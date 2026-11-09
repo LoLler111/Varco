@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Varco.Agent/Varco.Agent.csproj" />
+    <Project Path="src/Varco.Core/Varco.Core.csproj" />
+    <Project Path="src/Varco.Service/Varco.Service.csproj" />
+    <Project Path="src/Varco.Tray/Varco.Tray.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Varco.Tests/Varco.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,201 @@
+using Varco.Core.Input;
+using Varco.Core.Net;
+using Varco.Core.Protocol;
+
+namespace Varco.Tests;
+
+public class GeometryTests
+{
+    private static readonly IReadOnlyList<Rect> Two = [new Rect(0, 0, 1920, 1080), new Rect(1920, 0, 3840, 1080)];
+
+    [Fact]
+    public void Edge_only_on_outer_border()
+    {
+        Assert.Equal(Edge.Right, ScreenGeometry.DetectEdge(Two, 3839, 500));
+        Assert.Equal(Edge.Left, ScreenGeometry.DetectEdge(Two, 0, 500));
+        Assert.Null(ScreenGeometry.DetectEdge(Two, 1919, 500)); // confine fra i due monitor
+        Assert.Null(ScreenGeometry.DetectEdge(Two, 1000, 500));
+    }
+
+    [Fact]
+    public void MoveBy_crosses_monitors_and_reports_outer_edge()
+    {
+        Assert.Equal((1925, 10, (Edge?)null), ScreenGeometry.MoveBy(Two, 1915, 10, 10, 0));
+        var (x, y, hit) = ScreenGeometry.MoveBy(Two, 3835, 10, 50, 0);
+        Assert.Equal((3839, 10, (Edge?)Edge.Right), (x, y, hit));
+    }
+
+    [Fact]
+    public void Entry_point_respects_ratio()
+    {
+        var (x, y) = ScreenGeometry.EntryPoint(Two, Edge.Left, 0.5f);
+        Assert.Equal(ScreenGeometry.EntryInset, x);
+        Assert.InRange(y, 538, 541);
+        var (x2, _) = ScreenGeometry.EntryPoint(Two, Edge.Right, 0f);
+        Assert.Equal(3839 - ScreenGeometry.EntryInset, x2);
+    }
+}
+
+public class LayoutTests
+{
+    [Fact]
+    public void Newer_layout_wins_and_members_are_preserved()
+    {
+        Guid a = Guid.NewGuid(), b = Guid.NewGuid(), c = Guid.NewGuid();
+        var la = new LayoutManager(a, "A", new Layout());
+        var lb = new LayoutManager(b, "B", new Layout());
+        la.EnsureMembers([(b, "B")]);         // A: [A, B]
+        lb.Merge(la.Current, [(a, "A")]);      // B adotta
+        Assert.Equal(a, lb.Neighbor(b, Edge.Left));
+        Assert.Equal(b, lb.Neighbor(a, Edge.Right));
+
+        lb.SetRow([(b, "B"), (a, "A")]);       // l'utente su B inverte
+        la.Merge(lb.Current, [(b, "B")]);
+        Assert.Equal(b, la.Neighbor(a, Edge.Left));
+
+        la.EnsureMembers([(c, "C")]);          // arriva C: in coda a destra
+        Assert.Equal(c, la.Neighbor(a, Edge.Right));
+        Assert.False(lb.Current.IsNewerThan(la.Current));
+    }
+}
+
+public class CoordinatorTests
+{
+    private sealed class FakeNet(Guid self) : IPeerNetwork
+    {
+        public readonly List<(Guid To, Message Msg)> Sent = [];
+        public readonly HashSet<Guid> Connected = [];
+        public Guid SelfId { get; } = self;
+        public bool IsConnected(Guid id) => Connected.Contains(id);
+        public bool Send(Guid id, Message m) { Sent.Add((id, m)); return Connected.Contains(id); }
+        public void Broadcast(Message m) { foreach (var c in Connected) Sent.Add((c, m)); }
+    }
+
+    private sealed class FakePlatform : IInputPlatform
+    {
+        public readonly List<string> Log = [];
+        public (int X, int Y) Cursor = (100, 100);
+        public void Post(Action action) => action();
+        public IReadOnlyList<Rect> GetMonitors() => [new Rect(0, 0, 1920, 1080)];
+        public (int X, int Y) GetCursorPos() => Cursor;
+        public void SetCursorPos(int x, int y) { Cursor = (x, y); Log.Add($"set {x},{y}"); }
+        public void InjectMoveTo(int x, int y) { Cursor = (x, y); Log.Add($"move {x},{y}"); }
+        public void InjectButton(MouseButton b, bool down) => Log.Add($"btn {b} {down}");
+        public void InjectWheel(int d, bool h) => Log.Add($"wheel {d}");
+        public void InjectKey(ushort vk, ushort scan, KeyFlags f) => Log.Add($"key {vk:X2} {f}");
+    }
+
+    private static (InputCoordinator c, FakeNet net, FakePlatform p, Guid other) Setup(bool otherOnRight = true)
+    {
+        var self = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        var net = new FakeNet(self);
+        net.Connected.Add(other);
+        var layout = new LayoutManager(self, "me", new Layout());
+        layout.SetRow(otherOnRight ? [(self, "me"), (other, "other")] : [(other, "other"), (self, "me")]);
+        var p = new FakePlatform();
+        return (new InputCoordinator(net, p, layout), net, p, other);
+    }
+
+    [Fact]
+    public void Crossing_right_edge_starts_controlling_and_forwards_input()
+    {
+        var (c, net, p, other) = Setup();
+        Assert.False(c.OnLocalMouseMove(1000, 500));
+        Assert.True(c.OnLocalMouseMove(1919, 540));
+        Assert.Equal(InputMode.Controlling, c.Mode);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is Enter { From: Edge.Left });
+        Assert.Equal((960, 540), p.Cursor); // cursore locale parcheggiato al centro
+
+        Assert.True(c.OnLocalMouseMove(965, 538));
+        Assert.Contains(net.Sent, s => s.Msg is MouseMove { Dx: 5, Dy: -2 });
+        Assert.True(c.OnLocalKey(0x41, 0x1E, KeyFlags.None));
+        Assert.Contains(net.Sent, s => s.Msg is KeyMsg { Vk: 0x41 });
+    }
+
+    [Fact]
+    public void No_crossing_while_dragging_or_when_neighbor_offline()
+    {
+        var (c, net, _, other) = Setup();
+        c.OnLocalButton(MouseButton.Left, true);
+        Assert.False(c.OnLocalMouseMove(1919, 540));
+        c.OnLocalButton(MouseButton.Left, false);
+        net.Connected.Remove(other);
+        Assert.False(c.OnLocalMouseMove(1919, 540));
+        Assert.Equal(InputMode.Local, c.Mode);
+    }
+
+    [Fact]
+    public void Disconnect_while_controlling_returns_cursor_home()
+    {
+        var (c, _, p, other) = Setup();
+        c.OnLocalMouseMove(1919, 300);
+        c.OnPeerDisconnected(other);
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Equal((1919, 300), p.Cursor);
+    }
+
+    [Fact]
+    public void Controlled_side_releases_stuck_keys_on_disconnect()
+    {
+        var (c, _, p, other) = Setup();
+        c.OnMessage(other, new Enter(Edge.Right, 0.5f), () => []);
+        Assert.Equal(InputMode.Controlled, c.Mode);
+        c.OnMessage(other, new KeyMsg(0xA2, 0x1D, KeyFlags.None), () => []); // Ctrl giù
+        c.OnMessage(other, new MouseButtonMsg(MouseButton.Left, true), () => []);
+        c.OnPeerDisconnected(other);
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Contains("key A2 Up", p.Log);
+        Assert.Contains("btn Left False", p.Log);
+    }
+
+    [Fact]
+    public void Edge_hit_on_target_brings_control_back()
+    {
+        var (c, net, p, other) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnMessage(other, new EdgeHit(Edge.Left, 0.25f), () => []);
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is Leave);
+        Assert.Equal(1919 - ScreenGeometry.EntryInset, p.Cursor.X);
+    }
+
+    [Fact]
+    public void Target_reports_edge_once_and_physical_input_takes_over()
+    {
+        var (c, net, _, other) = Setup(otherOnRight: false);
+        c.OnMessage(other, new Enter(Edge.Left, 0.5f), () => []);
+        c.OnMessage(other, new MouseMove(-50, 0), () => []);
+        c.OnMessage(other, new MouseMove(-50, 0), () => []);
+        Assert.Single(net.Sent, s => s.Msg is EdgeHit { Edge: Edge.Left });
+
+        Assert.False(c.OnLocalMouseMove(10, 10)); // qualcuno muove il mouse fisico del target
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is TakeOver);
+    }
+
+    [Fact]
+    public void Key_held_before_crossing_is_released_locally()
+    {
+        var (c, net, _, _) = Setup();
+        Assert.False(c.OnLocalKey(0xA0, 0x2A, KeyFlags.None)); // Shift giù in locale
+        c.OnLocalMouseMove(1919, 540);
+        Assert.True(c.OnLocalKey(0xA0, 0x2A, KeyFlags.None)); // ripetizione: bloccata e non inviata
+        Assert.False(c.OnLocalKey(0xA0, 0x2A, KeyFlags.Up));  // rilascio: al PC locale
+        Assert.DoesNotContain(net.Sent, s => s.Msg is KeyMsg { Vk: 0xA0 });
+    }
+
+    [Fact]
+    public void Ctrl_Alt_F12_always_returns_home()
+    {
+        var (c, net, _, other) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnLocalKey(0xA2, 0x1D, KeyFlags.None);
+        c.OnLocalKey(0xA4, 0x38, KeyFlags.None);
+        Assert.True(c.OnLocalKey(0x7B, 0x58, KeyFlags.None));
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is Leave);
+        // i rilasci di Ctrl/Alt non arrivano al PC locale, che non li aveva visti premere
+        Assert.True(c.OnLocalKey(0xA2, 0x1D, KeyFlags.Up));
+    }
+}

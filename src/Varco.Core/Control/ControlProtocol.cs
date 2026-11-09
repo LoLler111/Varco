@@ -1,0 +1,73 @@
+using System.IO.Pipes;
+using System.Text;
+using System.Text.Json;
+using Varco.Core.Input;
+
+namespace Varco.Core.Control;
+
+/// <summary>Protocollo locale (named pipe, una riga JSON per richiesta) fra l'icona nella tray e l'agent.</summary>
+public static class ControlProtocol
+{
+    public const string PipeName = "Varco.Control";
+
+    public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+}
+
+public sealed class ControlRequest
+{
+    /// <summary>status | getKey | newGroup | setKey | setRow | addAddress | removeAddress | reconnect</summary>
+    public string Cmd { get; set; } = "status";
+    public string? Key { get; set; }
+    public string? Address { get; set; }
+    public List<Guid>? Order { get; set; }
+}
+
+public sealed class ControlResponse
+{
+    public bool Ok { get; set; } = true;
+    public string? Error { get; set; }
+    public string? Key { get; set; }
+    public StatusDto? Status { get; set; }
+}
+
+public sealed class StatusDto
+{
+    public Guid MachineId { get; set; }
+    public string MachineName { get; set; } = "";
+    public bool HasKey { get; set; }
+    public string Mode { get; set; } = "Local";
+    public string? ActivePeerName { get; set; }
+    public int ListenPort { get; set; }
+    public List<PeerDto> Peers { get; set; } = [];
+    public List<LayoutEntry> Layout { get; set; } = [];
+    public List<string> ManualAddresses { get; set; } = [];
+}
+
+public sealed class PeerDto
+{
+    public Guid? Id { get; set; }
+    public string Name { get; set; } = "";
+    /// <summary>Connected | Connecting | Disconnected</summary>
+    public string State { get; set; } = "Disconnected";
+    public string? Address { get; set; }
+    public double RttMs { get; set; }
+    public string? LastError { get; set; }
+}
+
+public static class ControlClient
+{
+    public static async Task<ControlResponse> SendAsync(ControlRequest request, int timeoutMs = 1500)
+    {
+        using var cts = new CancellationTokenSource(timeoutMs);
+        await using var pipe = new NamedPipeClientStream(".", ControlProtocol.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        await pipe.ConnectAsync(cts.Token).ConfigureAwait(false);
+        var line = JsonSerializer.Serialize(request, ControlProtocol.Json) + "\n";
+        await pipe.WriteAsync(Encoding.UTF8.GetBytes(line), cts.Token).ConfigureAwait(false);
+        await pipe.FlushAsync(cts.Token).ConfigureAwait(false);
+        using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
+        var resp = await reader.ReadLineAsync(cts.Token).ConfigureAwait(false)
+            ?? throw new IOException("Nessuna risposta dall'agent");
+        return JsonSerializer.Deserialize<ControlResponse>(resp, ControlProtocol.Json)
+            ?? throw new IOException("Risposta non valida");
+    }
+}
