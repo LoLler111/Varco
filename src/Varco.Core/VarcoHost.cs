@@ -37,7 +37,15 @@ public sealed partial class VarcoHost : IAsyncDisposable
             _net.Broadcast(new LayoutMsg(l));
         };
         Coordinator = new InputCoordinator(_net, platform, Layout);
+        // Cambi di risoluzione o monitor collegati/scollegati: la dimensione del desktop finisce nel layout condiviso.
+        _desktopWatch = new Timer(_ =>
+        {
+            try { Coordinator.SyncDesktopSize(); }
+            catch (Exception ex) { Log.Error("Dimensione desktop", ex); }
+        }, null, 2000, 2000);
     }
+
+    private readonly Timer _desktopWatch;
 
     public Task StartAsync() => RestartNetworkAsync();
 
@@ -165,6 +173,11 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     return new ControlResponse { Status = GetStatus() };
                 }
 
+                case "setLayout":
+                    if (req.Positions is null || req.Positions.Count == 0) return Fail("Disposizione vuota");
+                    Layout.SetPositions(req.Positions.Select(p => (p.Id, p.X, p.Y)));
+                    return new ControlResponse { Status = GetStatus() };
+
                 case "addAddress":
                     if (string.IsNullOrWhiteSpace(req.Address)) return Fail("Indirizzo vuoto");
                     _store.Update(c => { if (!c.ManualAddresses.Contains(req.Address.Trim())) c.ManualAddresses.Add(req.Address.Trim()); }, immediate: true);
@@ -258,6 +271,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        await _desktopWatch.DisposeAsync().ConfigureAwait(false);
         _net.Node = null;
         if (_node is not null) await _node.DisposeAsync().ConfigureAwait(false);
         _store.SaveNow();

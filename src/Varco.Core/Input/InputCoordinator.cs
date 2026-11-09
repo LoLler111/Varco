@@ -65,6 +65,16 @@ public sealed class InputCoordinator
         _net = net;
         _platform = platform;
         _layout = layout;
+        SyncDesktopSize();
+    }
+
+    /// <summary>Comunica al layout la dimensione attuale del desktop (cambia se si cambia risoluzione o si collega un monitor).</summary>
+    public void SyncDesktopSize()
+    {
+        var monitors = _platform.GetMonitors();
+        if (monitors.Count == 0) return;
+        var b = ScreenGeometry.Bounds(monitors);
+        _layout.SetSelfSize(b.Width, b.Height);
     }
 
     public InputMode Mode { get { lock (_gate) return _mode; } }
@@ -94,8 +104,10 @@ public sealed class InputCoordinator
                     if (_localButtons != 0) return false; // niente passaggio durante un trascinamento
                     var monitors = _platform.GetMonitors();
                     if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) return false;
-                    if (_layout.Neighbor(_net.SelfId, edge) is not Guid next || !_net.IsConnected(next)) return false;
-                    StartControlling(next, edge, ScreenGeometry.Ratio(monitors, edge, x, y), x, y, monitors);
+                    // Chi c'è oltre il bordo proprio in questo punto? (disposizione 2D: dipende anche dall'altezza)
+                    if (_layout.Cross(_net.SelfId, edge, ScreenGeometry.Ratio(monitors, edge, x, y)) is not { } hop
+                        || hop.Id == _net.SelfId || !_net.IsConnected(hop.Id)) return false;
+                    StartControlling(hop.Id, edge, hop.Ratio, x, y, monitors);
                     return true;
 
                 case InputMode.Controlling:
@@ -295,19 +307,21 @@ public sealed class InputCoordinator
 
     private void HandleEdgeHit(Guid from, EdgeHit h)
     {
-        var next = _layout.Neighbor(from, h.Edge);
+        // Il punto d'uscita sul bordo del target viene riportato sulla disposizione 2D: ne ricavo chi c'è accanto
+        // in quel punto e dove entrare lungo il suo bordo. Nessuno accanto → il cursore resta sul target.
+        if (_layout.Cross(from, h.Edge, h.Ratio) is not { } hop) return;
         var entry = ScreenGeometry.Opposite(h.Edge);
-        if (next == _net.SelfId)
+        if (hop.Id == _net.SelfId)
         {
             _net.Send(from, new Leave());
-            var (x, y) = ScreenGeometry.EntryPoint(_platform.GetMonitors(), entry, h.Ratio);
+            var (x, y) = ScreenGeometry.EntryPoint(_platform.GetMonitors(), entry, hop.Ratio);
             ReturnLocal(x, y);
         }
-        else if (next is Guid other && _net.IsConnected(other))
+        else if (_net.IsConnected(hop.Id))
         {
             _net.Send(from, new Leave());
-            SetMode(InputMode.Controlling, other);
-            _net.Send(other, new Enter(entry, h.Ratio));
+            SetMode(InputMode.Controlling, hop.Id);
+            _net.Send(hop.Id, new Enter(entry, hop.Ratio));
         }
     }
 
@@ -329,8 +343,12 @@ public sealed class InputCoordinator
                 if (hit is not Edge edge) { _latchedEdge = null; return; }
                 // Un solo EdgeHit per "spinta" e mai durante un trascinamento.
                 if (_latchedEdge == edge || _injectedButtons != 0) return;
+                // Se in questo punto del bordo non c'è nessun PC accanto il cursore resta qui; scorrendo lungo
+                // il bordo fino a dove un altro PC lo tocca, l'EdgeHit parte (il bordo non resta "agganciato").
+                var ratio = ScreenGeometry.Ratio(monitors, edge, nx, ny);
+                if (_layout.Cross(_net.SelfId, edge, ratio) is null) return;
                 _latchedEdge = edge;
-                _net.Send(controller, new EdgeHit(edge, ScreenGeometry.Ratio(monitors, edge, nx, ny)));
+                _net.Send(controller, new EdgeHit(edge, ratio));
             }
         });
     }

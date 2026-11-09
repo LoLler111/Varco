@@ -11,8 +11,8 @@ internal sealed class MainForm : Form
     private const int ContentWidth = 440;
 
     private readonly Label _subtitle = new() { AutoSize = true, ForeColor = Muted, MaximumSize = new Size(ContentWidth - 70, 0) };
-    private readonly LayoutStrip _strip = new() { Width = ContentWidth, Margin = new Padding(0, 4, 0, 0) };
-    private readonly Label _stripHint = Hint("Trascina i PC nell'ordine in cui sono sulla tua scrivania.");
+    private readonly LayoutCanvas _strip = new() { Width = ContentWidth, Margin = new Padding(0, 4, 0, 0) };
+    private readonly Label _stripHint = Hint("Trascina i PC come sono messi sulla tua scrivania, anche più in alto o più in basso: il mouse passa dove gli schermi si toccano, alla stessa altezza.");
     private readonly FlowLayoutPanel _peers = Column();
     private readonly FlowLayoutPanel _found = Column();
     private readonly Panel _pairBox = new() { Width = ContentWidth, Height = 0, Visible = false, Margin = new Padding(0, 8, 0, 0) };
@@ -66,7 +66,11 @@ internal sealed class MainForm : Form
         _pairBox.Controls.AddRange([_pairText, _pairCode, _pairCancel]);
         _pairCancel.Click += async (_, _) => await Send(new ControlRequest { Cmd = "pairCancel" });
 
-        _strip.OrderChanged += async order => await Send(new ControlRequest { Cmd = "setRow", Order = order.ToList() });
+        _strip.PositionsChanged += async moved => await Send(new ControlRequest
+        {
+            Cmd = "setLayout",
+            Positions = moved.Select(m => new LayoutPositionDto { Id = m.Id, X = m.X, Y = m.Y }).ToList(),
+        });
     }
 
     public void UpdateStatus(StatusDto? s)
@@ -94,7 +98,8 @@ internal sealed class MainForm : Form
         // disposizione
         var online = connected.Select(p => p.Id).ToHashSet();
         var items = s.Layout.OrderBy(e => e.Y).ThenBy(e => e.X)
-            .Select(e => new LayoutStrip.Item(e.Id, e.Name, e.Id == s.MachineId, e.Id == s.MachineId || online.Contains(e.Id)))
+            .Select(e => new LayoutCanvas.Item(e.Id, e.Name, e.Id == s.MachineId, e.Id == s.MachineId || online.Contains(e.Id),
+                e.X, e.Y, e.Width, e.Height))
             .ToList();
         var showStrip = items.Count > 1;
         _strip.Visible = _stripHint.Visible = showStrip;

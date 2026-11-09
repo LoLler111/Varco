@@ -17,7 +17,7 @@ public sealed class ControlRequest
 {
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
-    /// setRow (Order) | addAddress | removeAddress | reconnect | getKey | setKey
+    /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey
     /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
@@ -26,6 +26,8 @@ public sealed class ControlRequest
     public Guid? Id { get; set; }
     public Guid? RequestId { get; set; }
     public bool? Accept { get; set; }
+    /// <summary>setLayout: nuove posizioni dei PC nella disposizione 2D.</summary>
+    public List<LayoutPositionDto>? Positions { get; set; }
 }
 
 public sealed class ControlResponse
@@ -53,6 +55,14 @@ public sealed class StatusDto
     public PairRequestDto? IncomingPair { get; set; }
     /// <summary>Abbinamento avviato da questo PC.</summary>
     public PairProgressDto? OutgoingPair { get; set; }
+}
+
+/// <summary>Posizione di un PC nella disposizione (pixel virtuali, angolo in alto a sinistra).</summary>
+public sealed class LayoutPositionDto
+{
+    public Guid Id { get; set; }
+    public int X { get; set; }
+    public int Y { get; set; }
 }
 
 public sealed class DiscoveredDto

@@ -38,24 +38,166 @@ public class GeometryTests
 
 public class LayoutTests
 {
-    [Fact]
-    public void Newer_layout_wins_and_members_are_preserved()
+    private static readonly Guid A = Guid.NewGuid(), B = Guid.NewGuid(), C = Guid.NewGuid();
+
+    /// <summary>Fisso 1920×1080 a sinistra, portatile 1366×768 a destra più in basso di 156 pixel.</summary>
+    private static Layout DeskAndLaptop(int laptopY = 156) => new()
     {
-        Guid a = Guid.NewGuid(), b = Guid.NewGuid(), c = Guid.NewGuid();
-        var la = new LayoutManager(a, "A", new Layout());
-        var lb = new LayoutManager(b, "B", new Layout());
-        la.EnsureMembers([(b, "B")]);         // A: [A, B]
-        lb.Merge(la.Current, [(a, "A")]);      // B adotta
-        Assert.Equal(a, lb.Neighbor(b, Edge.Left));
-        Assert.Equal(b, lb.Neighbor(a, Edge.Right));
+        Entries =
+        [
+            new LayoutEntry { Id = A, Name = "Fisso", X = 0, Y = 0, Width = 1920, Height = 1080 },
+            new LayoutEntry { Id = B, Name = "Portatile", X = 1920, Y = laptopY, Width = 1366, Height = 768 },
+        ],
+    };
 
-        lb.SetRow([(b, "B"), (a, "A")]);       // l'utente su B inverte
-        la.Merge(lb.Current, [(b, "B")]);
-        Assert.Equal(b, la.Neighbor(a, Edge.Left));
+    private static float RatioOfPixel(int pixel, int size) => (pixel + 0.5f) / size;
 
-        la.EnsureMembers([(c, "C")]);          // arriva C: in coda a destra
-        Assert.Equal(c, la.Neighbor(a, Edge.Right));
+    [Fact]
+    public void Crossing_keeps_the_same_height_with_offset_and_different_resolution()
+    {
+        var l = DeskAndLaptop();
+        // Fisso, bordo destro, y=540 → virtuale 540.5 → sul portatile 540.5-156 = 384.5 → pixel 384
+        var hop = l.Cross(A, Edge.Right, RatioOfPixel(540, 1080));
+        Assert.NotNull(hop);
+        Assert.Equal(B, hop.Value.Id);
+        Assert.Equal(384, (int)(hop.Value.Ratio * 768));
+
+        // e al ritorno si torna allo stesso pixel
+        var back = l.Cross(B, Edge.Left, RatioOfPixel(384, 768));
+        Assert.Equal(A, back!.Value.Id);
+        Assert.Equal(540, (int)(back.Value.Ratio * 1080));
+    }
+
+    [Fact]
+    public void No_crossing_where_nothing_is_adjacent()
+    {
+        var l = DeskAndLaptop();
+        Assert.Null(l.Cross(A, Edge.Right, RatioOfPixel(100, 1080)));   // sopra il portatile
+        Assert.Null(l.Cross(A, Edge.Right, RatioOfPixel(1000, 1080)));  // sotto il portatile (156+768=924)
+        Assert.NotNull(l.Cross(A, Edge.Right, RatioOfPixel(156, 1080)));
+        Assert.Null(l.Cross(A, Edge.Left, 0.5f));
+        Assert.Null(l.Cross(A, Edge.Top, 0.5f));
+        Assert.Null(l.Cross(B, Edge.Right, 0.5f));
+        Assert.Null(l.Cross(Guid.NewGuid(), Edge.Right, 0.5f));
+    }
+
+    [Fact]
+    public void Vertical_arrangement_and_gaps_between_rectangles()
+    {
+        var l = new Layout
+        {
+            Entries =
+            [
+                new LayoutEntry { Id = A, X = 0, Y = 0, Width = 1920, Height = 1080 },
+                new LayoutEntry { Id = B, X = 960, Y = 1080, Width = 1366, Height = 768 }, // sotto, spostato a destra
+                new LayoutEntry { Id = C, X = 1920 + 50, Y = 0, Width = 1920, Height = 1080 }, // staccato di 50: non tocca
+            ],
+        };
+        var hop = l.Cross(A, Edge.Bottom, RatioOfPixel(1500, 1920));
+        Assert.Equal(B, hop!.Value.Id);
+        Assert.Equal(1500 - 960, (int)(hop.Value.Ratio * 1366));
+        Assert.Null(l.Cross(A, Edge.Bottom, RatioOfPixel(500, 1920)));
+        Assert.Null(l.Cross(A, Edge.Right, 0.5f));
+    }
+
+    [Fact]
+    public void Old_grid_layout_is_converted()
+    {
+        var old = new Layout
+        {
+            Version = 7,
+            Entries = [new LayoutEntry { Id = A, X = 0, Y = 0 }, new LayoutEntry { Id = B, X = 1, Y = 0 }],
+        };
+        var lm = new LayoutManager(A, "A", old);
+        Assert.Equal(B, lm.Cross(A, Edge.Right, 0.5f)?.Id);
+        Assert.Equal(A, lm.Cross(B, Edge.Left, 0.5f)?.Id);
+        Assert.All(lm.Current.Entries, e => Assert.True(e.Width > 0 && e.Height > 0));
+    }
+
+    [Fact]
+    public void Own_desktop_size_is_shared_and_keeps_neighbors_touching()
+    {
+        var lm = new LayoutManager(A, "A", new Layout());
+        lm.EnsureMembers([(B, "B")]);
+        var before = lm.Current.Version;
+        lm.SetSelfSize(2560, 1440);
+        var cur = lm.Current;
+        Assert.True(cur.Version > before);
+        Assert.Equal((2560, 1440), (cur.Find(A)!.Width, cur.Find(A)!.Height));
+        Assert.Equal(2560, cur.Find(B)!.X); // spostato: tocca ancora il bordo destro
+        Assert.Equal(B, lm.Cross(A, Edge.Right, 0.5f)?.Id);
+
+        // stessa dimensione: niente nuova versione
+        var v = lm.Current.Version;
+        lm.SetSelfSize(2560, 1440);
+        Assert.Equal(v, lm.Current.Version);
+    }
+
+    [Fact]
+    public void Merge_newer_wins_keeps_members_and_repairs_own_size()
+    {
+        var la = new LayoutManager(A, "A", new Layout());
+        la.SetSelfSize(1920, 1080);
+        la.EnsureMembers([(B, "B")]);                    // A: [A, B (dimensione predefinita)]
+        var lb = new LayoutManager(B, "B", new Layout());
+        Assert.True(lb.Merge(la.Current, [(A, "A")]));   // B adotta
+        lb.SetSelfSize(1366, 768);                       // e comunica la sua dimensione
+        Assert.True(la.Merge(lb.Current, [(B, "B")]));
+        Assert.Equal((1366, 768), (la.Current.Find(B)!.Width, la.Current.Find(B)!.Height));
+
+        // layout più recente con la mia dimensione sbagliata: adottato e corretto subito, con una nuova versione
+        var wrong = DeskAndLaptop();
+        wrong.Version = 100;
+        wrong.Entries[1].Width = 1920;
+        wrong.Entries[1].Height = 1080;
+        Assert.True(lb.Merge(wrong, [(A, "A")]));
+        Assert.Equal((1366, 768), (lb.Current.Find(B)!.Width, lb.Current.Find(B)!.Height));
+        Assert.Equal((101L, B), (lb.Current.Version, lb.Current.Author));
+        Assert.True(la.Merge(lb.Current, [(B, "B")]));
+
+        // l'utente su B abbassa il portatile
+        lb.SetPositions([(B, 1920, 200)]);
+        la.Merge(lb.Current, [(B, "B")]);
+        Assert.Equal(200, la.Current.Find(B)!.Y);
+        Assert.Null(la.Cross(A, Edge.Right, RatioOfPixel(100, 1080)));
+        Assert.Equal(B, la.Cross(A, Edge.Right, RatioOfPixel(300, 1080))?.Id);
+
+        // un layout vecchio non vince
+        Assert.False(la.Merge(DeskAndLaptop(0), [(B, "B")]));
+
+        // arriva C: in coda a destra, e nessuno sparisce
+        la.EnsureMembers([(C, "C")]);
+        Assert.Equal(3, la.Current.Entries.Count);
+        Assert.Equal(C, la.Cross(B, Edge.Right, 0.5f)?.Id);
         Assert.False(lb.Current.IsNewerThan(la.Current));
+    }
+
+    [Fact]
+    public void Set_positions_moves_to_origin()
+    {
+        var lm = new LayoutManager(A, "A", DeskAndLaptop());
+        lm.SetPositions([(B, -1366, -100)]); // portatile a sinistra e più in alto
+        var cur = lm.Current;
+        Assert.Equal((1366, 100), (cur.Find(A)!.X, cur.Find(A)!.Y));
+        Assert.Equal((0, 0), (cur.Find(B)!.X, cur.Find(B)!.Y));
+        Assert.Equal(B, cur.Cross(A, Edge.Left, RatioOfPixel(500, 1080))?.Id);
+    }
+
+    [Fact]
+    public void Snap_attaches_to_the_nearest_edge_without_overlap()
+    {
+        IReadOnlyList<Rect> desk = [new Rect(0, 0, 1920, 1080)];
+        // lasciato un po' staccato a destra e in basso → si attacca al bordo destro, all'altezza scelta
+        Assert.Equal((1920, 250), LayoutSnap.Snap(desk, 1366, 768, 2000, 250, 20));
+        // vicino all'allineamento in alto → allineato
+        Assert.Equal((1920, 0), LayoutSnap.Snap(desk, 1366, 768, 1950, 15, 20));
+        // sovrapposto quasi tutto a sinistra → spinto fuori a sinistra
+        Assert.Equal((-1366, 100), LayoutSnap.Snap(desk, 1366, 768, -900, 100, 20));
+        // troppo in basso: resta un tratto di bordo in comune
+        var (_, y) = LayoutSnap.Snap(desk, 1366, 768, 2300, 1300, 0);
+        Assert.Equal(1080 - LayoutSnap.MinShared, y);
+        // sotto, centrato
+        Assert.Equal((300, 1080), LayoutSnap.Snap(desk, 1366, 768, 300, 1150, 0));
     }
 }
 
@@ -197,5 +339,64 @@ public class CoordinatorTests
         Assert.Contains(net.Sent, s => s.To == other && s.Msg is Leave);
         // i rilasci di Ctrl/Alt non arrivano al PC locale, che non li aveva visti premere
         Assert.True(c.OnLocalKey(0xA2, 0x1D, KeyFlags.Up));
+    }
+
+    /// <summary>Questo PC 1920×1080; l'altro (1366×768) a destra, più in basso di 156 pixel.</summary>
+    private static (InputCoordinator c, FakeNet net, FakePlatform p, Guid other) Setup2D()
+    {
+        var self = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        var net = new FakeNet(self);
+        net.Connected.Add(other);
+        var layout = new LayoutManager(self, "me", new Layout
+        {
+            Version = 1,
+            Entries =
+            [
+                new LayoutEntry { Id = self, Name = "me", X = 0, Y = 0, Width = 1920, Height = 1080 },
+                new LayoutEntry { Id = other, Name = "other", X = 1920, Y = 156, Width = 1366, Height = 768 },
+            ],
+        });
+        var p = new FakePlatform();
+        return (new InputCoordinator(net, p, layout), net, p, other);
+    }
+
+    [Fact]
+    public void Crossing_honors_vertical_offset_and_gaps()
+    {
+        var (c, net, _, other) = Setup2D();
+        Assert.False(c.OnLocalMouseMove(1919, 100));  // lì a destra non c'è nessuno
+        Assert.False(c.OnLocalMouseMove(1919, 1000));
+        Assert.Equal(InputMode.Local, c.Mode);
+
+        Assert.True(c.OnLocalMouseMove(1919, 540));
+        var enter = Assert.Single(net.Sent.Where(s => s.To == other).Select(s => s.Msg).OfType<Enter>());
+        Assert.Equal(Edge.Left, enter.From);
+        Assert.Equal(540 - 156, (int)(enter.Ratio * 768)); // stessa altezza fisica sul portatile
+    }
+
+    [Fact]
+    public void Edge_hit_returns_at_the_same_height()
+    {
+        var (c, net, p, other) = Setup2D();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnMessage(other, new EdgeHit(Edge.Left, (700 + 0.5f) / 768), () => []);
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is Leave);
+        Assert.Equal((1919 - ScreenGeometry.EntryInset, 700 + 156), p.Cursor);
+    }
+
+    [Fact]
+    public void Target_sends_edge_hit_only_where_a_neighbor_touches()
+    {
+        var (c, net, p, other) = Setup2D();
+        c.OnMessage(other, new Enter(Edge.Right, (50 + 0.5f) / 1080), () => []);
+        Assert.Equal((1919 - ScreenGeometry.EntryInset, 50), p.Cursor);
+        c.OnMessage(other, new MouseMove(50, 0), () => []);   // spinge a destra dove non c'è nessuno
+        Assert.DoesNotContain(net.Sent, s => s.Msg is EdgeHit);
+        c.OnMessage(other, new MouseMove(50, 490), () => []); // scorre lungo il bordo fino al portatile
+        var hit = Assert.Single(net.Sent.Select(s => s.Msg).OfType<EdgeHit>());
+        Assert.Equal(Edge.Right, hit.Edge);
+        Assert.Equal(540, (int)(hit.Ratio * 1080));
     }
 }

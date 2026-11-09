@@ -41,9 +41,13 @@ public sealed record MouseButtonMsg(MouseButton Button, bool Down) : Message;
 public sealed record MouseWheel(int Delta, bool Horizontal) : Message;
 public sealed record KeyMsg(ushort Vk, ushort Scan, KeyFlags Flags) : Message;
 
-/// <summary>Controller → target: "ora comandi tu", il cursore entra dal bordo <paramref name="From"/> alla posizione relativa <paramref name="Ratio"/> (0..1).</summary>
+/// <summary>
+/// Controller → target: "ora comandi tu", il cursore entra dal bordo <paramref name="From"/> alla posizione <paramref name="Ratio"/>
+/// (0..1 lungo il bordo del desktop del target). Il controller la ricava dalla disposizione 2D (<see cref="Layout.Cross"/>),
+/// così il cursore passa alla stessa altezza anche fra PC con risoluzioni e posizioni diverse.
+/// </summary>
 public sealed record Enter(Edge From, float Ratio) : Message;
-/// <summary>Target → controller: il cursore ha toccato un bordo dello schermo del target.</summary>
+/// <summary>Target → controller: il cursore ha toccato un bordo dello schermo del target, alla posizione <paramref name="Ratio"/> (0..1 lungo quel bordo).</summary>
 public sealed record EdgeHit(Edge Edge, float Ratio) : Message;
 /// <summary>Controller → target: non sei più controllato, rilascia tutto.</summary>
 public sealed record Leave() : Message;

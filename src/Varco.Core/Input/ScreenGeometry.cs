@@ -67,13 +67,16 @@ public static class ScreenGeometry
         return null;
     }
 
-    /// <summary>Posizione lungo il bordo, 0..1 rispetto all'intero desktop virtuale.</summary>
+    /// <summary>
+    /// Posizione lungo il bordo, 0..1 rispetto all'intero desktop (centro del pixel: y = Top → 0.5/Height).
+    /// <see cref="EntryPoint"/> fa la conversione inversa, quindi un rapporto torna esattamente allo stesso pixel.
+    /// </summary>
     public static float Ratio(IReadOnlyList<Rect> monitors, Edge edge, int x, int y)
     {
         var b = Bounds(monitors);
         float r = edge is Edge.Left or Edge.Right
-            ? (y - b.Top) / (float)Math.Max(1, b.Height - 1)
-            : (x - b.Left) / (float)Math.Max(1, b.Width - 1);
+            ? (y - b.Top + 0.5f) / Math.Max(1, b.Height)
+            : (x - b.Left + 0.5f) / Math.Max(1, b.Width);
         return Math.Clamp(r, 0f, 1f);
     }
 
@@ -85,7 +88,7 @@ public static class ScreenGeometry
         ratio = Math.Clamp(ratio, 0f, 1f);
         if (from is Edge.Left or Edge.Right)
         {
-            var y = b.Top + (int)Math.Round(ratio * (b.Height - 1));
+            var y = b.Top + Math.Min(b.Height - 1, (int)(ratio * b.Height));
             var spanning = monitors.Where(m => y >= m.Top && y < m.Bottom).ToList();
             if (spanning.Count == 0) spanning = [MonitorAt(monitors, from == Edge.Left ? b.Left : b.Right - 1, y)];
             var m = from == Edge.Left ? spanning.MinBy(s => s.Left) : spanning.MaxBy(s => s.Right);
@@ -95,7 +98,7 @@ public static class ScreenGeometry
         }
         else
         {
-            var x = b.Left + (int)Math.Round(ratio * (b.Width - 1));
+            var x = b.Left + Math.Min(b.Width - 1, (int)(ratio * b.Width));
             var spanning = monitors.Where(m => x >= m.Left && x < m.Right).ToList();
             if (spanning.Count == 0) spanning = [MonitorAt(monitors, x, from == Edge.Top ? b.Top : b.Bottom - 1)];
             var m = from == Edge.Top ? spanning.MinBy(s => s.Top) : spanning.MaxBy(s => s.Bottom);
