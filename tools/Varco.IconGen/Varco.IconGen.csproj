@@ -1,5 +1,5 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <!-- Rigenera assets/varco.ico e le anteprime PNG dal disegno in src/Varco.Tray/VarcoIcon.cs
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Rigenera assets/varco.ico e le anteprime PNG dal disegno in src/Varco.App/VarcoIcon.cs
        (comando: dotnet run, opzione project, cartella tools/Varco.IconGen) -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -7,6 +7,6 @@
     <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\..\src\Varco.Tray\VarcoIcon.cs" Link="VarcoIcon.cs" />
+    <Compile Include="..\..\src\Varco.App\VarcoIcon.cs" Link="VarcoIcon.cs" />
   </ItemGroup>
 </Project>

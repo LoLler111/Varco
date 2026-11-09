@@ -1,0 +1,18 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Varco.exe: un solo file che fa da setup, icona nella tray, servizio e agent. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>Varco</AssemblyName>
+    <RootNamespace>Varco.App</RootNamespace>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\assets\varco.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Varco.Core\Varco.Core.csproj" />
+    <ProjectReference Include="..\Varco.Agent\Varco.Agent.csproj" />
+    <ProjectReference Include="..\Varco.Service\Varco.Service.csproj" />
+  </ItemGroup>
+</Project>

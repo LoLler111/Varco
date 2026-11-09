@@ -68,6 +68,12 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     public event Action<PeerConnection>? PeerConnected;
     public event Action<Guid, string>? PeerDisconnected;
     public event Action<Guid, Message>? MessageReceived;
+    /// <summary>Un PC con Varco (anche di un altro gruppo) si è annunciato: (id, nome, endpoint TCP, stesso gruppo?).</summary>
+    public event Action<Guid, string, IPEndPoint, bool>? Announced;
+
+    /// <summary>Gestore delle richieste di abbinamento in ingresso: riceve lo stream (ne diventa proprietario), il primo frame e l'indirizzo remoto.</summary>
+    public Func<Stream, byte[], IPEndPoint, Task>? PairingRequested { get; set; }
+
     /// <summary>Un peer è stato raggiunto a questo indirizzo: da salvare in config per la prossima volta.</summary>
     public event Action<Guid, string, string>? PeerLearned;
 
@@ -98,6 +104,7 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         {
             _discovery = new Discovery(Me, options.DiscoveryPort, ManualDiscoveryTargets);
             _discovery.PeerSeen += OnPeerSeen;
+            _discovery.Announced += (id, name, ep, same) => Announced?.Invoke(id, name, ep, same);
         }
     }
 
@@ -153,6 +160,15 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         List<PeerSlot> slots;
         lock (_gate) slots = _slots.Values.ToList();
         foreach (var s in slots) s.Kick(_opt.BackoffMinMs);
+        _discovery?.Announce();
+    }
+
+    /// <summary>Aggiunge (o aggiorna) un PC del gruppo da contattare subito, es. appena abbinato.</summary>
+    public void AddPeerHint(Guid id, string name, IPEndPoint endpoint)
+    {
+        var slot = GetOrCreateSlot(id, name);
+        slot.AddEndpoint(endpoint, front: true);
+        slot.Kick(_opt.BackoffMinMs);
         _discovery?.Announce();
     }
 
@@ -215,7 +231,17 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         {
             using var t = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
             t.CancelAfter(_opt.HandshakeTimeoutMs);
-            var hs = await Handshake.RunServerAsync(stream, Me, t.Token).ConfigureAwait(false);
+            var first = await Framing.ReadFrameAsync(stream, t.Token).ConfigureAwait(false);
+            if (PairingProtocol.IsPairingFrame(first))
+            {
+                // Richiesta di abbinamento: la gestisce l'host (serve la conferma dell'utente, niente timeout di handshake).
+                var handler = PairingRequested;
+                var remoteEp = (IPEndPoint)s.RemoteEndPoint!;
+                if (handler is null) { await stream.DisposeAsync().ConfigureAwait(false); return; }
+                await handler(stream, first, new IPEndPoint(Normalize(remoteEp.Address), remoteEp.Port)).ConfigureAwait(false);
+                return;
+            }
+            var hs = await Handshake.RunServerAsync(stream, Me, t.Token, first).ConfigureAwait(false);
             var conn = new PeerConnection(s, stream, hs, initiatorId: hs.PeerId, _opt.HeartbeatIntervalMs, _opt.HeartbeatTimeoutMs);
             var learned = new IPEndPoint(Normalize(conn.RemoteEndPoint.Address), conn.PeerListenPort);
             Register(conn, learned, viaSlot: null);

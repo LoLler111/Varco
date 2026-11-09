@@ -1,18 +1,16 @@
-﻿# Compila Varco in una cartella pronta da copiare sugli altri PC.
-#   .\scripts\publish.ps1                      → self-contained (non serve installare .NET sui PC)
-#   .\scripts\publish.ps1 -FrameworkDependent  → più leggero, richiede ".NET 10 Desktop Runtime" su ogni PC
-param(
-    [string]$Output = (Join-Path $PSScriptRoot '..\publish\Varco'),
-    [switch]$FrameworkDependent
-)
+﻿# Crea publish\Varco.exe: un unico file che fa da setup, icona, servizio e agent.
+# Non serve installare .NET sui PC: il runtime è incluso nel file.
+#   powershell -ExecutionPolicy Bypass -File scripts\publish.ps1
+param([string]$Output = (Join-Path $PSScriptRoot '..\publish'))
 $ErrorActionPreference = 'Stop'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
-$sc = if ($FrameworkDependent) { 'false' } else { 'true' }
 
 if (Test-Path $Output) { Remove-Item $Output -Recurse -Force }
-foreach ($p in 'Varco.Agent', 'Varco.Service', 'Varco.Tray') {
-    dotnet publish (Join-Path $root "src\$p\$p.csproj") -c Release -r win-x64 --self-contained $sc -o $Output -nologo -v q
-    if ($LASTEXITCODE -ne 0) { throw "Publish di $p fallito" }
-}
-Copy-Item (Join-Path $PSScriptRoot 'install.ps1'), (Join-Path $PSScriptRoot 'uninstall.ps1') $Output
-Write-Host "Pronto in $((Resolve-Path $Output).Path). Copia la cartella sull'altro PC ed esegui install.ps1 come amministratore."
+dotnet publish (Join-Path $root 'src\Varco.App\Varco.App.csproj') -c Release -r win-x64 --self-contained true `
+    -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true `
+    -p:DebugType=None -o $Output -nologo -v q
+if ($LASTEXITCODE -ne 0) { throw 'Publish fallito' }
+
+$exe = Join-Path (Resolve-Path $Output).Path 'Varco.exe'
+Write-Host ("Pronto: {0} ({1:N0} MB)" -f $exe, ((Get-Item $exe).Length / 1MB))
+Write-Host "Copialo su ogni PC e aprilo con un doppio clic."

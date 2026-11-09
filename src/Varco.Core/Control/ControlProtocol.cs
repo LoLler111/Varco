@@ -1,4 +1,4 @@
-using System.IO.Pipes;
+﻿using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 using Varco.Core.Input;
@@ -15,11 +15,17 @@ public static class ControlProtocol
 
 public sealed class ControlRequest
 {
-    /// <summary>status | getKey | newGroup | setKey | setRow | addAddress | removeAddress | reconnect</summary>
+    /// <summary>
+    /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
+    /// setRow (Order) | addAddress | removeAddress | reconnect | getKey | setKey
+    /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
     public string? Address { get; set; }
     public List<Guid>? Order { get; set; }
+    public Guid? Id { get; set; }
+    public Guid? RequestId { get; set; }
+    public bool? Accept { get; set; }
 }
 
 public sealed class ControlResponse
@@ -41,6 +47,35 @@ public sealed class StatusDto
     public List<PeerDto> Peers { get; set; } = [];
     public List<LayoutEntry> Layout { get; set; } = [];
     public List<string> ManualAddresses { get; set; } = [];
+    /// <summary>PC con Varco trovati nella rete ma non ancora abbinati.</summary>
+    public List<DiscoveredDto> Discovered { get; set; } = [];
+    /// <summary>Un altro PC chiede di abbinarsi: va mostrata la richiesta all'utente.</summary>
+    public PairRequestDto? IncomingPair { get; set; }
+    /// <summary>Abbinamento avviato da questo PC.</summary>
+    public PairProgressDto? OutgoingPair { get; set; }
+}
+
+public sealed class DiscoveredDto
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = "";
+    public string Address { get; set; } = "";
+}
+
+public sealed class PairRequestDto
+{
+    public Guid RequestId { get; set; }
+    public string PeerName { get; set; } = "";
+    public string Code { get; set; } = "";
+}
+
+public sealed class PairProgressDto
+{
+    public string PeerName { get; set; } = "";
+    public string? Code { get; set; }
+    /// <summary>Connecting | WaitingConfirm | Done | Rejected | Failed</summary>
+    public string State { get; set; } = "Connecting";
+    public string? Message { get; set; }
 }
 
 public sealed class PeerDto

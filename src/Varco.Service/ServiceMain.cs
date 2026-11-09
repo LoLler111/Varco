@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using Varco.Core;
@@ -7,13 +7,15 @@ using Varco.Core.Config;
 namespace Varco.Service;
 
 /// <summary>
-/// Servizio Windows "Varco" (LocalSystem). Non fa rete né input: tiene in vita Varco.Agent come SYSTEM
-/// nella sessione della console attiva. Così l'agent può lavorare anche su schermata di blocco, UAC e login,
+/// Servizio Windows "Varco" (LocalSystem). Non fa rete né input: tiene in vita l'agent (Varco.exe --agent)
+/// come SYSTEM nella sessione della console attiva. Così l'agent lavora anche su schermata di blocco, UAC e login,
 /// e se cade (o cambia la sessione, es. cambio utente) viene rilanciato subito.
 /// </summary>
-internal static class Program
+public static class ServiceMain
 {
-    private static void Main(string[] args)
+    public const string ServiceName = "Varco";
+
+    public static int Run(string[] args)
     {
         Log.Init(Path.Combine(ConfigStore.DefaultDirectory, "logs"), "service.log");
         if (args.Contains("--console"))
@@ -24,9 +26,24 @@ internal static class Program
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
             launcher.RunAsync(cts.Token).GetAwaiter().GetResult();
-            return;
+            return 0;
         }
         ServiceBase.Run(new VarcoService());
+        return 0;
+    }
+
+    /// <summary>Chiede a qualsiasi agent in esecuzione di chiudersi (usato anche dal setup).</summary>
+    public static void SignalAgentStop()
+    {
+        try
+        {
+            if (EventWaitHandle.TryOpenExisting(@"Global\Varco.Agent.Stop", out var ev))
+                using (ev) ev.Set();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Impossibile segnalare la chiusura all'agent: {ex.Message}");
+        }
     }
 }
 
@@ -38,7 +55,7 @@ internal sealed class VarcoService : ServiceBase
 
     public VarcoService()
     {
-        ServiceName = "Varco";
+        ServiceName = ServiceMain.ServiceName;
         CanHandleSessionChangeEvent = true;
         CanShutdown = true;
     }
@@ -74,7 +91,7 @@ internal sealed class AgentLauncher : IDisposable
     private uint _agentSession = uint.MaxValue;
     private readonly Queue<DateTime> _recentStarts = new();
 
-    private static string AgentPath => Path.Combine(AppContext.BaseDirectory, "Varco.Agent.exe");
+    private static string AgentPath => Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "Varco.exe");
 
     public void CheckNow()
     {
@@ -83,7 +100,7 @@ internal sealed class AgentLauncher : IDisposable
 
     public async Task RunAsync(CancellationToken ct)
     {
-        KillStrayAgents();
+        StopStrayAgents();
         while (!ct.IsCancellationRequested)
         {
             try { Check(); }
@@ -96,20 +113,20 @@ internal sealed class AgentLauncher : IDisposable
 
     private void Check()
     {
-        var session = Win32.WTSGetActiveConsoleSessionId();
-        if (session == 0xFFFFFFFF) return; // transizione in corso, nessuna console attiva
+        var session = Win32.TargetSession();
+        if (session == 0xFFFFFFFF) return; // transizione in corso, nessuna sessione utilizzabile
 
         var alive = _agent is { HasExited: false };
         if (alive && _agentSession == session) return;
 
         if (alive)
         {
-            Log.Info($"La console è passata alla sessione {session}: sposto l'agent");
+            Log.Info($"La sessione attiva è ora la {session}: sposto l'agent");
             StopAgent();
         }
         else if (_agent is not null)
         {
-            Log.Warn($"Varco.Agent terminato (codice {SafeExitCode(_agent)}): lo riavvio");
+            Log.Warn($"Agent terminato (codice {SafeExitCode(_agent)}): lo riavvio");
             _agent.Dispose();
             _agent = null;
         }
@@ -143,7 +160,7 @@ internal sealed class AgentLauncher : IDisposable
                 throw new System.ComponentModel.Win32Exception();
 
             var si = new Win32.STARTUPINFO { cb = Marshal.SizeOf<Win32.STARTUPINFO>(), lpDesktop = @"winsta0\default" };
-            var cmd = $"\"{AgentPath}\" --service";
+            var cmd = $"\"{AgentPath}\" --agent";
             if (!Win32.CreateProcessAsUser(dup, null, cmd, IntPtr.Zero, IntPtr.Zero, false,
                     Win32.CREATE_NO_WINDOW | Win32.CREATE_UNICODE_ENVIRONMENT, IntPtr.Zero,
                     AppContext.BaseDirectory, ref si, out var pi))
@@ -151,7 +168,7 @@ internal sealed class AgentLauncher : IDisposable
 
             Win32.CloseHandle(pi.hThread);
             Win32.CloseHandle(pi.hProcess);
-            Log.Info($"Varco.Agent avviato nella sessione {session} (pid {pi.dwProcessId})");
+            Log.Info($"Agent avviato nella sessione {session} (pid {pi.dwProcessId})");
             return Process.GetProcessById(pi.dwProcessId);
         }
         catch (Exception ex)
@@ -166,30 +183,22 @@ internal sealed class AgentLauncher : IDisposable
         }
     }
 
-    private void StopAgent()
+private void StopAgent()
     {
         if (_agent is null) return;
-        try { if (!_agent.HasExited) _agent.Kill(); } catch { }
+        // Prima con le buone (l'agent rilascia i tasti e chiude le connessioni), poi con le cattive.
+        ServiceMain.SignalAgentStop();
+        try { if (!_agent.WaitForExit(2000)) _agent.Kill(); } catch { }
         _agent.Dispose();
         _agent = null;
         _agentSession = uint.MaxValue;
     }
 
-    private static void KillStrayAgents()
+    /// <summary>Un agent rimasto da un'esecuzione precedente terrebbe il mutex: gli chiedo di chiudersi.</summary>
+    private static void StopStrayAgents()
     {
-        foreach (var p in Process.GetProcessesByName("Varco.Agent"))
-        {
-            try
-            {
-                if (string.Equals(p.MainModule?.FileName, AgentPath, StringComparison.OrdinalIgnoreCase))
-                {
-                    Log.Info($"Chiudo un agent rimasto da un'esecuzione precedente (pid {p.Id})");
-                    p.Kill();
-                }
-            }
-            catch { }
-            finally { p.Dispose(); }
-        }
+        ServiceMain.SignalAgentStop();
+        Thread.Sleep(500);
     }
 
     private static string SafeExitCode(Process p)
@@ -226,6 +235,52 @@ internal static class Win32
 
     [DllImport("kernel32.dll")]
     public static extern uint WTSGetActiveConsoleSessionId();
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WTS_SESSION_INFO
+    {
+        public uint SessionId;
+        public IntPtr WinStationName;
+        public int State;
+    }
+
+    private const int WTSActive = 0;
+
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    private static extern bool WTSEnumerateSessions(IntPtr server, int reserved, int version, out IntPtr sessions, out int count);
+
+    [DllImport("wtsapi32.dll")]
+    private static extern void WTSFreeMemory(IntPtr memory);
+
+    /// <summary>
+    /// Sessione in cui far girare l'agent: la console fisica se c'è qualcuno che la usa;
+    /// altrimenti la sessione attiva dell'utente (es. Desktop remoto o sessione avanzata di Hyper-V);
+    /// altrimenti di nuovo la console (schermata di accesso, nessuno collegato).
+    /// </summary>
+    public static uint TargetSession()
+    {
+        var console = WTSGetActiveConsoleSessionId();
+        var active = new List<uint>();
+        if (WTSEnumerateSessions(IntPtr.Zero, 0, 1, out var buffer, out var count))
+        {
+            try
+            {
+                var size = Marshal.SizeOf<WTS_SESSION_INFO>();
+                for (var i = 0; i < count; i++)
+                {
+                    var info = Marshal.PtrToStructure<WTS_SESSION_INFO>(buffer + i * size);
+                    if (info.State == WTSActive && info.SessionId != 0) active.Add(info.SessionId);
+                }
+            }
+            finally
+            {
+                WTSFreeMemory(buffer);
+            }
+        }
+        if (console != 0xFFFFFFFF && active.Contains(console)) return console;
+        if (active.Count > 0) return active.Min();
+        return console;
+    }
 
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);

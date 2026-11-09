@@ -1,5 +1,5 @@
-using System.Drawing.Imaging;
-using Varco.Tray;
+﻿using System.Drawing.Imaging;
+using Varco.App;
 
 // Scrive assets/varco.ico (più dimensioni, frame PNG) e alcune anteprime PNG.
 var root = FindRoot(AppContext.BaseDirectory);

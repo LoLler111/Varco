@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -16,6 +16,8 @@ namespace Varco.Core.Net;
 public sealed class Discovery : IDisposable
 {
     private static readonly byte[] Magic = "VRCB"u8.ToArray();
+    /// <summary>Annuncio pubblico (non firmato): serve a far comparire i PC non ancora abbinati.</summary>
+    private static readonly byte[] AnnounceMagic = "VRCA"u8.ToArray();
     private const int MacSize = 16;
 
     private readonly LocalIdentity _me;
@@ -27,8 +29,11 @@ public sealed class Discovery : IDisposable
 
     public TimeSpan Interval { get; init; } = TimeSpan.FromSeconds(2);
 
-    /// <summary>(id, nome, endpoint TCP del peer)</summary>
+    /// <summary>(id, nome, endpoint TCP del peer) — solo PC dello stesso gruppo (beacon firmato).</summary>
     public event Action<Guid, string, IPEndPoint>? PeerSeen;
+
+    /// <summary>(id, nome, endpoint TCP, stesso gruppo?) — qualsiasi PC con Varco nella rete.</summary>
+    public event Action<Guid, string, IPEndPoint, bool>? Announced;
 
     public Discovery(LocalIdentity me, int port, Func<IEnumerable<IPEndPoint>> extraTargets)
     {
@@ -71,12 +76,47 @@ public sealed class Discovery : IDisposable
 
     private void SendBeacons(IEnumerable<IPEndPoint> targets)
     {
-        var packet = BuildBeacon();
+        byte[][] packets = [BuildBeacon(), BuildAnnounce()];
         foreach (var t in targets.Distinct())
         {
-            try { _udp.Send(packet, packet.Length, t); }
-            catch (Exception ex) { Log.Debug($"Beacon verso {t} fallito: {ex.Message}"); }
+            foreach (var packet in packets)
+            {
+                try { _udp.Send(packet, packet.Length, t); }
+                catch (Exception ex) { Log.Debug($"Beacon verso {t} fallito: {ex.Message}"); }
+            }
         }
+    }
+
+    private byte[] BuildAnnounce()
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms, Encoding.UTF8);
+        w.Write(AnnounceMagic);
+        w.Write((byte)1);
+        w.Write(_me.Id.ToByteArray());
+        w.Write((ushort)_me.ListenPort);
+        w.Write(_me.GroupTag);
+        w.Write(_me.Name.Length > 60 ? _me.Name[..60] : _me.Name);
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    private bool TryParseAnnounce(byte[] buf, out Guid id, out string name, out int tcpPort, out bool sameGroup)
+    {
+        id = Guid.Empty; name = ""; tcpPort = 0; sameGroup = false;
+        if (buf.Length < 4 + 1 + 16 + 2 + 8 + 1 || !buf.AsSpan(0, 4).SequenceEqual(AnnounceMagic)) return false;
+        try
+        {
+            using var r = new BinaryReader(new MemoryStream(buf), Encoding.UTF8);
+            r.ReadBytes(4);
+            if (r.ReadByte() != 1) return false;
+            id = new Guid(r.ReadBytes(16));
+            tcpPort = r.ReadUInt16();
+            sameGroup = r.ReadBytes(8).AsSpan().SequenceEqual(_me.GroupTag);
+            name = r.ReadString();
+            return tcpPort != 0;
+        }
+        catch { return false; }
     }
 
     private async Task ReceiveLoop()
@@ -90,6 +130,14 @@ public sealed class Discovery : IDisposable
             catch (SocketException ex)
             {
                 Log.Debug($"Discovery receive: {ex.SocketErrorCode}");
+                continue;
+            }
+
+            if (TryParseAnnounce(res.Buffer, out var aid, out var aname, out var aport, out var same))
+            {
+                if (aid == _me.Id) continue;
+                try { Announced?.Invoke(aid, aname, new IPEndPoint(res.RemoteEndPoint.Address, aport), same); }
+                catch (Exception ex) { Log.Error("Announced handler", ex); }
                 continue;
             }
 

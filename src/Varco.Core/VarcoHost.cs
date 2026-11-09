@@ -9,7 +9,7 @@ namespace Varco.Core;
 /// <summary>
 /// Mette insieme configurazione, rete, layout e input. Indipendente da Windows (l'input arriva da <see cref="IInputPlatform"/>).
 /// </summary>
-public sealed class VarcoHost : IAsyncDisposable
+public sealed partial class VarcoHost : IAsyncDisposable
 {
     private readonly ConfigStore _store;
     private readonly NetworkProxy _net;
@@ -57,8 +57,11 @@ public sealed class VarcoHost : IAsyncDisposable
             var cfg = _store.Current;
             if (!GroupKey.TryParse(cfg.GroupKey, out var key))
             {
-                Log.Warn("Nessuna chiave di gruppo: rete non avviata (crea o unisciti a un gruppo dall'icona Varco)");
-                return;
+                // Primo avvio: ogni PC nasce come gruppo di uno. L'abbinamento poi unisce i gruppi.
+                var fresh = GroupKey.Generate();
+                _store.Update(c => c.GroupKey = fresh, immediate: true);
+                GroupKey.TryParse(fresh, out key);
+                Log.Info("Creata una nuova chiave di gruppo per questo PC");
             }
 
             var opts = new NodeOptions
@@ -87,6 +90,8 @@ public sealed class VarcoHost : IAsyncDisposable
             node.PeerDisconnected += (id, _) => Coordinator.OnPeerDisconnected(id);
             node.MessageReceived += (id, m) => Coordinator.OnMessage(id, m, ConnectedPeers);
             node.PeerLearned += RememberPeer;
+            node.Announced += OnAnnounced;
+            node.PairingRequested = HandlePairingRequestAsync;
             _node = node;
             _net.Node = node;
             node.Start();
@@ -171,6 +176,25 @@ public sealed class VarcoHost : IAsyncDisposable
                     await RestartNetworkAsync().ConfigureAwait(false);
                     return new ControlResponse { Status = GetStatus() };
 
+                case "pair":
+                    return StartPairing(req.Id, req.Address);
+
+                case "pairAnswer":
+                    return AnswerPairing(req.RequestId, req.Accept == true);
+
+                case "pairCancel":
+                    CancelPairing();
+                    return new ControlResponse();
+
+                case "forget":
+                    if (req.Id is not Guid fid) return Fail("PC non indicato");
+                    await ForgetAsync(fid).ConfigureAwait(false);
+                    return new ControlResponse { Status = GetStatus() };
+
+                case "leaveGroup":
+                    await JoinGroupAsync(GroupKey.Generate()).ConfigureAwait(false);
+                    return new ControlResponse { Status = GetStatus() };
+
                 case "reconnect":
                     _node?.ResetAll("richiesta dall'utente");
                     return new ControlResponse { Status = GetStatus() };
@@ -206,6 +230,7 @@ public sealed class VarcoHost : IAsyncDisposable
         var cfg = _store.Current;
         var peers = _node?.GetStatus() ?? [];
         var active = Coordinator.ActivePeer;
+        var (incoming, outgoing) = PairingStatus();
         return new StatusDto
         {
             MachineId = cfg.MachineId,
@@ -225,6 +250,9 @@ public sealed class VarcoHost : IAsyncDisposable
             }).ToList(),
             Layout = Layout.Current.Entries,
             ManualAddresses = cfg.ManualAddresses.ToList(),
+            Discovered = DiscoveredPeers(),
+            IncomingPair = incoming,
+            OutgoingPair = outgoing,
         };
     }
 

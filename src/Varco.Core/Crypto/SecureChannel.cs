@@ -1,4 +1,4 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 using Varco.Core.Config;
@@ -105,10 +105,11 @@ public static class Handshake
     public static Task<HandshakeResult> RunClientAsync(Stream s, LocalIdentity me, CancellationToken ct) =>
         RunAsync(s, me, isClient: true, ct);
 
-    public static Task<HandshakeResult> RunServerAsync(Stream s, LocalIdentity me, CancellationToken ct) =>
-        RunAsync(s, me, isClient: false, ct);
+    /// <param name="firstFrame">Primo frame già letto dal chiamante (per distinguere handshake e abbinamento).</param>
+    public static Task<HandshakeResult> RunServerAsync(Stream s, LocalIdentity me, CancellationToken ct, byte[]? firstFrame = null) =>
+        RunAsync(s, me, isClient: false, ct, firstFrame);
 
-    private static async Task<HandshakeResult> RunAsync(Stream s, LocalIdentity me, bool isClient, CancellationToken ct)
+    private static async Task<HandshakeResult> RunAsync(Stream s, LocalIdentity me, bool isClient, CancellationToken ct, byte[]? firstFrame = null)
     {
         using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var myHello = BuildHello(me, ecdh.PublicKey.ExportSubjectPublicKeyInfo());
@@ -124,7 +125,7 @@ public static class Handshake
         }
         else
         {
-            peer = ParseHello(await Framing.ReadFrameAsync(s, ct).ConfigureAwait(false));
+            peer = ParseHello(firstFrame ?? await Framing.ReadFrameAsync(s, ct).ConfigureAwait(false));
             clientRaw = peer.Raw;
             serverRaw = myHello;
         }

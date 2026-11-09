@@ -1,6 +1,6 @@
-using System.Drawing.Drawing2D;
+﻿using System.Drawing.Drawing2D;
 
-namespace Varco.Tray;
+namespace Varco.App;
 
 /// <summary>
 /// Logo di Varco: due schermi i cui lati interni formano un varco a V, attraversato dal cursore.
