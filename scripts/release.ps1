@@ -8,7 +8,9 @@ param(
     [string]$Notes,
     [string]$Key = (Join-Path $env:USERPROFILE '.varco\varco-update-key.pem')
 )
-$ErrorActionPreference = 'Stop'
+# Non 'Stop': in Windows PowerShell 5.1 git e gh scrivono i messaggi normali su stderr e verrebbero presi per errori.
+# Gli errori veri si fermano con Check (codice di uscita) e con throw.
+$ErrorActionPreference = 'Continue'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $tag = "v$Version"
 
