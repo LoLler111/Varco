@@ -1,4 +1,5 @@
-﻿using Varco.Core.Net;
+﻿using System.Diagnostics;
+using Varco.Core.Net;
 using Varco.Core.Protocol;
 
 namespace Varco.Core.Input;
@@ -50,6 +51,13 @@ public sealed class InputCoordinator
     private int _localButtons;
     private readonly HashSet<ushort> _localDownKeys = new();
     private readonly HashSet<ushort> _remoteDownKeys = new();
+    // Movimenti raggruppati: un mouse da 1000 Hz farebbe 1000 pacchetti al secondo, che sul Wi-Fi arrivano a raffiche.
+    private int _pendDx, _pendDy;
+    private long _lastMoveSent = long.MinValue / 2;
+    private readonly Timer _flushTimer;
+
+    /// <summary>Intervallo minimo tra due movimenti inviati (ms). Gli spostamenti nel frattempo vengono sommati.</summary>
+    public int MoveIntervalMs { get; init; } = 8;
 
     // lato target
     private readonly Dictionary<ushort, KeyMsg> _injectedKeys = new();
@@ -65,6 +73,7 @@ public sealed class InputCoordinator
         _net = net;
         _platform = platform;
         _layout = layout;
+        _flushTimer = new Timer(_ => { lock (_gate) FlushMoves(); });
         SyncDesktopSize();
     }
 
@@ -86,7 +95,8 @@ public sealed class InputCoordinator
     {
         _mode = mode;
         _peer = peer;
-        var p = mode == InputMode.Local ? (Guid?)null : peer;
+        _pendDx = _pendDy = 0; // spostamenti non inviati: appartenevano al target precedente
+        var p =mode == InputMode.Local ? (Guid?)null : peer;
         Log.Info($"Modalità input: {mode}{(p is null ? "" : $" ({p})")}");
         try { ModeChanged?.Invoke(mode, p); } catch { }
     }
@@ -111,8 +121,11 @@ public sealed class InputCoordinator
                     return true;
 
                 case InputMode.Controlling:
-                    int dx = x - _parkX, dy = y - _parkY;
-                    if (dx != 0 || dy != 0) _net.Send(_peer, new MouseMove(dx, dy));
+                    _pendDx += x - _parkX;
+                    _pendDy += y - _parkY;
+                    var waited = ElapsedMs(_lastMoveSent);
+                    if (waited >= MoveIntervalMs) FlushMoves();
+                    else _flushTimer.Change(Math.Max(1, MoveIntervalMs - (int)waited), Timeout.Infinite); // invia la coda se il mouse si ferma
                     return true;
 
                 default:
@@ -132,6 +145,7 @@ public sealed class InputCoordinator
                     if (down) _localButtons |= 1 << (int)button; else _localButtons &= ~(1 << (int)button);
                     return false;
                 case InputMode.Controlling:
+                    FlushMoves(); // il clic deve arrivare dopo lo spostamento che lo precede
                     _net.Send(_peer, new MouseButtonMsg(button, down));
                     return true;
                 default:
@@ -149,6 +163,7 @@ public sealed class InputCoordinator
             {
                 case InputMode.Local: return false;
                 case InputMode.Controlling:
+                    FlushMoves();
                     _net.Send(_peer, new MouseWheel(delta, horizontal));
                     return true;
                 default:
@@ -187,6 +202,7 @@ public sealed class InputCoordinator
                         _remoteDownKeys.Add(vk);
                         return true;
                     }
+                    FlushMoves();
                     _net.Send(_peer, new KeyMsg(vk, scan, flags));
                     if (up) _remoteDownKeys.Remove(vk); else _remoteDownKeys.Add(vk);
                     return true;
@@ -265,6 +281,17 @@ public sealed class InputCoordinator
     // ═══════════════════════ logica interna (chiamata sotto lock) ═══════════════════════
 
     private bool IsControlledBy(Guid peer) => _mode == InputMode.Controlled && _peer == peer;
+
+    private static double ElapsedMs(long since) => (Stopwatch.GetTimestamp() - since) * 1000.0 / Stopwatch.Frequency;
+
+    /// <summary>Invia al target gli spostamenti accumulati (se ce ne sono).</summary>
+    private void FlushMoves()
+    {
+        if (_mode != InputMode.Controlling || (_pendDx == 0 && _pendDy == 0)) return;
+        _net.Send(_peer, new MouseMove(_pendDx, _pendDy));
+        _pendDx = _pendDy = 0;
+        _lastMoveSent = Stopwatch.GetTimestamp();
+    }
 
     private void StartControlling(Guid target, Edge edge, float ratio, int x, int y, IReadOnlyList<Rect> monitors)
     {

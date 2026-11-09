@@ -24,7 +24,20 @@ public sealed class PeerConnection : IAsyncDisposable
     private readonly int _timeoutMs;
     private long _lastReceived;
     private long _lastSent;
+    private long _lastInput = long.MinValue / 2;
+    private long _lastPing;
     private int _closing;
+
+    // Mentre si usa il mouse su questo collegamento si manda un ping ogni ActivePingMs:
+    //  • la scheda Wi-Fi in risparmio energetico non si "addormenta" e non consegna i movimenti a raffiche;
+    //  • se un pacchetto si perde, il traffico continuo fa partire subito la ritrasmissione TCP invece di aspettare centinaia di ms.
+    private const int ActivePingMs = 20;
+    private const int ActiveWindowMs = 30_000;
+    private const int StatsEveryMs = 10_000;
+    private readonly object _statsGate = new();
+    private int _rttCount, _rttSlow;
+    private double _rttSum, _rttMax;
+    private long _lastStats = Environment.TickCount64;
 
     public Guid PeerId { get; }
     public string PeerName { get; }
@@ -69,7 +82,39 @@ public sealed class PeerConnection : IAsyncDisposable
     public void Send(Message m)
     {
         if (_closing != 0) return;
+        if (IsInput(m)) Volatile.Write(ref _lastInput, Environment.TickCount64);
         _outbox.Writer.TryWrite(MessageCodec.Encode(m));
+    }
+
+    private static bool IsInput(Message m) => m is MouseMove or MouseButtonMsg or MouseWheel or KeyMsg or Enter;
+
+    private bool InputActive => Environment.TickCount64 - Volatile.Read(ref _lastInput) < ActiveWindowMs;
+
+    private void RecordRtt(double ms)
+    {
+        RttMs = ms;
+        if (!InputActive) return;
+        lock (_statsGate)
+        {
+            _rttCount++;
+            _rttSum += ms;
+            if (ms > _rttMax) _rttMax = ms;
+            if (ms > 50) _rttSlow++;
+        }
+    }
+
+    private void MaybeLogStats(long now)
+    {
+        if (now - _lastStats < StatsEveryMs) return;
+        _lastStats = now;
+        lock (_statsGate)
+        {
+            if (_rttCount > 0)
+                Log.Info($"Latenza con {PeerName}: media {_rttSum / _rttCount:0.0} ms, massima {_rttMax:0} ms, " +
+                         $"oltre 50 ms {_rttSlow} su {_rttCount}");
+            _rttCount = _rttSlow = 0;
+            _rttSum = _rttMax = 0;
+        }
     }
 
     public void Close(string reason)
@@ -96,8 +141,9 @@ public sealed class PeerConnection : IAsyncDisposable
                 {
                     case null: break;
                     case Ping p: Send(new Pong(p.Timestamp)); break;
-                    case Pong p: RttMs = (Stopwatch.GetTimestamp() - p.Timestamp) * 1000.0 / Stopwatch.Frequency; break;
+                    case Pong p: RecordRtt((Stopwatch.GetTimestamp() - p.Timestamp) * 1000.0 / Stopwatch.Frequency); break;
                     default:
+                        if (IsInput(msg)) Volatile.Write(ref _lastInput, Environment.TickCount64);
                         try { MessageReceived?.Invoke(this, msg); }
                         catch (Exception ex) { Log.Error($"Errore gestendo {msg.GetType().Name} da {PeerName}", ex); }
                         break;
@@ -128,20 +174,26 @@ public sealed class PeerConnection : IAsyncDisposable
 
     private async Task HeartbeatLoop()
     {
-        var tick = Math.Max(50, _intervalMs / 2);
+        var idleTick = Math.Max(50, _intervalMs / 2);
         try
         {
             while (!_cts.IsCancellationRequested)
             {
-                await Task.Delay(tick, _cts.Token).ConfigureAwait(false);
+                var active = InputActive;
+                await Task.Delay(active ? ActivePingMs / 2 : idleTick, _cts.Token).ConfigureAwait(false);
                 var now = Environment.TickCount64;
                 if (now - Volatile.Read(ref _lastReceived) > _timeoutMs)
                 {
                     Close($"nessuna risposta da {_timeoutMs} ms");
                     return;
                 }
-                if (now - Volatile.Read(ref _lastSent) >= _intervalMs)
+                var due = active ? now - _lastPing >= ActivePingMs : now - Volatile.Read(ref _lastSent) >= _intervalMs;
+                if (due)
+                {
+                    _lastPing = now;
                     Send(new Ping(Stopwatch.GetTimestamp()));
+                }
+                if (active) MaybeLogStats(now);
             }
         }
         catch (OperationCanceledException) { }

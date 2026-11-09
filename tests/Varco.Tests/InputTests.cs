@@ -256,6 +256,29 @@ public class CoordinatorTests
     }
 
     [Fact]
+    public void Rapid_moves_are_coalesced_and_flushed_before_clicks_and_when_the_mouse_stops()
+    {
+        var (c, net, _, other) = Setup();
+        c.OnLocalMouseMove(1919, 540); // passa al vicino, cursore parcheggiato a 960,540
+        int Moves() => net.Sent.Count(s => s.Msg is MouseMove);
+
+        c.OnLocalMouseMove(965, 540);  // primo movimento: subito
+        Assert.Equal(1, Moves());
+        c.OnLocalMouseMove(963, 541);  // entro 8 ms: sommati
+        c.OnLocalMouseMove(964, 541);
+        Assert.Equal(1, Moves());
+
+        c.OnLocalButton(MouseButton.Left, true); // il clic porta con sé gli spostamenti in attesa, prima del clic
+        var tail = net.Sent.SkipWhile(s => s.Msg is not MouseMove).Skip(1).Select(s => s.Msg).ToList();
+        Assert.Equal(new MouseMove(7, 2), tail[0]);
+        Assert.Equal(new MouseButtonMsg(MouseButton.Left, true), tail[1]);
+
+        c.OnLocalMouseMove(961, 540);  // l'ultimo movimento prima di fermarsi arriva comunque
+        Thread.Sleep(100);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is MouseMove { Dx: 1, Dy: 0 });
+    }
+
+    [Fact]
     public void No_crossing_while_dragging_or_when_neighbor_offline()
     {
         var (c, net, _, other) = Setup();
