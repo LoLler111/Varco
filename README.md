@@ -1,3 +1,5 @@
+<img src="assets/varco.svg" width="96" alt="Logo di Varco: due schermi separati da un varco a V attraversato dal cursore">
+
 # Varco
 
 Un solo mouse e una sola tastiera per 2–4 PC Windows sulla stessa rete locale, via cavo o Wi-Fi.
@@ -85,6 +87,14 @@ Mettere la stessa `GroupKey` nei due `config.json` e in A `"ManualAddresses": ["
 Lanciato a mano come utente normale, l'agent funziona solo sul desktop normale: per la schermata di blocco serve il servizio.
 
 Log: `%ProgramData%\Varco\logs\agent.log` e `service.log`.
+
+### Logo e icone
+Il disegno vive in `src/Varco.Tray/VarcoIcon.cs`, su una griglia 128×128 identica a `assets/varco.svg`. Sotto i 32 px si usa la versione senza cursore, `assets/varco-small.svg`.
+Dopo aver modificato il disegno, rigenera `assets/varco.ico` e le anteprime:
+
+```powershell
+dotnet run --project tools/Varco.IconGen
+```
 
 ## Limiti noti e prossimi passi
 - **Ctrl+Alt+Canc** non si può intercettare: agisce sempre sul PC fisico. Inviarlo al remoto richiede `SendSAS` con la policy *SoftwareSASGeneration*.

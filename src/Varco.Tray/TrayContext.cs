@@ -1,4 +1,3 @@
-using System.Drawing.Drawing2D;
 using Varco.Core.Control;
 
 namespace Varco.Tray;
@@ -132,16 +131,9 @@ internal sealed class TrayContext : ApplicationContext
     private Icon IconFor(Color color)
     {
         if (_icons.TryGetValue(color, out var icon)) return icon;
-        using var bmp = new Bitmap(32, 32);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Color.Transparent);
-            using var bg = new SolidBrush(color);
-            g.FillEllipse(bg, 1, 1, 30, 30);
-            using var pen = new Pen(Color.White, 4.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
-            g.DrawLines(pen, [new PointF(9, 9), new PointF(16, 23), new PointF(23, 9)]);
-        }
+        // Dimensione reale dell'icona nella tray (16 px al 100%, 24 al 150%, 32 al 200%).
+        var size = SystemInformation.SmallIconSize.Width;
+        using var bmp = VarcoIcon.RenderTray(size, color);
         icon = Icon.FromHandle(bmp.GetHicon());
         _icons[color] = icon;
         return icon;

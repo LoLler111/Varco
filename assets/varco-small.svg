@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="32" height="32">
+  <title>Varco (versione piccola, sotto i 32 px)</title>
+  <rect width="128" height="128" rx="28.8" fill="#534AB7"/>
+  <g fill="#fff" stroke="#fff" stroke-width="8" stroke-linejoin="round">
+    <path d="M18 26 L46 26 L60 102 L18 102 Z"/>
+    <path d="M110 26 L82 26 L68 102 L110 102 Z"/>
+  </g>
+</svg>

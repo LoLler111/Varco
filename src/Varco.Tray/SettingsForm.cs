@@ -21,6 +21,7 @@ internal sealed class SettingsForm : Form
     public SettingsForm()
     {
         Text = "Varco — impostazioni";
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         AutoSize = true;

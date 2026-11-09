@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="256" height="256">
+  <title>Varco</title>
+  <rect width="128" height="128" rx="28.8" fill="#534AB7"/>
+  <g fill="#fff" stroke="#fff" stroke-width="8" stroke-linejoin="round">
+    <path d="M18 28 L46 28 L58 92 L18 92 Z"/>
+    <path d="M110 28 L82 28 L70 92 L110 92 Z"/>
+  </g>
+  <path d="M57 34 L57 65.2 L65.4 58 L71.4 71.2 L77.4 68.8 L71.4 55.6 L82.2 55.6 Z"
+        fill="#534AB7" stroke="#fff" stroke-width="4" stroke-linejoin="round"/>
+</svg>
