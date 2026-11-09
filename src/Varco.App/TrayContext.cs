@@ -26,11 +26,14 @@ internal sealed class TrayContext : ApplicationContext
     private bool _polling;
     private bool _welcomeShown;
     private bool _firstPoll = true;
+    private bool _afterUpdate;
 
     public const string ShowEventName = @"Local\Varco.Tray.Show";
 
-    public TrayContext(EventWaitHandle showRequests)
+    public TrayContext(EventWaitHandle showRequests, bool afterUpdate = false)
     {
+        _afterUpdate = afterUpdate;
+        _welcomeShown = afterUpdate; // dopo un aggiornamento automatico niente finestra di benvenuto: basta la notifica
         var ui = SynchronizationContext.Current;
         ThreadPool.RegisterWaitForSingleObject(showRequests, (_, _) => ui?.Post(_ => ShowMain(), null), null, Timeout.Infinite, executeOnlyOnce: false);
         _icon = new NotifyIcon { Icon = IconFor(Gray), Text = "Varco", Visible = true, ContextMenuStrip = _menu };
@@ -62,6 +65,12 @@ internal sealed class TrayContext : ApplicationContext
         UpdateIcon();
         _main?.UpdateStatus(_last);
         if (_last is null) return;
+
+        if (_afterUpdate)
+        {
+            _afterUpdate = false;
+            _icon.ShowBalloonTip(5000, "Varco aggiornato", $"Ora usi la versione {Installer.CurrentVersion.ToString(3)}.", ToolTipIcon.Info);
+        }
 
         HandleIncomingRequest(_last.IncomingPair);
         NotifyNewPcs(_last);

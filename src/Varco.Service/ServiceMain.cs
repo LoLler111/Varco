@@ -28,8 +28,56 @@ public static class ServiceMain
             launcher.RunAsync(cts.Token).GetAwaiter().GetResult();
             return 0;
         }
+        if (Path.GetDirectoryName(Environment.ProcessPath) is { } dir) DeleteOldCopies(dir);
         ServiceBase.Run(new VarcoService());
         return 0;
+    }
+
+    /// <summary>
+    /// Avvia un programma come l'utente collegato alla sessione indicata (token non elevato, il suo ambiente, il suo desktop).
+    /// Serve SYSTEM: lo usa l'aggiornamento automatico per riaprire le icone nella tray.
+    /// </summary>
+    public static bool LaunchAsSessionUser(uint session, string exe, string args)
+    {
+        IntPtr user = IntPtr.Zero, env = IntPtr.Zero;
+        try
+        {
+            if (!Win32.WTSQueryUserToken(session, out user)) throw new System.ComponentModel.Win32Exception();
+            if (!Win32.CreateEnvironmentBlock(out env, user, false)) env = IntPtr.Zero;
+            var si = new Win32.STARTUPINFO { cb = Marshal.SizeOf<Win32.STARTUPINFO>(), lpDesktop = @"winsta0\default" };
+            if (!Win32.CreateProcessAsUser(user, null, $"\"{exe}\" {args}", IntPtr.Zero, IntPtr.Zero, false,
+                    Win32.CREATE_UNICODE_ENVIRONMENT, env, Path.GetDirectoryName(exe), ref si, out var pi))
+                throw new System.ComponentModel.Win32Exception();
+            Win32.CloseHandle(pi.hThread);
+            Win32.CloseHandle(pi.hProcess);
+            Log.Info($"Avviato {Path.GetFileName(exe)} {args} nella sessione {session} (pid {pi.dwProcessId})");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Impossibile avviare {Path.GetFileName(exe)} nella sessione {session}: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            if (env != IntPtr.Zero) Win32.DestroyEnvironmentBlock(env);
+            if (user != IntPtr.Zero) Win32.CloseHandle(user);
+        }
+    }
+
+    /// <summary>
+    /// Cancella le copie Varco.old-*.exe lasciate da un aggiornamento (al momento erano in uso da un'icona aperta).
+    /// Quelle ancora in uso restano lì fino alla prossima volta.
+    /// </summary>
+    public static void DeleteOldCopies(string installDir)
+    {
+        try
+        {
+            if (!Directory.Exists(installDir)) return;
+            foreach (var f in Directory.EnumerateFiles(installDir, "Varco.old-*.exe"))
+                try { File.Delete(f); } catch { }
+        }
+        catch { }
     }
 
     /// <summary>Chiede a qualsiasi agent in esecuzione di chiudersi (usato anche dal setup).</summary>
@@ -297,4 +345,13 @@ internal static class Win32
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr h);
+
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    public static extern bool WTSQueryUserToken(uint session, out IntPtr token);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    public static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    public static extern bool DestroyEnvironmentBlock(IntPtr env);
 }

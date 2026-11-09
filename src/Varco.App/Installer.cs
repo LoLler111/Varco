@@ -67,16 +67,24 @@ internal static class Installer
 
     // ═══════════════════════ installazione ═══════════════════════
 
-    public static int RunInstall()
+    /// <param name="update">
+    /// Aggiornamento automatico lanciato dall'agent (SYSTEM): nessuna finestra; le icone nella tray vengono chiuse
+    /// e riaperte nelle sessioni degli utenti; il servizio riparte comunque, anche se qualcosa va storto.
+    /// </param>
+    public static int RunInstall(bool update = false)
     {
         Log.Init(Path.Combine(ConfigStore.DefaultDirectory, "logs"), "setup.log");
         try { File.Delete(ErrorFile); } catch { }
+        var serviceStopped = false;
+        var traySessions = new HashSet<uint>();
         try
         {
             if (!IsAdmin()) throw new InvalidOperationException("Servono i permessi di amministratore.");
-            Log.Info($"Installazione di Varco {CurrentVersion} da {Self}");
+            Log.Info($"{(update ? "Aggiornamento automatico" : "Installazione")} di Varco {CurrentVersion} da {Self}");
 
-            StopEverything();
+            DeleteOldCopies();
+            traySessions = StopEverything();
+            serviceStopped = true;
             CopyFiles();
 
             var exe = InstalledExe;
@@ -111,21 +119,61 @@ internal static class Installer
 
             CreateStartMenuShortcut(exe);
 
-            using (var sc = new System.ServiceProcess.ServiceController(ServiceMain.ServiceName))
-            {
-                sc.Start();
-                sc.WaitForStatus(System.ServiceProcess.ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
-            }
-            Log.Info("Installazione completata");
+            StartService();
+            serviceStopped = false;
+            Log.Info(update ? $"Aggiornamento a {CurrentVersion.ToString(3)} completato" : "Installazione completata");
+            if (update) ReopenTrays(traySessions, "--after-update");
             return 0;
         }
         catch (Exception ex)
         {
-            Log.Error("Installazione fallita", ex);
+            Log.Error(update ? "Aggiornamento fallito" : "Installazione fallita", ex);
             try { File.WriteAllText(ErrorFile, ex.Message); } catch { }
+            // Mai lasciare il PC senza Varco: se il servizio era stato fermato, lo riavvio (con l'exe vecchio se la copia è fallita).
+            if (serviceStopped && ServiceExists())
+                try { StartService(); } catch (Exception ex2) { Log.Error("Riavvio del servizio fallito", ex2); }
+            if (update) ReopenTrays(traySessions, "");
             return 1;
         }
     }
+
+    /// <summary>
+    /// Riapre l'icona in ogni sessione in cui era aperta, come l'utente di quella sessione. Durante un aggiornamento
+    /// automatico non c'è nessuno a cui chiedere: il setup gira come SYSTEM. Nell'installazione normale ci pensa la finestra di setup.
+    /// </summary>
+    private static void ReopenTrays(IEnumerable<uint> sessions, string args)
+    {
+        if (!File.Exists(InstalledExe)) return;
+        foreach (var s in sessions) ServiceMain.LaunchAsSessionUser(s, InstalledExe, args);
+    }
+
+    private static void StartService()
+    {
+        using var sc = new System.ServiceProcess.ServiceController(ServiceMain.ServiceName);
+        if (sc.Status == System.ServiceProcess.ServiceControllerStatus.Running) return;
+        sc.Start();
+        sc.WaitForStatus(System.ServiceProcess.ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
+    }
+
+    /// <summary>Ferma il servizio, che chiude l'agent.</summary>
+    private static void StopService()
+    {
+        try
+        {
+            using var sc = new System.ServiceProcess.ServiceController(ServiceMain.ServiceName);
+            if (sc.Status != System.ServiceProcess.ServiceControllerStatus.Stopped)
+            {
+                Log.Info("Arresto del servizio Varco");
+                sc.Stop();
+                sc.WaitForStatus(System.ServiceProcess.ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(20));
+            }
+        }
+        catch (InvalidOperationException) { /* servizio non installato */ }
+        ServiceMain.SignalAgentStop();
+    }
+
+    /// <summary>Copie vecchie messe da parte durante un aggiornamento (erano in uso da un'icona aperta).</summary>
+    private static void DeleteOldCopies() => ServiceMain.DeleteOldCopies(InstallDir);
 
     private static void CopyFiles()
     {
@@ -144,7 +192,28 @@ internal static class Installer
         }
         else
         {
-            Retry(() => File.Copy(Self, InstalledExe, overwrite: true));
+            // Un exe in esecuzione (es. l'icona nella tray) non si può sovrascrivere ma si può rinominare:
+            // lo sposto da parte, copio il nuovo e, se la copia fallisce, rimetto a posto il vecchio.
+            string? aside = null;
+            if (File.Exists(InstalledExe))
+            {
+                aside = Path.Combine(InstallDir, $"Varco.old-{DateTime.Now:yyyyMMddHHmmssfff}.exe");
+                Retry(() => File.Move(InstalledExe, aside));
+            }
+            try
+            {
+                Retry(() => File.Copy(Self, InstalledExe, overwrite: true));
+            }
+            catch
+            {
+                if (aside is not null)
+                {
+                    try { File.Delete(InstalledExe); } catch { }
+                    File.Move(aside, InstalledExe);
+                }
+                throw;
+            }
+            if (aside is not null) try { File.Delete(aside); } catch { /* ancora in uso: lo cancello alla prossima occasione */ }
         }
         Log.Info($"File copiati in {InstallDir}");
     }
@@ -202,23 +271,14 @@ internal static class Installer
 
     // ═══════════════════════ utilità ═══════════════════════
 
-    private static void StopEverything()
+    /// <summary>Ferma servizio e agent e chiude le icone aperte. Ritorna le sessioni in cui c'era un'icona.</summary>
+    private static HashSet<uint> StopEverything()
     {
-        try
-        {
-            using var sc = new System.ServiceProcess.ServiceController(ServiceMain.ServiceName);
-            if (sc.Status != System.ServiceProcess.ServiceControllerStatus.Stopped)
-            {
-                Log.Info("Arresto del servizio Varco");
-                sc.Stop();
-                sc.WaitForStatus(System.ServiceProcess.ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(20));
-            }
-        }
-        catch (InvalidOperationException) { /* servizio non installato */ }
-
-        ServiceMain.SignalAgentStop();
+        StopService();
+        var sessions = new HashSet<uint>();
         var me = Environment.ProcessId;
-        foreach (var p in Process.GetProcessesByName("Varco"))
+        // Anche le copie Varco.old-*.exe rimaste aperte da un aggiornamento precedente.
+        foreach (var p in Process.GetProcesses().Where(p => p.ProcessName.StartsWith("Varco", StringComparison.OrdinalIgnoreCase)))
         {
             using (p)
             {
@@ -226,15 +286,17 @@ internal static class Installer
                 // Solo le copie installate (icone, agent): non la finestra di setup che ci ha lanciato.
                 string? path = null;
                 try { path = p.MainModule?.FileName; } catch { /* processo SYSTEM: percorso non leggibile */ }
-                if (path is not null && !string.Equals(path, InstalledExe, StringComparison.OrdinalIgnoreCase)) continue;
+                if (path is not null && !string.Equals(Path.GetDirectoryName(path), InstallDir, StringComparison.OrdinalIgnoreCase)) continue;
+                if (path is not null && p.SessionId != 0) sessions.Add((uint)p.SessionId);
                 try
                 {
-                    if (!p.WaitForExit(1500)) p.Kill();
+                    if (!p.WaitForExit(1000)) p.Kill();
                     p.WaitForExit(3000);
                 }
                 catch (Exception ex) { Log.Warn($"Impossibile chiudere Varco (pid {p.Id}): {ex.Message}"); }
             }
         }
+        return sessions;
     }
 
     private static bool ServiceExists() =>

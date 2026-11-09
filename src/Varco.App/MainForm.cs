@@ -20,7 +20,31 @@ internal sealed class MainForm : Form
     private readonly Label _pairCode = new() { AutoSize = true, Location = new Point(12, 36) };
     private readonly Button _pairCancel = new() { Text = "Annulla", AutoSize = true };
 
+    private readonly Label _version = new() { AutoSize = true, ForeColor = Muted, Margin = new Padding(16, 14, 0, 0) };
+
     private string? _peersSig, _foundSig;
+
+    /// <summary>Testo sullo stato degli aggiornamenti (breve per la finestra principale, completo per Avanzate).</summary>
+    internal static string UpdateText(StatusDto? s, bool brief = false)
+    {
+        if (s is null) return "";
+        var v = $"Versione {s.Version}";
+        var u = s.Update;
+        if (u is null) return brief ? v : $"{v}. Gli aggiornamenti funzionano solo con Varco installato.";
+        var state = u.State switch
+        {
+            "Downloading" => $"scarico la versione {u.Latest}…",
+            "Waiting" => $"la versione {u.Latest} si installerà appena smetti di usare un altro PC",
+            "Installing" => $"installo la versione {u.Latest}…",
+            "Checking" => brief ? null : "controllo…",
+            "Error" => brief ? null : $"ultimo controllo non riuscito ({u.Message})",
+            "UpToDate" => brief ? null : "è la più recente",
+            _ => brief ? null : !s.AutoUpdate ? "aggiornamenti automatici spenti" : "controllo entro pochi minuti",
+        };
+        if (!brief && u.LastCheckUtc is { } t && u.State is "UpToDate" or "Error")
+            state += $" (controllato alle {t.ToLocalTime():HH:mm})";
+        return state is null ? v : $"{v}: {state}";
+    }
     private StatusDto? _last;
 
     public MainForm()
@@ -58,7 +82,10 @@ internal sealed class MainForm : Form
 
         var advanced = new LinkLabel { Text = "Avanzate…", AutoSize = true, Margin = new Padding(0, 14, 0, 0) };
         advanced.LinkClicked += (_, _) => { using var f = new AdvancedForm(_last); f.ShowDialog(this); };
-        root.Controls.Add(advanced);
+        var footer = Row();
+        footer.Controls.Add(advanced);
+        footer.Controls.Add(_version);
+        root.Controls.Add(footer);
 
         _pairCode.Font = new Font(FontFamily.GenericMonospace, 22f, FontStyle.Bold);
         _pairCode.ForeColor = VarcoIcon.Brand;
@@ -83,6 +110,8 @@ internal sealed class MainForm : Form
             _subtitle.ForeColor = Bad;
             return;
         }
+
+        _version.Text = UpdateText(s, brief: true);
 
         var connected = s.Peers.Where(p => p.State == "Connected").ToList();
         _subtitle.ForeColor = Muted;

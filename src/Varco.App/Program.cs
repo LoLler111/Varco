@@ -22,7 +22,7 @@ internal static class Program
 
         ApplicationConfiguration.Initialize();
 
-        if (args.Contains("--install")) return Installer.RunInstall();
+        if (args.Contains("--install")) return Installer.RunInstall(update: args.Contains("--update"));
         if (args.Contains("--uninstall")) return Installer.RunUninstallInteractive(quiet: args.Contains("--quiet"));
 
         // --tray forza l'icona anche fuori dalla cartella di installazione (sviluppo).
@@ -32,15 +32,35 @@ internal static class Program
             return 0;
         }
 
-        using var single = new Mutex(true, @"Local\Varco.Tray", out var first);
+        // L'icona gira come utente: log nella sua cartella. Un errore non deve mai bloccarla con una finestra di eccezione.
+        Varco.Core.Log.Init(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Varco", "logs"), "tray.log");
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => Varco.Core.Log.Error("Errore nell'icona", e.Exception);
+
+        // --after-update: avviata dalla vecchia icona dopo un aggiornamento; aspetto che quella si chiuda.
+        var afterUpdate = args.Contains("--after-update");
+        using var single = new Mutex(false, @"Local\Varco.Tray");
         using var show = new EventWaitHandle(false, EventResetMode.AutoReset, TrayContext.ShowEventName);
-        if (!first)
+        if (!Acquire(single, afterUpdate ? 15000 : 0))
         {
             // Già aperto (es. lanciato di nuovo dal menu Start): chiedo all'istanza esistente di mostrare la finestra.
-            show.Set();
+            if (!afterUpdate) show.Set();
             return 0;
         }
-        Application.Run(new TrayContext(show));
+        try
+        {
+            Application.Run(new TrayContext(show, afterUpdate));
+        }
+        finally
+        {
+            single.ReleaseMutex();
+        }
         return 0;
+    }
+
+    private static bool Acquire(Mutex m, int timeoutMs)
+    {
+        try { return m.WaitOne(timeoutMs); }
+        catch (AbandonedMutexException) { return true; } // l'istanza precedente è uscita senza rilasciarlo
     }
 }

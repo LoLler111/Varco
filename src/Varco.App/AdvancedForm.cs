@@ -59,7 +59,33 @@ internal sealed class AdvancedForm : Form
                         "Varco", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
                     await Send(new ControlRequest { Cmd = "leaveGroup" });
             })));
-        root.Controls.Add(Hint($"Versione {Application.ProductVersion.Split('+')[0]}"));
+        root.Controls.Add(Header("Aggiornamenti"));
+        _autoUpdate.Checked = status?.AutoUpdate ?? true;
+        _autoUpdate.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setAutoUpdate", Enabled = _autoUpdate.Checked });
+        root.Controls.Add(_autoUpdate);
+        root.Controls.Add(Row(Btn("Controlla ora", async (_, _) =>
+        {
+            if (await Send(new ControlRequest { Cmd = "checkUpdate" }) is { Status: { } s }) ShowUpdate(s);
+        }), _updateText));
+        ShowUpdate(status);
+
+        // Lo stato dell'aggiornamento cambia mentre la finestra è aperta (controllo, download…).
+        var timer = new System.Windows.Forms.Timer { Interval = 1000 };
+        timer.Tick += async (_, _) =>
+        {
+            try { ShowUpdate((await ControlClient.SendAsync(new ControlRequest { Cmd = "status" })).Status); } catch { }
+        };
+        timer.Start();
+        FormClosed += (_, _) => timer.Dispose();
+    }
+
+    private readonly CheckBox _autoUpdate = new() { Text = "Aggiorna Varco automaticamente (consigliato)", AutoSize = true, Margin = new Padding(0, 2, 0, 2) };
+    private readonly Label _updateText = new() { AutoSize = true, MaximumSize = new Size(300, 0), ForeColor = SystemColors.GrayText, Margin = new Padding(6, 7, 0, 0) };
+
+    private void ShowUpdate(StatusDto? s)
+    {
+        if (IsDisposed) return;
+        _updateText.Text = MainForm.UpdateText(s);
     }
 
     private async Task<ControlResponse?> Send(ControlRequest req)

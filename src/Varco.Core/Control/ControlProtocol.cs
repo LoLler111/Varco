@@ -17,7 +17,8 @@ public sealed class ControlRequest
 {
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
-    /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey
+    /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
+    /// checkUpdate | setAutoUpdate (Enabled)
     /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
@@ -28,6 +29,7 @@ public sealed class ControlRequest
     public bool? Accept { get; set; }
     /// <summary>setLayout: nuove posizioni dei PC nella disposizione 2D.</summary>
     public List<LayoutPositionDto>? Positions { get; set; }
+    public bool? Enabled { get; set; }
 }
 
 public sealed class ControlResponse
@@ -55,6 +57,21 @@ public sealed class StatusDto
     public PairRequestDto? IncomingPair { get; set; }
     /// <summary>Abbinamento avviato da questo PC.</summary>
     public PairProgressDto? OutgoingPair { get; set; }
+    /// <summary>Versione dell'agent in esecuzione (x.y.z).</summary>
+    public string Version { get; set; } = "";
+    public bool AutoUpdate { get; set; } = true;
+    /// <summary>Null se gli aggiornamenti non sono attivi (agent avviato a mano per sviluppo).</summary>
+    public UpdateStatusDto? Update { get; set; }
+}
+
+public sealed class UpdateStatusDto
+{
+    /// <summary>Idle | Checking | UpToDate | Downloading | Waiting | Installing | Error</summary>
+    public string State { get; set; } = "Idle";
+    /// <summary>Ultima versione pubblicata, se nota.</summary>
+    public string? Latest { get; set; }
+    public string? Message { get; set; }
+    public DateTime? LastCheckUtc { get; set; }
 }
 
 /// <summary>Posizione di un PC nella disposizione (pixel virtuali, angolo in alto a sinistra).</summary>

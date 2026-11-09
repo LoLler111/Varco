@@ -23,6 +23,25 @@ public sealed partial class VarcoHost : IAsyncDisposable
     public InputCoordinator Coordinator { get; }
     public NetworkNode? Node => _node;
 
+    /// <summary>Aggiornamenti automatici: impostato dall'agent solo quando gira installato (non in sviluppo).</summary>
+    public Update.Updater? Updater { get; private set; }
+
+    public static Version CurrentVersion => Update.UpdateSignature.Normalize(typeof(VarcoHost).Assembly.GetName().Version ?? new Version(0, 0, 0));
+
+    public void EnableUpdates()
+    {
+        var cfg = _store.Current;
+        Updater = new Update.Updater(new Update.UpdaterOptions
+        {
+            FeedUrl = string.IsNullOrWhiteSpace(cfg.UpdateFeedUrl) ? Update.Updater.GitHubFeed : cfg.UpdateFeedUrl,
+            CurrentVersion = CurrentVersion,
+            DownloadDirectory = Path.Combine(_store.Directory, "updates"),
+            CanInstallNow = () => Coordinator.Mode == InputMode.Local,
+            Enabled = () => _store.Current.AutoUpdate,
+        });
+        Updater.Start();
+    }
+
     public VarcoHost(ConfigStore store, IInputPlatform platform, int? tcpPort = null, int? discoveryPort = null)
     {
         _store = store;
@@ -137,7 +156,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
     public void OnSuspend() => Coordinator.OnPeerDisconnected(Coordinator.ActivePeer ?? Guid.Empty);
 
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ comandi dalla tray â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ───────────────────────────── comandi dalla tray ─────────────────────────────
 
     public async Task<ControlResponse> HandleAsync(ControlRequest req)
     {
@@ -150,6 +169,16 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
                 case "getKey":
                     return new ControlResponse { Key = _store.Current.GroupKey };
+
+                case "checkUpdate":
+                    if (Updater is null) return Fail("Gli aggiornamenti funzionano solo con Varco installato.");
+                    Updater.CheckSoon();
+                    return new ControlResponse { Status = GetStatus() };
+
+                case "setAutoUpdate":
+                    _store.Update(c => c.AutoUpdate = req.Enabled != false, immediate: true);
+                    if (req.Enabled != false) Updater?.CheckSoon();
+                    return new ControlResponse { Status = GetStatus() };
 
                 case "newGroup":
                 {
@@ -266,11 +295,15 @@ public sealed partial class VarcoHost : IAsyncDisposable
             Discovered = DiscoveredPeers(),
             IncomingPair = incoming,
             OutgoingPair = outgoing,
+            Version = CurrentVersion.ToString(3),
+            AutoUpdate = cfg.AutoUpdate,
+            Update = Updater?.Status,
         };
     }
 
     public async ValueTask DisposeAsync()
     {
+        Updater?.Dispose();
         await _desktopWatch.DisposeAsync().ConfigureAwait(false);
         _net.Node = null;
         if (_node is not null) await _node.DisposeAsync().ConfigureAwait(false);

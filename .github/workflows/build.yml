@@ -1,0 +1,19 @@
+name: build
+
+# Compila e lancia i test a ogni push e pull request. Le release (firmate) si fanno in locale con scripts/release.ps1:
+# la chiave di firma non esce mai dal PC di chi pubblica.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet build Varco.slnx -c Release
+      - run: dotnet test Varco.slnx -c Release --no-build

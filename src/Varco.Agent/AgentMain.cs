@@ -53,6 +53,9 @@ public static class AgentMain
         control.Start();
         await host.StartAsync();
 
+        // Aggiornamenti automatici solo per l'agent avviato dal servizio (Varco installato), non in sviluppo.
+        if (!console && !noInput && Arg(args, "--config") is null) host.EnableUpdates();
+
         var exit = new TaskCompletionSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; exit.TrySetResult(); };
         AppDomain.CurrentDomain.ProcessExit += (_, _) => exit.TrySetResult();

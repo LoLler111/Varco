@@ -16,10 +16,11 @@ Ci riesce dopo uno standby, un cambio di rete, un riavvio o un cavo staccato, se
 
 - **Ctrl+Alt+F12** riporta sempre mouse e tastiera sul PC fisico (via di fuga).
 - Se tocchi il mouse o la tastiera del PC comandato, il controllo passa a quel PC.
-- Per aggiornare: apri il nuovo `Varco.exe` e premi **Aggiorna**. I PC già collegati restano collegati.
+- **Aggiornamenti automatici:** Varco controlla le [release su GitHub](https://github.com/LoLler111/Varco/releases) qualche minuto dopo l'avvio e poi ogni 6 ore circa. Le nuove versioni si installano da sole, senza conferme, appena nessun PC sta usando mouse e tastiera di un altro. Si possono spegnere, o forzare un controllo, in *Avanzate*.
+- Per aggiornare a mano: apri il nuovo `Varco.exe` e premi **Aggiorna**. I PC già collegati restano collegati.
 - Per disinstallare: *Impostazioni → App → App installate → Varco → Disinstalla*.
 
-`Varco.exe` si crea con `scripts\publish.ps1` (un solo file di circa 50 MB, .NET incluso).
+`Varco.exe` si scarica dalle [release](https://github.com/LoLler111/Varco/releases/latest) oppure si crea con `scripts\publish.ps1` (un solo file di circa 50 MB, .NET incluso).
 
 ### Cosa fa il setup
 - Copia `Varco.exe` in `C:\Program Files\Varco`.
@@ -65,7 +66,8 @@ Varco.exe --uninstall  → disinstallazione
 | `src/Varco.Agent` | Parti Win32: hook, iniezione, cambio di desktop, notifiche di standby, pipe di controllo. |
 | `src/Varco.Service` | Servizio che tiene l'agent vivo nella sessione della console. |
 | `src/Varco.App` | `Varco.exe`: setup, icona nella tray, finestre (WinForms) e smistamento dei ruoli. |
-| `tests/Varco.Tests` | Test su crittografia, riconnessione e abbinamento reali su loopback, geometria, layout e coordinatore. |
+| `tests/Varco.Tests` | Test su crittografia, riconnessione e abbinamento reali su loopback, geometria, layout, coordinatore e aggiornamenti firmati. |
+| `tools/Varco.Release` | Chiave, firma e verifica delle release (usato da `scripts/release.ps1`). |
 ### Riconnessione: perché qui non si blocca
 
 | Problema di Mouse Without Borders | Soluzione in Varco |
@@ -84,6 +86,14 @@ Varco.exe --uninstall  → disinstallazione
 - **Traffico:** cifrato con AES-256-GCM, contatore come nonce, una chiave per direzione.
 - **Beacon UDP:** quelli del gruppo sono firmati con HMAC e gli estranei li ignorano. Esiste anche un annuncio pubblico (ID, nome, porta), che serve solo a far comparire il PC nella lista *PC trovati*.
 - **Configurazione:** `%ProgramData%\Varco\config.json`, con ACL ristretta a SYSTEM e amministratori.
+- **Aggiornamenti:** ogni release contiene `Varco.exe` e `Varco.exe.sig`. Il `.sig` riporta versione, SHA-256 e dimensione dell'exe ed è firmato con ECDSA P-256. La chiave pubblica è dentro Varco, la privata resta sul PC di chi pubblica. L'agent (SYSTEM) scarica in `%ProgramData%\Varco\updates`, una cartella accessibile solo a SYSTEM e amministratori, ricontrolla firma e hash subito prima di avviare `Varco.exe --install --update` e non accetta mai versioni uguali o più vecchie. Un exe non firmato con quella chiave non viene installato, nemmeno se qualcuno riesce a caricarlo nella pagina delle release.
+
+### Come avviene un aggiornamento
+1. L'agent trova una versione più recente, la scarica e la verifica. Se in quel momento stai usando un altro PC, aspetta e riprova ogni minuto.
+2. Avvia il nuovo exe con `--install --update`. Il nuovo exe ferma il servizio, sposta da parte l'exe in uso (`Varco.old-*.exe`, che un'icona aperta tiene bloccato), copia quello nuovo e riavvia il servizio. Se qualcosa va storto rimette a posto il vecchio e riavvia comunque il servizio.
+3. L'icona nella tray si accorge che l'agent è più nuovo, avvia la nuova versione e si chiude. Compare la notifica *Varco aggiornato*.
+
+I PC del gruppo si aggiornano ognuno per conto proprio, quindi per qualche ora possono avere versioni diverse: il protocollo di rete deve restare compatibile tra una versione e la successiva.
 
 ### Porte
 - TCP 47800: connessioni
@@ -110,6 +120,19 @@ $exe = "src\Varco.App\bin\Debug\net10.0-windows\Varco.exe"
 I due agent si trovano da soli e il secondo compare in *PC trovati nella rete*.
 Lanciato a mano come utente normale, l'agent funziona solo sul desktop normale: per la schermata di blocco serve il servizio.
 Log: `%ProgramData%\Varco\logs\` (`agent.log`, `service.log`, `setup.log`).
+
+### Pubblicare una nuova versione
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Version 0.4.0 -Notes "Cosa cambia"
+```
+
+Lo script vuole il working tree pulito, lancia i test, crea `Varco.exe` con quella versione, lo firma con `%USERPROFILE%\.varco\varco-update-key.pem` e crea il tag e la release su GitHub con `Varco.exe` e `Varco.exe.sig`.
+**Conserva una copia della chiave privata in un posto sicuro**: senza quella chiave i PC già installati non accettano più aggiornamenti e andrebbero reinstallati a mano con una versione che contiene una chiave nuova.
+`tools/Varco.Release` crea la chiave (`keygen`), firma (`sign`) e verifica (`verify`).
+GitHub Actions (`.github/workflows/build.yml`) compila e lancia i test a ogni push, ma non firma nulla.
+
+Per provare un aggiornamento senza GitHub: in `%ProgramData%\Varco\config.json` imposta `"UpdateFeedUrl"` su un server locale che risponde come l'API delle release di GitHub.
 
 ### Logo e icone
 Il disegno vive in `src/Varco.App/VarcoIcon.cs`, su una griglia 128×128 identica a `assets/varco.svg`. Sotto i 32 px si usa la versione senza cursore, `assets/varco-small.svg`.
