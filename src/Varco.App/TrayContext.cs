@@ -39,6 +39,8 @@ internal sealed class TrayContext : ApplicationContext
         _icon = new NotifyIcon { Icon = IconFor(Gray), Text = "Varco", Visible = true, ContextMenuStrip = _menu };
         _icon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowMain(); };
         _icon.BalloonTipClicked += (_, _) => ShowMain();
+        _menu.Renderer = new DarkMenuRenderer();
+        _menu.ForeColor = Ui.Text;
         _menu.Opening += (_, _) => BuildMenu();
         _timer.Tick += async (_, _) => await Poll();
         _timer.Start();

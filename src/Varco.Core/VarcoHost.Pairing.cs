@@ -27,7 +27,13 @@ public sealed partial class VarcoHost
 
     private void OnAnnounced(Guid id, string name, IPEndPoint ep, bool sameGroup)
     {
-        lock (_pairGate) _seen[id] = new Seen(name, ep, Environment.TickCount64, sameGroup);
+        bool isNew;
+        lock (_pairGate)
+        {
+            isNew = !_seen.TryGetValue(id, out var old) || !old.Endpoint.Address.Equals(ep.Address);
+            _seen[id] = new Seen(name, ep, Environment.TickCount64, sameGroup);
+        }
+        if (isNew) Log.Info($"Visto {name} su {ep.Address}{(sameGroup ? " (già collegato)" : "")}");
     }
 
     private PairOffer MyOffer() =>

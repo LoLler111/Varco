@@ -22,6 +22,9 @@ internal static class Program
 
         ApplicationConfiguration.Initialize();
 
+#if DEBUG
+        if (Array.IndexOf(args, "--ui-preview") is var p and >= 0) return UiPreview.Run(args.ElementAtOrDefault(p + 1) ?? "ui-preview");
+#endif
         if (args.Contains("--install")) return Installer.RunInstall(update: args.Contains("--update"));
         if (args.Contains("--uninstall")) return Installer.RunUninstallInteractive(quiet: args.Contains("--quiet"));
 

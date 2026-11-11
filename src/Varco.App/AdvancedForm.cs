@@ -7,66 +7,99 @@ namespace Varco.App;
 /// <summary>Opzioni per i casi particolari (reti diverse, PC che non si trovano da soli).</summary>
 internal sealed class AdvancedForm : Form
 {
-    private readonly TextBox _address = new() { Width = 250, PlaceholderText = "192.168.1.20" };
-    private readonly ListBox _manual = new() { Width = 250, Height = 64, IntegralHeight = false };
+    private static readonly int W = Ui.S(440);
+
+    private readonly InputBox _address;
+    private readonly ListBox _manual = new() { IntegralHeight = false, BorderStyle = BorderStyle.None, BackColor = Ui.Well, ForeColor = Ui.Text, DrawMode = DrawMode.OwnerDrawFixed, Margin = Padding.Empty };
+    private readonly Toggle _autoUpdate = new("Aggiorna Varco automaticamente (consigliato)");
+    private readonly Label _updateText;
 
     public AdvancedForm(StatusDto? status)
     {
+        Ui.StyleForm(this);
         Text = "Varco — avanzate";
-        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
+        ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
         AutoSize = true;
         AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        Padding = new Padding(18, 12, 18, 14);
-        Font = SystemFonts.MessageBoxFont ?? Font;
+        Padding = Ui.P(18, 6, 18, 18);
 
-        var root = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false };
+        var root = Ui.Column();
+        root.Location = new Point(Padding.Left, Padding.Top);
         Controls.Add(root);
 
-        root.Controls.Add(Header("Collega un PC tramite indirizzo IP"));
-        root.Controls.Add(Hint("Serve solo se l'altro PC non compare da solo, ad esempio perché è su un'altra rete."));
-        root.Controls.Add(Row(_address, Btn("Collega", async (_, _) =>
+        // collegamento manuale
+        var manual = new Card(W, "Collega un PC tramite indirizzo IP");
+        manual.Body.Controls.Add(Ui.Label("Serve solo se l'altro PC non compare da solo, ad esempio perché è su un'altra rete. " +
+            "L'indirizzo lo trovi nella finestra di Varco sull'altro PC.", color: Ui.Muted, maxWidth: manual.InnerWidth, margin: Ui.P(0, 0, 0, 10)));
+        var connect = new VButton("Collega", primary: true);
+        connect.Click += async (_, _) => await PairByAddress();
+        _address = new InputBox(manual.InnerWidth - connect.Width - Ui.S(8), connect.Height, "es. 192.168.1.20") { Margin = Ui.P(0, 0, 8, 0) };
+        _address.Box.KeyDown += async (_, e) =>
         {
-            if (string.IsNullOrWhiteSpace(_address.Text)) return;
-            if (await Send(new ControlRequest { Cmd = "pair", Address = _address.Text.Trim() }) is not null)
-            {
-                await Send(new ControlRequest { Cmd = "addAddress", Address = _address.Text.Trim() });
-                Close(); // l'avanzamento si vede nella finestra principale
-            }
-        })));
+            if (e.KeyCode != Keys.Enter) return;
+            e.SuppressKeyPress = true;
+            await PairByAddress();
+        };
+        manual.Body.Controls.Add(Row(_address, connect));
+        var mine = Ui.LocalAddresses();
+        if (mine.Count > 0)
+            manual.Body.Controls.Add(Ui.Label($"Indirizzo di questo PC: {string.Join(", ", mine)}", Ui.Small, Ui.Muted, manual.InnerWidth, Ui.P(0, 8, 0, 0)));
 
-        root.Controls.Add(Header("Indirizzi cercati sempre"));
+        manual.Body.Controls.Add(Ui.Label("Indirizzi cercati sempre", Ui.BodyStrong, margin: Ui.P(0, 14, 0, 6)));
+        var remove = new VButton("Rimuovi");
+        var listW = manual.InnerWidth - remove.Width - Ui.S(8);
+        var listBox = new Tint(Ui.Well) { Edge = Ui.Line, Padding = Ui.P(6, 6, 6, 6), AutoSize = false, Size = new Size(listW, Ui.S(80)), Margin = Ui.P(0, 0, 8, 0) };
+        _manual.ItemHeight = Ui.S(22);
+        _manual.Bounds = new Rectangle(Ui.S(6), Ui.S(6), listW - Ui.S(12), Ui.S(68));
+        _manual.DrawItem += DrawAddress;
+        listBox.Controls.Add(_manual);
         if (status is not null) _manual.Items.AddRange(status.ManualAddresses.ToArray());
-        root.Controls.Add(Row(_manual, Btn("Rimuovi", async (_, _) =>
+        remove.Click += async (_, _) =>
         {
             if (_manual.SelectedItem is not string a) return;
             if (await Send(new ControlRequest { Cmd = "removeAddress", Address = a }) is not null) _manual.Items.Remove(a);
-        })));
+        };
+        manual.Body.Controls.Add(Row(listBox, remove));
+        root.Controls.Add(manual);
 
-        root.Controls.Add(Header("Problemi"));
-        root.Controls.Add(Row(
-            Btn("Riconnetti ora", async (_, _) => await Send(new ControlRequest { Cmd = "reconnect" })),
-            Btn("Apri i log", (_, _) =>
-            {
-                var dir = Path.Combine(ConfigStore.DefaultDirectory, "logs");
-                if (Directory.Exists(dir)) Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dir}\"") { UseShellExecute = true });
-            }),
-            Btn("Scollega questo PC da tutti", async (_, _) =>
-            {
-                if (MessageBox.Show(this, "Questo PC si scollegherà da tutti gli altri. Potrai ricollegarlo quando vuoi. Continuare?",
-                        "Varco", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
-                    await Send(new ControlRequest { Cmd = "leaveGroup" });
-            })));
-        root.Controls.Add(Header("Aggiornamenti"));
+        // problemi
+        var problems = new Card(W, "Problemi");
+        var reconnect = new VButton("Riconnetti ora");
+        reconnect.Click += async (_, _) => await Send(new ControlRequest { Cmd = "reconnect" });
+        var logs = new VButton("Apri i log");
+        logs.Click += (_, _) =>
+        {
+            var dir = Path.Combine(ConfigStore.DefaultDirectory, "logs");
+            if (Directory.Exists(dir)) Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dir}\"") { UseShellExecute = true });
+        };
+        reconnect.Margin = Ui.P(0, 0, 8, 0);
+        problems.Body.Controls.Add(Row(reconnect, logs));
+        problems.Body.Controls.Add(Ui.Link("Scollega questo PC da tutti gli altri…", async () =>
+        {
+            if (MessageBox.Show(this, "Questo PC si scollegherà da tutti gli altri. Potrai ricollegarlo quando vuoi. Continuare?",
+                    "Varco", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                await Send(new ControlRequest { Cmd = "leaveGroup" });
+        }, Ui.P(0, 12, 0, 0)));
+        root.Controls.Add(problems);
+
+        // aggiornamenti
+        var updates = new Card(W, "Aggiornamenti");
         _autoUpdate.Checked = status?.AutoUpdate ?? true;
         _autoUpdate.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setAutoUpdate", Enabled = _autoUpdate.Checked });
-        root.Controls.Add(_autoUpdate);
-        root.Controls.Add(Row(Btn("Controlla ora", async (_, _) =>
+        updates.Body.Controls.Add(_autoUpdate);
+        var check = new VButton("Controlla ora");
+        check.Click += async (_, _) =>
         {
             if (await Send(new ControlRequest { Cmd = "checkUpdate" }) is { Status: { } s }) ShowUpdate(s);
-        }), _updateText));
+        };
+        _updateText = Ui.Label("", Ui.Small, Ui.Muted, updates.InnerWidth - check.Width - Ui.S(12));
+        var updateRow = new LineRow(updates.InnerWidth, Ui.S(44), [check, _updateText], stretch: null) { Margin = Ui.P(0, 10, 0, 0) };
+        _updateText.Margin = Ui.P(12, 0, 0, 0);
+        updates.Body.Controls.Add(updateRow);
+        root.Controls.Add(updates);
         ShowUpdate(status);
 
         // Lo stato dell'aggiornamento cambia mentre la finestra è aperta (controllo, download…).
@@ -79,13 +112,34 @@ internal sealed class AdvancedForm : Form
         FormClosed += (_, _) => timer.Dispose();
     }
 
-    private readonly CheckBox _autoUpdate = new() { Text = "Aggiorna Varco automaticamente (consigliato)", AutoSize = true, Margin = new Padding(0, 2, 0, 2) };
-    private readonly Label _updateText = new() { AutoSize = true, MaximumSize = new Size(300, 0), ForeColor = SystemColors.GrayText, Margin = new Padding(6, 7, 0, 0) };
+    private async Task PairByAddress()
+    {
+        var a = _address.Box.Text.Trim();
+        if (a.Length == 0) { _address.Box.Focus(); return; }
+        if (await Send(new ControlRequest { Cmd = "pair", Address = a }) is not null)
+        {
+            await Send(new ControlRequest { Cmd = "addAddress", Address = a });
+            Close(); // l'avanzamento si vede nella finestra principale
+        }
+    }
+
+    /// <summary>Voce della lista indirizzi: selezione viola scuro invece del blu di sistema.</summary>
+    private void DrawAddress(object? sender, DrawItemEventArgs e)
+    {
+        if (e.Index < 0) return;
+        var selected = (e.State & DrawItemState.Selected) != 0;
+        using (var bg = new SolidBrush(selected ? Ui.AccentSoft : Ui.Well))
+            e.Graphics.FillRectangle(bg, e.Bounds);
+        TextRenderer.DrawText(e.Graphics, _manual.Items[e.Index]?.ToString(), Ui.Body,
+            new Rectangle(e.Bounds.X + Ui.S(6), e.Bounds.Y, e.Bounds.Width - Ui.S(6), e.Bounds.Height),
+            selected ? Ui.AccentText : Ui.Text, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+    }
 
     private void ShowUpdate(StatusDto? s)
     {
         if (IsDisposed) return;
         _updateText.Text = MainForm.UpdateText(s);
+        _updateText.Parent?.PerformLayout();
     }
 
     private async Task<ControlResponse?> Send(ControlRequest req)
@@ -103,26 +157,9 @@ internal sealed class AdvancedForm : Form
         return null;
     }
 
-    private Label Header(string text) => new()
-    {
-        Text = text,
-        AutoSize = true,
-        Font = new Font(Font, FontStyle.Bold),
-        Margin = new Padding(0, 12, 0, 2),
-    };
-
-    private static Label Hint(string text) => new() { Text = text, AutoSize = true, MaximumSize = new Size(420, 0), ForeColor = SystemColors.GrayText };
-
-    private static Button Btn(string text, EventHandler onClick)
-    {
-        var b = new Button { Text = text, AutoSize = true, Height = 28 };
-        b.Click += onClick;
-        return b;
-    }
-
     private static FlowLayoutPanel Row(params Control[] controls)
     {
-        var p = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 2, 0, 2) };
+        var p = Ui.Flow();
         p.Controls.AddRange(controls);
         return p;
     }

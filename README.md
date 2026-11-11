@@ -78,6 +78,7 @@ Varco.exe --uninstall  → disinstallazione
 | Dipende da chi torna online per primo | Entrambi i lati compongono. Se nascono due connessioni, la scelta è deterministica: nella finestra di gara vince quella aperta dall'ID più basso, altrimenti la più recente. |
 | Socket rimasti vecchi dopo lo standby | Al risveglio tutte le connessioni vengono chiuse e riaperte. |
 | Il firewall blocca dopo che la rete diventa "Pubblica" | Le regole del firewall valgono per tutti i profili. |
+| Il router non inoltra i broadcast tra cavo e Wi-Fi | Ogni 30 s (e dopo un cambio di rete) Varco annuncia sé stesso in unicast a ogni indirizzo della sottorete, e chi riceve un annuncio risponde direttamente. Basta che passi in una direzione. |
 | Tasti incastrati quando cade la connessione | Il PC comandato rilascia tutti i tasti e i pulsanti premuti. Il cursore torna sul PC fisico. |
 
 ### Sicurezza

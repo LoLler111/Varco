@@ -12,9 +12,9 @@ internal sealed class LayoutCanvas : Control
 {
     public sealed record Item(Guid Id, string Name, bool IsSelf, bool Connected, int X, int Y, int Width, int Height);
 
-    private const int Pad = 10;
+    private static readonly int Pad = Ui.S(10);
     /// <summary>Distanza (pixel sullo schermo) entro cui i bordi si allineano.</summary>
-    private const int AlignPx = 10;
+    private static readonly int AlignPx = Ui.S(10);
 
     private List<Item> _items = [];
     private readonly Font _small;
@@ -34,7 +34,7 @@ internal sealed class LayoutCanvas : Control
     {
         DoubleBuffered = true;
         ResizeRedraw = true;
-        Height = 190;
+        Height = Ui.S(190);
         _small = new Font(Font.FontFamily, Math.Max(6.5f, Font.Size - 1.5f));
     }
 
@@ -87,11 +87,20 @@ internal sealed class LayoutCanvas : Control
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
-        using (var bg = new SolidBrush(Color.FromArgb(0xF7, 0xF6, 0xF2)))
-        using (var frame = Rounded(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 8))
-        using (var border = new Pen(Color.FromArgb(0xE2, 0xE0, 0xD8)))
+        g.Clear(Parent?.BackColor ?? Ui.Card);
+        using (var bg = new SolidBrush(Ui.Well))
+        using (var frame = Rounded(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), Ui.S(10)))
+        using (var border = new Pen(Ui.Border))
         {
             g.FillPath(bg, frame);
+            // griglia di puntini leggera: dà profondità alla "scrivania" senza costare nulla
+            using (var dots = new SolidBrush(Color.FromArgb(0x22, 0x20, 0x2C)))
+            {
+                var step = Ui.S(16);
+                for (int y = step; y < Height - 4; y += step)
+                    for (int x = step; x < Width - 4; x += step)
+                        g.FillRectangle(dots, x, y, 2, 2);
+            }
             g.DrawPath(border, frame);
         }
 
@@ -106,7 +115,7 @@ internal sealed class LayoutCanvas : Control
             var it = _items[_drag];
             // dove si aggancerà al rilascio
             var target = ToScreen(_snapX, _snapY, it.Width, it.Height);
-            using (var ghost = new Pen(VarcoIcon.Brand, 1.5f) { DashStyle = DashStyle.Dash })
+            using (var ghost = new Pen(Ui.Accent, 1.5f) { DashStyle = DashStyle.Dash })
             using (var path = Rounded(target, 6))
                 g.DrawPath(ghost, path);
             DrawTile(g, it, ToScreen(_rawX, _rawY, it.Width, it.Height), dragging: true);
@@ -115,15 +124,27 @@ internal sealed class LayoutCanvas : Control
 
     private void DrawTile(Graphics g, Item item, RectangleF rect, bool dragging)
     {
-        var fill = item.IsSelf ? VarcoIcon.Brand : item.Connected ? Color.FromArgb(0xEE, 0xED, 0xFE) : Color.FromArgb(0xF1, 0xEF, 0xE8);
-        var border = item.IsSelf ? VarcoIcon.Brand : item.Connected ? Color.FromArgb(0x7F, 0x77, 0xDD) : Color.FromArgb(0xB4, 0xB2, 0xA9);
-        var text = item.IsSelf ? Color.White : item.Connected ? Color.FromArgb(0x3C, 0x34, 0x89) : Color.FromArgb(0x5F, 0x5E, 0x5A);
-        if (dragging) fill = Color.FromArgb(225, fill);
-
-        using (var path = Rounded(rect, 6))
-        using (var b = new SolidBrush(fill))
-        using (var p = new Pen(border, dragging ? 2.5f : 1.2f))
+        var radius = Ui.S(7);
+        var text = item.IsSelf ? Color.White : item.Connected ? Ui.AccentText : Ui.Idle;
+        if (item.IsSelf)
         {
+            // il PC attuale "si accende": sfumatura viola con un alone
+            Ui.Glow(g, rect, radius, Ui.BrandLight, Ui.S(dragging ? 10 : 7));
+            using var path = Rounded(rect, radius);
+            using var b = Ui.BrandGradient(rect);
+            using var hi = new Pen(Color.FromArgb(60, Color.White), dragging ? 2f : 1f);
+            g.FillPath(b, path);
+            g.DrawPath(hi, path);
+        }
+        else
+        {
+            var fill = item.Connected ? Ui.AccentSoft : Color.FromArgb(0x22, 0x20, 0x2C);
+            var border = item.Connected ? Color.FromArgb(0x7F, 0x77, 0xDD) : Color.FromArgb(0x3A, 0x37, 0x48);
+            if (dragging) fill = Color.FromArgb(235, fill);
+            using var path = Rounded(rect, radius);
+            using var b = new SolidBrush(fill);
+            using var p = new Pen(border, dragging ? 2.5f : 1.2f);
+            if (!item.Connected) p.DashStyle = DashStyle.Dash;
             g.FillPath(b, path);
             g.DrawPath(p, path);
         }

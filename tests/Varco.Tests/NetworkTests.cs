@@ -242,3 +242,40 @@ public class ReconnectTests : IAsyncLifetime
         foreach (var n in _nodes) await n.DisposeAsync();
     }
 }
+
+public class DiscoveryTests
+{
+    private static int FreeUdpPort()
+    {
+        using var s = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        return ((IPEndPoint)s.Client.LocalEndPoint!).Port;
+    }
+
+    [Fact]
+    public async Task Announce_reaches_unpaired_pc_through_unicast_target()
+    {
+        var key = GroupKey.TryParse(GroupKey.Generate(), out var k) ? k : throw new();
+        var other = GroupKey.TryParse(GroupKey.Generate(), out var k2) ? k2 : throw new();
+        int pa = FreeUdpPort(), pb = FreeUdpPort();
+        var ia = new LocalIdentity(Guid.NewGuid(), "A", 1001, key);
+        var ib = new LocalIdentity(Guid.NewGuid(), "B", 1002, other);
+        using var a = new Discovery(ia, pa, () => [new IPEndPoint(IPAddress.Loopback, pb)]) { SweepInterval = TimeSpan.Zero, Interval = TimeSpan.FromMilliseconds(200) };
+        using var b = new Discovery(ib, pb, () => []) { SweepInterval = TimeSpan.Zero };
+        var seen = new TaskCompletionSource<(Guid Id, string Name, int Port, bool Same)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        b.Announced += (id, name, ep, same) => seen.TrySetResult((id, name, ep.Port, same));
+        b.Start();
+        a.Start();
+        var got = await seen.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal((ia.Id, "A", 1001, false), got);
+    }
+
+    [Theory]
+    [InlineData("192.168.1.34", true)]
+    [InlineData("10.0.0.5", true)]
+    [InlineData("172.20.1.1", true)]
+    [InlineData("100.100.1.1", true)]
+    [InlineData("8.8.8.8", false)]
+    [InlineData("172.32.0.1", false)]
+    public void Replies_only_to_private_addresses(string ip, bool expected) =>
+        Assert.Equal(expected, Discovery.IsPrivate(IPAddress.Parse(ip)));
+}

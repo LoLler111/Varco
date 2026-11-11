@@ -20,14 +20,17 @@ public static class VarcoIcon
         [new(57, 34), new(57, 65.2f), new(65.4f, 58), new(71.4f, 71.2f), new(77.4f, 68.8f), new(71.4f, 55.6f), new(82.2f, 55.6f)];
 
     /// <summary>Icona dell'app: quadrato arrotondato viola.</summary>
-    public static Bitmap RenderApp(int size)
+    /// <param name="gradient">Sfumatura diagonale (finestre col tema scuro) invece del viola pieno.</param>
+    public static Bitmap RenderApp(int size, bool gradient = false)
     {
         var bmp = new Bitmap(size, size);
         using var g = Prepare(bmp);
-        using (var bg = new SolidBrush(Brand))
+        using (Brush bg = gradient
+                   ? new LinearGradientBrush(new RectangleF(0, 0, size, size), Color.FromArgb(0x8A, 0x82, 0xE6), Color.FromArgb(0x43, 0x3B, 0x9C), 45f)
+                   : new SolidBrush(Brand))
         using (var path = RoundedSquare(0, 0, size, size * 0.225f))
             g.FillPath(bg, path);
-        DrawGlyph(g, new RectangleF(0, 0, size, size), Brand, withCursor: size >= 32);
+        DrawGlyph(g, new RectangleF(0, 0, size, size), gradient ? Color.FromArgb(0x63, 0x5A, 0xC6) : Brand, withCursor: size >= 32);
         return bmp;
     }
 

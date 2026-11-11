@@ -29,6 +29,20 @@ public sealed class Discovery : IDisposable
 
     public TimeSpan Interval { get; init; } = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// Ogni quanto inviare un annuncio unicast a tutti gli indirizzi della sottorete (0 = mai).
+    /// Serve quando il router non inoltra i broadcast tra cavo e Wi-Fi: l'unicast passa quasi sempre.
+    /// </summary>
+    public TimeSpan SweepInterval { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Sottoreti più grandi di così (es. /16) non vengono scandite: troppi indirizzi.</summary>
+    private const int MinSweepPrefix = 22;
+
+    private long _lastSweep = long.MinValue / 2;
+    private volatile bool _sweepSoon = true;
+    private readonly Dictionary<IPAddress, long> _lastReply = new();
+    private string? _lastNetLog;
+
     /// <summary>(id, nome, endpoint TCP del peer) — solo PC dello stesso gruppo (beacon firmato).</summary>
     public event Action<Guid, string, IPEndPoint>? PeerSeen;
 
@@ -61,6 +75,7 @@ public sealed class Discovery : IDisposable
     /// <summary>Invia subito un beacon (es. dopo un cambio di rete o il risveglio).</summary>
     public void Announce()
     {
+        _sweepSoon = true;
         try { if (_sendNow.CurrentCount == 0) _sendNow.Release(); } catch (SemaphoreFullException) { }
     }
 
@@ -68,15 +83,65 @@ public sealed class Discovery : IDisposable
     {
         while (!_cts.IsCancellationRequested)
         {
-            SendBeacons(BroadcastTargets().Concat(_extraTargets()));
+            var nets = LocalNetworks();
+            LogNetworks(nets);
+            SendBeacons(BroadcastTargets(nets).Concat(_extraTargets()));
+
+            // Scansione unicast: subito all'avvio e dopo un cambio di rete (al massimo ogni 10 s), poi a intervalli regolari.
+            var now = Environment.TickCount64;
+            var since = now - _lastSweep;
+            if (SweepInterval > TimeSpan.Zero && (since >= SweepInterval.TotalMilliseconds || (_sweepSoon && since >= 10_000)))
+            {
+                _lastSweep = now;
+                _sweepSoon = false;
+                try { await SweepAsync(nets).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                catch (Exception ex) { Log.Debug($"Scansione della sottorete: {ex.Message}"); }
+            }
+
             try { await _sendNow.WaitAsync(Interval, _cts.Token).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
         }
     }
 
-    private void SendBeacons(IEnumerable<IPEndPoint> targets)
+    /// <summary>Annuncio unicast a ogni indirizzo delle sottoreti con gateway (a piccoli gruppi, per non intasare la rete).</summary>
+    private async Task SweepAsync(List<LocalNet> nets)
     {
-        byte[][] packets = [BuildBeacon(), BuildAnnounce()];
+        byte[][] packets = [BuildBeacon(), BuildAnnounce(reply: false)];
+        var sent = 0;
+        foreach (var net in nets)
+        {
+            if (!net.HasGateway || net.Prefix < MinSweepPrefix || net.Prefix > 30) continue;
+            var self = ToUInt(net.Address);
+            var mask = net.Prefix == 0 ? 0u : uint.MaxValue << (32 - net.Prefix);
+            var first = (self & mask) + 1;
+            var last = (self | ~mask) - 1;
+            for (var host = first; host <= last; host++)
+            {
+                if (host == self) continue;
+                var ep = new IPEndPoint(FromUInt(host), _port);
+                foreach (var packet in packets)
+                {
+                    try { _udp.Send(packet, packet.Length, ep); }
+                    catch (Exception ex) when (ex is SocketException or ObjectDisposedException) { }
+                }
+                if (++sent % 32 == 0) await Task.Delay(5, _cts.Token).ConfigureAwait(false);
+            }
+        }
+        if (sent > 0) Log.Debug($"Scansione unicast: {sent} indirizzi");
+    }
+
+    private void LogNetworks(List<LocalNet> nets)
+    {
+        var text = string.Join(", ", nets.Select(n => $"{n.Address}/{n.Prefix} ({n.Name}{(n.HasGateway ? "" : ", senza gateway")})"));
+        if (text == _lastNetLog) return;
+        _lastNetLog = text;
+        Log.Info($"Reti per la ricerca dei PC: {(text.Length == 0 ? "nessuna" : text)}");
+    }
+
+    private void SendBeacons(IEnumerable<IPEndPoint> targets, bool reply = false)
+    {
+        byte[][] packets = [BuildBeacon(), BuildAnnounce(reply)];
         foreach (var t in targets.Distinct())
         {
             foreach (var packet in packets)
@@ -87,7 +152,8 @@ public sealed class Discovery : IDisposable
         }
     }
 
-    private byte[] BuildAnnounce()
+    /// <param name="reply">Risposta a un annuncio ricevuto: chi la riceve non risponde a sua volta (niente ping-pong).</param>
+    private byte[] BuildAnnounce(bool reply)
     {
         using var ms = new MemoryStream();
         using var w = new BinaryWriter(ms, Encoding.UTF8);
@@ -97,13 +163,15 @@ public sealed class Discovery : IDisposable
         w.Write((ushort)_me.ListenPort);
         w.Write(_me.GroupTag);
         w.Write(_me.Name.Length > 60 ? _me.Name[..60] : _me.Name);
+        // Campo aggiunto in coda: le versioni precedenti lo ignorano.
+        w.Write(reply ? (byte)1 : (byte)0);
         w.Flush();
         return ms.ToArray();
     }
 
-    private bool TryParseAnnounce(byte[] buf, out Guid id, out string name, out int tcpPort, out bool sameGroup)
+    private bool TryParseAnnounce(byte[] buf, out Guid id, out string name, out int tcpPort, out bool sameGroup, out bool isReply)
     {
-        id = Guid.Empty; name = ""; tcpPort = 0; sameGroup = false;
+        id = Guid.Empty; name = ""; tcpPort = 0; sameGroup = false; isReply = false;
         if (buf.Length < 4 + 1 + 16 + 2 + 8 + 1 || !buf.AsSpan(0, 4).SequenceEqual(AnnounceMagic)) return false;
         try
         {
@@ -114,6 +182,7 @@ public sealed class Discovery : IDisposable
             tcpPort = r.ReadUInt16();
             sameGroup = r.ReadBytes(8).AsSpan().SequenceEqual(_me.GroupTag);
             name = r.ReadString();
+            isReply = r.BaseStream.Position < r.BaseStream.Length && r.ReadByte() == 1;
             return tcpPort != 0;
         }
         catch { return false; }
@@ -133,11 +202,14 @@ public sealed class Discovery : IDisposable
                 continue;
             }
 
-            if (TryParseAnnounce(res.Buffer, out var aid, out var aname, out var aport, out var same))
+            if (TryParseAnnounce(res.Buffer, out var aid, out var aname, out var aport, out var same, out var isReply))
             {
                 if (aid == _me.Id) continue;
                 try { Announced?.Invoke(aid, aname, new IPEndPoint(res.RemoteEndPoint.Address, aport), same); }
                 catch (Exception ex) { Log.Error("Announced handler", ex); }
+                // Rispondo in unicast: se il broadcast passa in una sola direzione (es. dal cavo al Wi-Fi ma non al contrario),
+                // o se mi ha trovato con la scansione, anche l'altro PC mi vede.
+                if (!isReply) MaybeReply(res.RemoteEndPoint.Address);
                 continue;
             }
 
@@ -150,7 +222,33 @@ public sealed class Discovery : IDisposable
     }
 
     /// <summary>Risponde direttamente a un peer (unicast) per accelerare la scoperta reciproca.</summary>
-    public void ReplyTo(IPAddress address) => SendBeacons([new IPEndPoint(address, _port)]);
+    public void ReplyTo(IPAddress address) => SendBeacons([new IPEndPoint(address, _port)], reply: true);
+
+    /// <summary>Risposta a un annuncio: al massimo una al secondo per indirizzo e solo verso reti private.</summary>
+    private void MaybeReply(IPAddress address)
+    {
+        if (!IsPrivate(address)) return;
+        var now = Environment.TickCount64;
+        if (_lastReply.TryGetValue(address, out var last) && now - last < 1000) return;
+        if (_lastReply.Count > 256)
+            foreach (var old in _lastReply.Where(kv => now - kv.Value > 10_000).Select(kv => kv.Key).ToList()) _lastReply.Remove(old);
+        _lastReply[address] = now;
+        ReplyTo(address);
+    }
+
+    /// <summary>Reti locali e VPN private (RFC 1918, link-local, CGNAT come Tailscale).</summary>
+    internal static bool IsPrivate(IPAddress a)
+    {
+        if (a.IsIPv4MappedToIPv6) a = a.MapToIPv4();
+        if (a.AddressFamily != AddressFamily.InterNetwork) return false;
+        var b = a.GetAddressBytes();
+        return b[0] == 10
+            || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)
+            || (b[0] == 192 && b[1] == 168)
+            || (b[0] == 169 && b[1] == 254)
+            || (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
+            || b[0] == 127;
+    }
 
     private byte[] BuildBeacon()
     {
@@ -192,30 +290,57 @@ public sealed class Discovery : IDisposable
         catch { return false; }
     }
 
-    /// <summary>Broadcast diretto su ogni interfaccia attiva + broadcast globale.</summary>
-    private IEnumerable<IPEndPoint> BroadcastTargets()
+    internal sealed record LocalNet(string Name, IPAddress Address, int Prefix, bool HasGateway);
+
+    /// <summary>Indirizzi IPv4 di questo PC sulle interfacce attive (cavo, Wi-Fi, adattatori virtuali).</summary>
+    internal static List<LocalNet> LocalNetworks()
     {
-        var list = new List<IPEndPoint> { new(IPAddress.Broadcast, _port) };
+        var list = new List<LocalNet>();
         try
         {
             foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
             {
                 if (nic.OperationalStatus != OperationalStatus.Up) continue;
                 if (nic.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel) continue;
-                foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+                var props = nic.GetIPProperties();
+                var hasGateway = props.GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any));
+                foreach (var ua in props.UnicastAddresses)
                 {
-                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork || ua.IPv4Mask is null) continue;
-                    var ip = ua.Address.GetAddressBytes();
-                    var mask = ua.IPv4Mask.GetAddressBytes();
-                    var bc = new byte[4];
-                    for (int i = 0; i < 4; i++) bc[i] = (byte)(ip[i] | ~mask[i]);
-                    list.Add(new IPEndPoint(new IPAddress(bc), _port));
+                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    var prefix = ua.PrefixLength is > 0 and <= 32 ? ua.PrefixLength
+                        : ua.IPv4Mask is { } m ? System.Numerics.BitOperations.PopCount(ToUInt(m)) : 24;
+                    list.Add(new LocalNet(nic.Name, ua.Address, prefix, hasGateway));
                 }
             }
         }
         catch (Exception ex) { Log.Debug($"Enumerazione interfacce: {ex.Message}"); }
         return list;
     }
+
+    /// <summary>
+    /// Broadcast diretto su ogni interfaccia attiva + broadcast globale.
+    /// Il broadcast diretto (es. 192.168.1.255) esce dall'interfaccia giusta anche se il PC ha adattatori virtuali
+    /// (Hyper-V, VPN), che invece possono "rubare" il broadcast globale 255.255.255.255.
+    /// </summary>
+    private IEnumerable<IPEndPoint> BroadcastTargets(List<LocalNet> nets)
+    {
+        var list = new List<IPEndPoint> { new(IPAddress.Broadcast, _port) };
+        foreach (var n in nets)
+        {
+            if (n.Prefix >= 31) continue;
+            var mask = n.Prefix == 0 ? 0u : uint.MaxValue << (32 - n.Prefix);
+            list.Add(new IPEndPoint(FromUInt(ToUInt(n.Address) | ~mask), _port));
+        }
+        return list;
+    }
+
+    private static uint ToUInt(IPAddress a)
+    {
+        var b = a.GetAddressBytes();
+        return (uint)(b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]);
+    }
+
+    private static IPAddress FromUInt(uint v) => new([(byte)(v >> 24), (byte)(v >> 16), (byte)(v >> 8), (byte)v]);
 
     public void Dispose()
     {
