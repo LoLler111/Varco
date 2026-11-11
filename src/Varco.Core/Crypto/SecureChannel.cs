@@ -18,6 +18,15 @@ internal static class Framing
         await s.WriteAsync(buf, ct).ConfigureAwait(false);
     }
 
+    /// <summary>Accoda un frame (lunghezza + payload) in un buffer, per inviarne diversi con una sola scrittura.</summary>
+    public static void AppendFrame(System.Buffers.IBufferWriter<byte> w, ReadOnlySpan<byte> payload)
+    {
+        var span = w.GetSpan(4 + payload.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(span, (uint)payload.Length);
+        payload.CopyTo(span[4..]);
+        w.Advance(4 + payload.Length);
+    }
+
     public static async Task<byte[]> ReadFrameAsync(Stream s, CancellationToken ct)
     {
         var header = new byte[4];

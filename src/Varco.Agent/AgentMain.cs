@@ -45,6 +45,13 @@ public static class AgentMain
         await using var host = new VarcoHost(store, platform, port, discoveryPort);
         if (platform is WindowsInput wi) wi.Coordinator = host.Coordinator;
 
+        using var responsiveness = new Responsiveness();
+        if (!noInput)
+        {
+            Responsiveness.ApplyProcessPriority();
+            host.Coordinator.ModeChanged += responsiveness.OnModeChanged;
+        }
+
         using var power = new PowerNotifier();
         power.Suspending += host.OnSuspend;
         power.Resumed += host.OnResume;

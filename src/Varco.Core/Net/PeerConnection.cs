@@ -27,6 +27,7 @@ public sealed class PeerConnection : IAsyncDisposable
     private long _lastInput = long.MinValue / 2;
     private long _lastPing;
     private int _closing;
+    private readonly SocketQos? _qos;
 
     // Mentre si usa il mouse su questo collegamento si manda un ping ogni ActivePingMs:
     //  • la scheda Wi-Fi in risparmio energetico non si "addormenta" e non consegna i movimenti a raffiche;
@@ -69,6 +70,7 @@ public sealed class PeerConnection : IAsyncDisposable
         _intervalMs = intervalMs;
         _timeoutMs = timeoutMs;
         _lastReceived = _lastSent = Environment.TickCount64;
+        _qos = SocketQos.TryApply(socket);
     }
 
     /// <summary>Avvia lettura, scrittura e heartbeat. Va chiamato dopo aver agganciato gli eventi.</summary>
@@ -122,6 +124,7 @@ public sealed class PeerConnection : IAsyncDisposable
         if (Interlocked.Exchange(ref _closing, 1) != 0) return;
         _outbox.Writer.TryComplete();
         _cts.Cancel();
+        _qos?.Dispose();
         try { _socket.Shutdown(SocketShutdown.Both); } catch { }
         try { _socket.Close(0); } catch { }
         _cipher.Dispose();
@@ -132,9 +135,12 @@ public sealed class PeerConnection : IAsyncDisposable
     {
         try
         {
+            // Bufferizzato: intestazione e contenuto di un frame (e i frame arrivati insieme sul Wi-Fi) con una sola lettura dal socket.
+            // Dopo l'handshake nessuno legge più direttamente da _stream, quindi non si perdono byte.
+            var input = new BufferedStream(_stream, 16 * 1024);
             while (!_cts.IsCancellationRequested)
             {
-                var frame = await Framing.ReadFrameAsync(_stream, _cts.Token).ConfigureAwait(false);
+                var frame = await Framing.ReadFrameAsync(input, _cts.Token).ConfigureAwait(false);
                 Volatile.Write(ref _lastReceived, Environment.TickCount64);
                 var msg = MessageCodec.Decode(_cipher.Open(frame));
                 switch (msg)
@@ -158,11 +164,19 @@ public sealed class PeerConnection : IAsyncDisposable
 
     private async Task WriteLoop()
     {
+        // Tutti i messaggi già in coda (es. un Pong e un movimento) partono con una sola scrittura, quindi in un solo pacchetto:
+        // sul Wi-Fi ogni pacchetto in meno è tempo d'antenna in meno. Nessuna attesa: si manda solo ciò che è già pronto.
+        var reader = _outbox.Reader;
+        var batch = new System.Buffers.ArrayBufferWriter<byte>(512);
         try
         {
-            await foreach (var plain in _outbox.Reader.ReadAllAsync(_cts.Token).ConfigureAwait(false))
+            while (await reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
             {
-                await Framing.WriteFrameAsync(_stream, _cipher.Seal(plain), _cts.Token).ConfigureAwait(false);
+                batch.ResetWrittenCount();
+                while (batch.WrittenCount < 64 * 1024 && reader.TryRead(out var plain))
+                    Framing.AppendFrame(batch, _cipher.Seal(plain));
+                if (batch.WrittenCount == 0) continue;
+                await _stream.WriteAsync(batch.WrittenMemory, _cts.Token).ConfigureAwait(false);
                 Volatile.Write(ref _lastSent, Environment.TickCount64);
             }
         }

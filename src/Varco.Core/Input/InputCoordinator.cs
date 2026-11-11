@@ -56,8 +56,13 @@ public sealed class InputCoordinator
     private long _lastMoveSent = long.MinValue / 2;
     private readonly Timer _flushTimer;
 
-    /// <summary>Intervallo minimo tra due movimenti inviati (ms). Gli spostamenti nel frattempo vengono sommati.</summary>
-    public int MoveIntervalMs { get; init; } = 8;
+    /// <summary>
+    /// Intervallo minimo tra due movimenti inviati (ms). Gli spostamenti nel frattempo vengono sommati.
+    /// 4 ms = 250 aggiornamenti al secondo: più della frequenza dei monitor fino a 240 Hz (con 8 ms il cursore sul target
+    /// si muoveva a 125 Hz e un mouse da 125 Hz, con gli eventi a cavallo degli 8 ms, finiva a scatti di 16 ms), ma
+    /// abbastanza pochi pacchetti da non intasare il Wi-Fi.
+    /// </summary>
+    public int MoveIntervalMs { get; init; } = 4;
 
     // lato target
     private readonly Dictionary<ushort, KeyMsg> _injectedKeys = new();

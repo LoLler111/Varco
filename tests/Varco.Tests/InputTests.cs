@@ -227,7 +227,7 @@ public class CoordinatorTests
         public void InjectKey(ushort vk, ushort scan, KeyFlags f) => Log.Add($"key {vk:X2} {f}");
     }
 
-    private static (InputCoordinator c, FakeNet net, FakePlatform p, Guid other) Setup(bool otherOnRight = true)
+    private static (InputCoordinator c, FakeNet net, FakePlatform p, Guid other) Setup(bool otherOnRight = true, int moveIntervalMs = 4)
     {
         var self = Guid.NewGuid();
         var other = Guid.NewGuid();
@@ -236,7 +236,7 @@ public class CoordinatorTests
         var layout = new LayoutManager(self, "me", new Layout());
         layout.SetRow(otherOnRight ? [(self, "me"), (other, "other")] : [(other, "other"), (self, "me")]);
         var p = new FakePlatform();
-        return (new InputCoordinator(net, p, layout), net, p, other);
+        return (new InputCoordinator(net, p, layout) { MoveIntervalMs = moveIntervalMs }, net, p, other);
     }
 
     [Fact]
@@ -258,13 +258,13 @@ public class CoordinatorTests
     [Fact]
     public void Rapid_moves_are_coalesced_and_flushed_before_clicks_and_when_the_mouse_stops()
     {
-        var (c, net, _, other) = Setup();
+        var (c, net, _, other) = Setup(moveIntervalMs: 50); // intervallo largo: il test non dipende dalla velocità della macchina
         c.OnLocalMouseMove(1919, 540); // passa al vicino, cursore parcheggiato a 960,540
         int Moves() => net.Sent.Count(s => s.Msg is MouseMove);
 
         c.OnLocalMouseMove(965, 540);  // primo movimento: subito
         Assert.Equal(1, Moves());
-        c.OnLocalMouseMove(963, 541);  // entro 8 ms: sommati
+        c.OnLocalMouseMove(963, 541);  // entro l'intervallo: sommati
         c.OnLocalMouseMove(964, 541);
         Assert.Equal(1, Moves());
 
