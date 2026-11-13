@@ -99,6 +99,9 @@ internal static class Installer
             // Firewall per tutti i profili: dopo una riconnessione Windows può classificare la rete come "Pubblica".
             foreach (var old in new[] { FirewallRule, "Varco (TCP)", "Varco (discovery UDP)" })
                 Run("netsh.exe", $"advfirewall firewall delete rule name=\"{old}\"", check: false);
+            // Anche le regole create da Windows per questo programma: se una volta l'avviso del firewall è stato chiuso
+            // con "Annulla", esiste una regola di BLOCCO (di solito per le reti pubbliche) che prevale sulla nostra.
+            Run("netsh.exe", $"advfirewall firewall delete rule name=all dir=in program=\"{exe}\"", check: false);
             Run("netsh.exe", $"advfirewall firewall add rule name=\"{FirewallRule}\" dir=in action=allow program=\"{exe}\" enable=yes profile=any");
 
             using (var run = Registry.LocalMachine.CreateSubKey(RunKey))

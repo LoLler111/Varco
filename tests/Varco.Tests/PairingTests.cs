@@ -92,6 +92,47 @@ public class PairingTests : IAsyncLifetime
         Assert.Empty(sa.Current.KnownPeers);
     }
 
+    [Fact]
+    public async Task Unreachable_peer_is_asked_to_call_back()
+    {
+        // Simula il portatile col firewall che blocca le connessioni in ingresso:
+        // A prova un indirizzo dove nessuno ascolta e la richiesta di richiamata arriva a B "via UDP".
+        var (a, sa) = await NewHost("PC-A");
+        var (b, sb) = await NewHost("PC-B");
+        var closedPort = ClosedPort();
+        a.CallbackSenderForTests = (_, _, token) =>
+            b.OnCallbackRequested(sa.Current.MachineId, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, a.Node!.ListenPort), token);
+
+        var r = await a.HandleAsync(new ControlRequest { Cmd = "pair", Address = $"127.0.0.1:{closedPort}" });
+        Assert.True(r.Ok, r.Error);
+
+        var req = await Eventually(() => b.GetStatus().IncomingPair, what: "richiesta su B tramite richiamata");
+        Assert.Equal("PC-A", req.PeerName);
+        var outgoing = await Eventually(() => a.GetStatus().OutgoingPair is { State: "WaitingConfirm" } o ? o : null, what: "A in attesa");
+        Assert.Equal(req.Code, outgoing.Code);
+
+        Assert.True((await b.HandleAsync(new ControlRequest { Cmd = "pairAnswer", RequestId = req.RequestId, Accept = true })).Ok);
+        await Eventually(() => a.GetStatus().OutgoingPair is { State: "Done" } o ? o : null, what: "abbinamento completato");
+        await Eventually(() => sa.Current.GroupKey == sb.Current.GroupKey ? "" : null, what: "stessa chiave");
+    }
+
+    [Fact]
+    public async Task Pairing_with_own_address_is_refused()
+    {
+        var (a, sa) = await NewHost("PC-A");
+        var r = await a.HandleAsync(new ControlRequest { Cmd = "pair", Address = $"127.0.0.1:{a.Node!.ListenPort}" });
+        Assert.False(r.Ok);
+        Assert.Contains("questo PC", r.Error);
+        Assert.Empty(sa.Current.ManualAddresses);
+    }
+
+    private static int ClosedPort()
+    {
+        using var s = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.InterNetwork, System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+        s.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        return ((System.Net.IPEndPoint)s.LocalEndPoint!).Port;
+    }
+
     public Task InitializeAsync() => Task.CompletedTask;
 
     public async Task DisposeAsync()

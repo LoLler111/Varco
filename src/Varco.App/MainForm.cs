@@ -154,9 +154,9 @@ internal sealed class MainForm : Form
     {
         var a = _address.Box.Text.Trim();
         if (a.Length == 0) { _address.Box.Focus(); return; }
+        // A collegamento riuscito il servizio ricorda da solo l'indirizzo.
         if (await Send(new ControlRequest { Cmd = "pair", Address = a }))
         {
-            await Send(new ControlRequest { Cmd = "addAddress", Address = a });
             _address.Box.Clear();
             _manualRow.Visible = false;
         }

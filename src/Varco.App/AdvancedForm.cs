@@ -12,6 +12,7 @@ internal sealed class AdvancedForm : Form
     private readonly InputBox _address;
     private readonly ListBox _manual = new() { IntegralHeight = false, BorderStyle = BorderStyle.None, BackColor = Ui.Well, ForeColor = Ui.Text, DrawMode = DrawMode.OwnerDrawFixed, Margin = Padding.Empty };
     private readonly Toggle _autoUpdate = new("Aggiorna Varco automaticamente (consigliato)");
+    private readonly Toggle _clipboard = new("Condividi gli appunti tra i PC");
     private readonly Label _updateText;
 
     public AdvancedForm(StatusDto? status)
@@ -64,6 +65,16 @@ internal sealed class AdvancedForm : Form
         };
         manual.Body.Controls.Add(Row(listBox, remove));
         root.Controls.Add(manual);
+
+        // appunti
+        var clip = new Card(W, "Appunti");
+        _clipboard.Checked = status?.ShareClipboard ?? true;
+        _clipboard.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setClipboard", Enabled = _clipboard.Checked });
+        clip.Body.Controls.Add(_clipboard);
+        clip.Body.Controls.Add(Ui.Label("Copi su un PC e incolli su un altro: testo, testo formattato e immagini. " +
+            "I file non vengono condivisi, e nemmeno ciò che i gestori di password segnano come privato. " +
+            "Funziona tra PC con Varco 0.5 o successivo.", Ui.Small, Ui.Muted, clip.InnerWidth, Ui.P(0, 8, 0, 0)));
+        root.Controls.Add(clip);
 
         // problemi
         var problems = new Card(W, "Problemi");
@@ -118,7 +129,7 @@ internal sealed class AdvancedForm : Form
         if (a.Length == 0) { _address.Box.Focus(); return; }
         if (await Send(new ControlRequest { Cmd = "pair", Address = a }) is not null)
         {
-            await Send(new ControlRequest { Cmd = "addAddress", Address = a });
+            // A collegamento riuscito il servizio ricorda da solo l'indirizzo.
             Close(); // l'avanzamento si vede nella finestra principale
         }
     }

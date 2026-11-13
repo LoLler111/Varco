@@ -31,6 +31,9 @@ public sealed class VarcoConfig
     /// <summary>Tollerante ai picchi del Wi-Fi: 3 s senza traffico = connessione morta.</summary>
     public int HeartbeatTimeoutMs { get; set; } = 3000;
 
+    /// <summary>Appunti condivisi fra i PC del gruppo (testo, testo formattato, immagini).</summary>
+    public bool ShareClipboard { get; set; } = true;
+
     /// <summary>Aggiornamenti automatici da GitHub (firmati), installati senza chiedere nulla.</summary>
     public bool AutoUpdate { get; set; } = true;
     /// <summary>Solo per i test: indirizzo alternativo della release (formato API di GitHub). Null = GitHub.</summary>

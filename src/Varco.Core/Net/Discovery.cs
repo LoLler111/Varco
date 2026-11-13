@@ -18,6 +18,9 @@ public sealed class Discovery : IDisposable
     private static readonly byte[] Magic = "VRCB"u8.ToArray();
     /// <summary>Annuncio pubblico (non firmato): serve a far comparire i PC non ancora abbinati.</summary>
     private static readonly byte[] AnnounceMagic = "VRCA"u8.ToArray();
+    /// <summary>"Richiamami": chiede a un PC di aprire lui la connessione TCP di abbinamento.</summary>
+    private static readonly byte[] CallbackMagic = "VRCK"u8.ToArray();
+    private const int CallbackSize = 4 + 1 + 16 + 2 + 16 + 16;
     private const int MacSize = 16;
 
     private readonly LocalIdentity _me;
@@ -48,6 +51,9 @@ public sealed class Discovery : IDisposable
 
     /// <summary>(id, nome, endpoint TCP, stesso gruppo?) — qualsiasi PC con Varco nella rete.</summary>
     public event Action<Guid, string, IPEndPoint, bool>? Announced;
+
+    /// <summary>(id di chi chiede, suo endpoint TCP, token) — un PC chiede di essere richiamato per l'abbinamento.</summary>
+    public event Action<Guid, IPEndPoint, byte[]>? CallbackRequested;
 
     public Discovery(LocalIdentity me, int port, Func<IEnumerable<IPEndPoint>> extraTargets)
     {
@@ -202,6 +208,14 @@ public sealed class Discovery : IDisposable
                 continue;
             }
 
+            if (TryParseCallback(res.Buffer, out var cid, out var cport, out var ctarget, out var token))
+            {
+                if (cid == _me.Id || (ctarget != Guid.Empty && ctarget != _me.Id) || !IsPrivate(res.RemoteEndPoint.Address)) continue;
+                try { CallbackRequested?.Invoke(cid, new IPEndPoint(res.RemoteEndPoint.Address, cport), token); }
+                catch (Exception ex) { Log.Error("CallbackRequested handler", ex); }
+                continue;
+            }
+
             if (TryParseAnnounce(res.Buffer, out var aid, out var aname, out var aport, out var same, out var isReply))
             {
                 if (aid == _me.Id) continue;
@@ -219,6 +233,37 @@ public sealed class Discovery : IDisposable
             try { PeerSeen?.Invoke(id, name, ep); }
             catch (Exception ex) { Log.Error("PeerSeen handler", ex); }
         }
+    }
+
+    /// <summary>
+    /// Chiede al PC <paramref name="target"/> (Guid.Empty = chiunque risponda a quell'indirizzo) di aprire lui
+    /// la connessione TCP verso di noi. Serve quando il suo firewall blocca le connessioni in ingresso
+    /// (tipico del Wi-Fi classificato come rete "Pubblica"): partendo dalla nostra porta di discovery,
+    /// il pacchetto passa come risposta ai suoi beacon.
+    /// </summary>
+    public void SendCallback(IPAddress address, Guid target, byte[] token)
+    {
+        var packet = new byte[CallbackSize];
+        CallbackMagic.CopyTo(packet, 0);
+        packet[4] = 1;
+        _me.Id.ToByteArray().CopyTo(packet, 5);
+        packet[21] = (byte)(_me.ListenPort >> 8);
+        packet[22] = (byte)_me.ListenPort;
+        target.ToByteArray().CopyTo(packet, 23);
+        token.AsSpan(0, 16).CopyTo(packet.AsSpan(39));
+        try { _udp.Send(packet, packet.Length, new IPEndPoint(address, _port)); }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException) { Log.Debug($"Richiesta di richiamata verso {address} fallita: {ex.Message}"); }
+    }
+
+    private static bool TryParseCallback(byte[] buf, out Guid id, out int tcpPort, out Guid target, out byte[] token)
+    {
+        id = Guid.Empty; tcpPort = 0; target = Guid.Empty; token = [];
+        if (buf.Length != CallbackSize || !buf.AsSpan(0, 4).SequenceEqual(CallbackMagic) || buf[4] != 1) return false;
+        id = new Guid(buf.AsSpan(5, 16));
+        tcpPort = buf[21] << 8 | buf[22];
+        target = new Guid(buf.AsSpan(23, 16));
+        token = buf.AsSpan(39, 16).ToArray();
+        return tcpPort != 0;
     }
 
     /// <summary>Risponde direttamente a un peer (unicast) per accelerare la scoperta reciproca.</summary>

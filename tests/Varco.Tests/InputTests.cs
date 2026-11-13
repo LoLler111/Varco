@@ -279,6 +279,73 @@ public class CoordinatorTests
     }
 
     [Fact]
+    public void Wheel_spam_is_coalesced_and_flushed_before_clicks_and_when_it_stops()
+    {
+        var self = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        var net = new FakeNet(self);
+        net.Connected.Add(other);
+        var layout = new LayoutManager(self, "me", new Layout());
+        layout.SetRow([(self, "me"), (other, "other")]);
+        var c = new InputCoordinator(net, new FakePlatform(), layout) { WheelIntervalMs = 50 };
+        c.OnLocalMouseMove(1919, 540);
+        List<MouseWheel> Wheels() => net.Sent.Select(s => s.Msg).OfType<MouseWheel>().ToList();
+
+        Assert.True(c.OnLocalWheel(120, false));        // primo scatto: subito
+        Assert.Equal([new MouseWheel(120, false)], Wheels());
+        for (int i = 0; i < 10; i++) c.OnLocalWheel(-120, false); // raffica: sommata
+        c.OnLocalWheel(30, true);
+        Assert.Single(Wheels());
+
+        c.OnLocalButton(MouseButton.Middle, true);     // il clic arriva dopo lo scorrimento che lo precede
+        var tail = net.Sent.Select(s => s.Msg).SkipWhile(m => m is not MouseWheel).Skip(1).ToList();
+        Assert.Equal(new MouseWheel(-1200, false), tail[0]);
+        Assert.Equal(new MouseWheel(30, true), tail[1]);
+        Assert.Equal(new MouseButtonMsg(MouseButton.Middle, true), tail[2]);
+
+        c.OnLocalWheel(-120, false);                   // l'ultimo scatto prima di fermarsi arriva comunque
+        c.OnLocalWheel(-120, false);
+        Thread.Sleep(150);
+        Assert.Equal(new MouseWheel(-240, false), Wheels()[^1]);
+    }
+
+    [Fact]
+    public void Target_merges_wheel_events_still_waiting_to_be_injected()
+    {
+        var p = new FakePlatform();
+        var queued = new List<Action>();
+        var self = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        var net = new FakeNet(self);
+        net.Connected.Add(other);
+        var layout = new LayoutManager(self, "me", new Layout());
+        layout.SetRow([(other, "other"), (self, "me")]);
+        var c = new InputCoordinator(net, new DeferredPlatform(p, queued), layout);
+
+        c.OnMessage(other, new Enter(Edge.Left, 0.5f), () => []);
+        for (int i = 0; i < 20; i++) c.OnMessage(other, new MouseWheel(-120, false), () => []);
+        c.OnMessage(other, new MouseMove(5, 0), () => []);
+        c.OnMessage(other, new MouseWheel(120, false), () => []); // dopo il movimento: non va anticipato
+        foreach (var a in queued) a();
+
+        var log = p.Log.SkipWhile(l => !l.StartsWith("move")).Skip(1).ToList();
+        Assert.Equal(["wheel -2400", $"move {ScreenGeometry.EntryInset + 5},540", "wheel 120"], log);
+    }
+
+    /// <summary>Piattaforma che accoda le azioni invece di eseguirle: simula il thread di input in ritardo.</summary>
+    private sealed class DeferredPlatform(FakePlatform inner, List<Action> queue) : IInputPlatform
+    {
+        public void Post(Action action) => queue.Add(action);
+        public IReadOnlyList<Rect> GetMonitors() => inner.GetMonitors();
+        public (int X, int Y) GetCursorPos() => inner.GetCursorPos();
+        public void SetCursorPos(int x, int y) => inner.SetCursorPos(x, y);
+        public void InjectMoveTo(int x, int y) => inner.InjectMoveTo(x, y);
+        public void InjectButton(MouseButton b, bool down) => inner.InjectButton(b, down);
+        public void InjectWheel(int d, bool h) => inner.InjectWheel(d, h);
+        public void InjectKey(ushort vk, ushort scan, KeyFlags f) => inner.InjectKey(vk, scan, f);
+    }
+
+    [Fact]
     public void No_crossing_while_dragging_or_when_neighbor_offline()
     {
         var (c, net, _, other) = Setup();

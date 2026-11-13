@@ -18,7 +18,7 @@ public sealed class ControlRequest
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
-    /// checkUpdate | setAutoUpdate (Enabled)
+    /// checkUpdate | setAutoUpdate (Enabled) | setClipboard (Enabled)
     /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
@@ -60,6 +60,7 @@ public sealed class StatusDto
     /// <summary>Versione dell'agent in esecuzione (x.y.z).</summary>
     public string Version { get; set; } = "";
     public bool AutoUpdate { get; set; } = true;
+    public bool ShareClipboard { get; set; } = true;
     /// <summary>Null se gli aggiornamenti non sono attivi (agent avviato a mano per sviluppo).</summary>
     public UpdateStatusDto? Update { get; set; }
 }

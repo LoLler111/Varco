@@ -44,6 +44,20 @@ public static class PairingProtocol
 
     public static bool IsPairingFrame(byte[] frame) => frame.Length >= 4 && frame.AsSpan(0, 4).SequenceEqual(Magic);
 
+    // ── richiamata: quando A non riesce a raggiungere B, B apre la connessione verso A e A procede come sempre ──
+
+    private static readonly byte[] CallbackMagic = "VRCR"u8.ToArray();
+    public const int CallbackTokenSize = 16;
+
+    /// <summary>Primo frame di B quando richiama A: porta il token ricevuto via UDP, poi A invia il suo Hello.</summary>
+    public static byte[] EncodeCallback(byte[] token) => [.. CallbackMagic, 1, .. token.AsSpan(0, CallbackTokenSize)];
+
+    public static bool IsCallbackFrame(byte[] frame) =>
+        frame.Length == 4 + 1 + CallbackTokenSize && frame.AsSpan(0, 4).SequenceEqual(CallbackMagic) && frame[4] == 1;
+
+    public static byte[] DecodeCallback(byte[] frame) =>
+        IsCallbackFrame(frame) ? frame.AsSpan(5, CallbackTokenSize).ToArray() : throw new InvalidDataException("richiamata non valida");
+
     public static async Task<PairingSession> InitiateAsync(Stream s, PairOffer me, CancellationToken ct)
     {
         using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);

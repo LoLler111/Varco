@@ -1,4 +1,5 @@
 ﻿using Varco.Core.Config;
+using Varco.Core.Clipboard;
 using Varco.Core.Control;
 using Varco.Core.Input;
 using Varco.Core.Net;
@@ -42,7 +43,11 @@ public sealed partial class VarcoHost : IAsyncDisposable
         Updater.Start();
     }
 
-    public VarcoHost(ConfigStore store, IInputPlatform platform, int? tcpPort = null, int? discoveryPort = null)
+    /// <summary>Null se l'agent gira senza appunti (es. --no-input per i test di rete).</summary>
+    public ClipboardSync? Clipboard { get; }
+
+    public VarcoHost(ConfigStore store, IInputPlatform platform, int? tcpPort = null, int? discoveryPort = null,
+        IClipboardPlatform? clipboard = null)
     {
         _store = store;
         _tcpPortOverride = tcpPort;
@@ -56,6 +61,10 @@ public sealed partial class VarcoHost : IAsyncDisposable
             _net.Broadcast(new LayoutMsg(l));
         };
         Coordinator = new InputCoordinator(_net, platform, Layout);
+        if (clipboard is not null)
+            Clipboard = new ClipboardSync(_net, clipboard,
+                enabled: () => _store.Current.ShareClipboard,
+                canSend: () => Coordinator.Mode != InputMode.Controlling);
         // Cambi di risoluzione o monitor collegati/scollegati: la dimensione del desktop finisce nel layout condiviso.
         _desktopWatch = new Timer(_ =>
         {
@@ -113,12 +122,25 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 return;
             }
 
-            node.PeerConnected += c => Coordinator.OnPeerConnected(c.PeerId, c.PeerName);
-            node.PeerDisconnected += (id, _) => Coordinator.OnPeerDisconnected(id);
-            node.MessageReceived += (id, m) => Coordinator.OnMessage(id, m, ConnectedPeers);
+            node.PeerConnected += c =>
+            {
+                Coordinator.OnPeerConnected(c.PeerId, c.PeerName);
+                Clipboard?.OnPeerConnected(c.PeerId);
+            };
+            node.PeerDisconnected += (id, _) =>
+            {
+                Coordinator.OnPeerDisconnected(id);
+                Clipboard?.OnPeerDisconnected(id);
+            };
+            node.MessageReceived += (id, m) =>
+            {
+                if (Clipboard?.OnMessage(id, m) == true) return;
+                Coordinator.OnMessage(id, m, ConnectedPeers);
+            };
             node.PeerLearned += RememberPeer;
             node.Announced += OnAnnounced;
-            node.PairingRequested = HandlePairingRequestAsync;
+            node.CallbackRequested += OnCallbackRequested;
+            node.PairingRequested = OnPairingConnectionAsync;
             _node = node;
             _net.Node = node;
             node.Start();
@@ -180,6 +202,12 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     if (req.Enabled != false) Updater?.CheckSoon();
                     return new ControlResponse { Status = GetStatus() };
 
+                case "setClipboard":
+                    _store.Update(c => c.ShareClipboard = req.Enabled != false, immediate: true);
+                    Log.Info($"Appunti condivisi {(req.Enabled != false ? "attivati" : "disattivati")}");
+                    Clipboard?.AnnounceCaps();
+                    return new ControlResponse { Status = GetStatus() };
+
                 case "newGroup":
                 {
                     var key = GroupKey.Generate();
@@ -209,6 +237,8 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
                 case "addAddress":
                     if (string.IsNullOrWhiteSpace(req.Address)) return Fail("Indirizzo vuoto");
+                    if (_node is { } n && NetworkNode.TryParseEndpoint(req.Address, n.ListenPort, out var own) && n.IsOwnEndpoint(own))
+                        return Fail("Questo è l'indirizzo di questo PC: scrivi quello dell'altro PC.");
                     _store.Update(c => { if (!c.ManualAddresses.Contains(req.Address.Trim())) c.ManualAddresses.Add(req.Address.Trim()); }, immediate: true);
                     await RestartNetworkAsync().ConfigureAwait(false);
                     return new ControlResponse { Status = GetStatus() };
@@ -297,6 +327,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             OutgoingPair = outgoing,
             Version = CurrentVersion.ToString(3),
             AutoUpdate = cfg.AutoUpdate,
+            ShareClipboard = cfg.ShareClipboard,
             Update = Updater?.Status,
         };
     }

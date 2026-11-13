@@ -9,6 +9,7 @@ public enum MsgType : byte
     Ping = 1,
     Pong = 2,
     Layout = 4,
+    Capabilities = 5,
     MouseMove = 10,
     MouseButton = 11,
     MouseWheel = 12,
@@ -17,6 +18,7 @@ public enum MsgType : byte
     EdgeHit = 21,
     Leave = 22,
     TakeOver = 23,
+    ClipChunk = 30,
 }
 
 public enum Edge : byte { Left = 0, Right = 1, Top = 2, Bottom = 3 }
@@ -26,6 +28,10 @@ public enum MouseButton : byte { Left = 0, Right = 1, Middle = 2, X1 = 3, X2 = 4
 [Flags]
 public enum KeyFlags : byte { None = 0, Up = 1, Extended = 2 }
 
+/// <summary>Funzioni che un PC sa gestire, annunciate appena connesso (le versioni senza questo messaggio non ne hanno).</summary>
+[Flags]
+public enum PeerCaps : uint { None = 0, Clipboard = 1 }
+
 public abstract record Message;
 
 /// <summary>Heartbeat: il ricevente risponde con <see cref="Pong"/> con lo stesso timestamp (per misurare l'RTT).</summary>
@@ -34,6 +40,15 @@ public sealed record Pong(long Timestamp) : Message;
 
 /// <summary>Disposizione degli schermi condivisa da tutto il gruppo.</summary>
 public sealed record LayoutMsg(Layout Layout) : Message;
+
+/// <summary>Mandato a ogni nuova connessione e quando cambiano le impostazioni. Le versioni vecchie lo ignorano.</summary>
+public sealed record Capabilities(PeerCaps Caps) : Message;
+
+/// <summary>
+/// Un pezzo degli appunti compressi (<paramref name="Total"/> byte in tutto), in ordine di <paramref name="Offset"/>.
+/// Viaggia in coda a bassa priorità: mouse e tastiera passano davanti.
+/// </summary>
+public sealed record ClipChunk(uint ClipId, int Total, int Offset, byte[] Data) : Message;
 
 /// <summary>Spostamento relativo (pixel fisici del PC che controlla).</summary>
 public sealed record MouseMove(int Dx, int Dy) : Message;
@@ -70,6 +85,11 @@ public static class MessageCodec
                 w.Write((byte)MsgType.Layout);
                 w.Write(JsonSerializer.Serialize(l.Layout, Json));
                 break;
+            case Capabilities c: w.Write((byte)MsgType.Capabilities); w.Write((uint)c.Caps); break;
+            case ClipChunk c:
+                w.Write((byte)MsgType.ClipChunk); w.Write(c.ClipId); w.Write(c.Total); w.Write(c.Offset);
+                w.Write(c.Data.Length); w.Write(c.Data);
+                break;
             case MouseMove mm: w.Write((byte)MsgType.MouseMove); w.Write(mm.Dx); w.Write(mm.Dy); break;
             case MouseButtonMsg b: w.Write((byte)MsgType.MouseButton); w.Write((byte)b.Button); w.Write(b.Down); break;
             case MouseWheel wh: w.Write((byte)MsgType.MouseWheel); w.Write(wh.Delta); w.Write(wh.Horizontal); break;
@@ -94,6 +114,8 @@ public static class MessageCodec
             MsgType.Ping => new Ping(r.ReadInt64()),
             MsgType.Pong => new Pong(r.ReadInt64()),
             MsgType.Layout => new LayoutMsg(JsonSerializer.Deserialize<Layout>(r.ReadString(), Json) ?? new Layout()),
+            MsgType.Capabilities => new Capabilities((PeerCaps)r.ReadUInt32()),
+            MsgType.ClipChunk => ReadClipChunk(r),
             MsgType.MouseMove => new MouseMove(r.ReadInt32(), r.ReadInt32()),
             MsgType.MouseButton => new MouseButtonMsg((MouseButton)r.ReadByte(), r.ReadBoolean()),
             MsgType.MouseWheel => new MouseWheel(r.ReadInt32(), r.ReadBoolean()),
@@ -104,5 +126,15 @@ public static class MessageCodec
             MsgType.TakeOver => new TakeOver(),
             _ => null,
         };
+    }
+
+    private static ClipChunk ReadClipChunk(BinaryReader r)
+    {
+        var id = r.ReadUInt32();
+        var total = r.ReadInt32();
+        var offset = r.ReadInt32();
+        var len = r.ReadInt32();
+        if (len < 0 || len > r.BaseStream.Length - r.BaseStream.Position) throw new InvalidDataException("ClipChunk troncato");
+        return new ClipChunk(id, total, offset, r.ReadBytes(len));
     }
 }

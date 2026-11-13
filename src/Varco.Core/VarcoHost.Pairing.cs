@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using Varco.Core.Config;
 using Varco.Core.Control;
+using Varco.Core.Crypto;
 using Varco.Core.Net;
 
 namespace Varco.Core;
@@ -23,7 +25,18 @@ public sealed partial class VarcoHost
     private long _outgoingFinishedAt;
     private CancellationTokenSource? _outgoingCts;
 
+    /// <summary>Abbinamento in uscita che aspetta di essere richiamato dall'altro PC (token inviato via UDP).</summary>
+    private sealed record PendingCallback(byte[] Token, TaskCompletionSource<Stream> Stream);
+    private PendingCallback? _callback;
+    /// <summary>Richiamate già in corso o riuscite (token → istante), per non rispondere due volte alla stessa.</summary>
+    private readonly Dictionary<string, long> _callbacksAnswered = new();
+
+    /// <summary>Solo per i test: sostituisce l'invio UDP della richiesta di richiamata.</summary>
+    internal Action<IPAddress, Guid, byte[]>? CallbackSenderForTests { get; set; }
+
     public static TimeSpan PairDecisionTimeout { get; set; } = TimeSpan.FromSeconds(60);
+    /// <summary>Tempo massimo per aprire il canale di abbinamento (diretto o con richiamata).</summary>
+    private static readonly TimeSpan PairConnectTimeout = TimeSpan.FromSeconds(10);
 
     private void OnAnnounced(Guid id, string name, IPEndPoint ep, bool sameGroup)
     {
@@ -73,6 +86,8 @@ public sealed partial class VarcoHost
     {
         IPEndPoint ep;
         string name;
+        var target = Guid.Empty;
+        string? manualAddress = null;
         lock (_pairGate)
         {
             if (_outgoing is { State: "Connecting" or "WaitingConfirm" })
@@ -81,11 +96,15 @@ public sealed partial class VarcoHost
             {
                 ep = s.Endpoint;
                 name = s.Name;
+                target = g;
             }
-            else if (!string.IsNullOrWhiteSpace(address) && NetworkNode.TryParseEndpoint(address, _store.Current.TcpPort, out var parsed))
+            else if (!string.IsNullOrWhiteSpace(address) && NetworkNode.TryParseEndpoint(address, _node?.ListenPort ?? _store.Current.TcpPort, out var parsed))
             {
+                if (_node?.IsOwnEndpoint(parsed) == true)
+                    return new ControlResponse { Ok = false, Error = "Questo è l'indirizzo di questo PC. Scrivi quello dell'altro PC: lo trovi in fondo alla finestra di Varco su quel PC." };
                 ep = parsed;
                 name = address.Trim();
+                manualAddress = name;
             }
             else
             {
@@ -96,26 +115,21 @@ public sealed partial class VarcoHost
             _outgoingCts = new CancellationTokenSource(PairDecisionTimeout + TimeSpan.FromSeconds(20));
         }
         var ct = _outgoingCts.Token;
-        _ = Task.Run(() => RunOutgoingPairing(ep, name, ct));
+        _ = Task.Run(() => RunOutgoingPairing(ep, name, target, manualAddress, ct));
         return new ControlResponse();
     }
 
-    private async Task RunOutgoingPairing(IPEndPoint ep, string name, CancellationToken ct)
+    private async Task RunOutgoingPairing(IPEndPoint ep, string name, Guid target, string? manualAddress, CancellationToken ct)
     {
         try
         {
-            using var socket = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            using (var connect = CancellationTokenSource.CreateLinkedTokenSource(ct))
-            {
-                connect.CancelAfter(4000);
-                await socket.ConnectAsync(ep, connect.Token).ConfigureAwait(false);
-            }
+            await using var stream = await OpenPairingStreamAsync(ep, target, ct).ConfigureAwait(false);
 
             PairingSession session;
             using (var hs = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 hs.CancelAfter(5000);
-                session = await PairingProtocol.InitiateAsync(new NetworkStream(socket, ownsSocket: false), MyOffer(), hs.Token).ConfigureAwait(false);
+                session = await PairingProtocol.InitiateAsync(stream, MyOffer(), hs.Token).ConfigureAwait(false);
             }
             using (session)
             {
@@ -141,6 +155,9 @@ public sealed partial class VarcoHost
                     await session.ReceiveAsync(ct).ConfigureAwait(false); // conferma
                     AddPartner(session.Peer, peerEp);
                 }
+                // Collegato scrivendo l'indirizzo: lo ricordo, servirà se la ricerca automatica non lo trova.
+                if (manualAddress is not null)
+                    _store.Update(c => { if (!c.ManualAddresses.Contains(manualAddress)) c.ManualAddresses.Add(manualAddress); }, immediate: true);
                 Finish("Done", $"Collegato a {session.Peer.Name}.");
                 Log.Info($"Abbinato a {session.Peer.Name}");
             }
@@ -152,8 +169,163 @@ public sealed partial class VarcoHost
         catch (Exception ex)
         {
             Log.Warn($"Abbinamento con {name} fallito: {ex.Message}");
-            Finish("Failed", ex is SocketException ? $"{name} non è raggiungibile." : $"Collegamento non riuscito: {ex.Message}");
+            Finish("Failed", ex is SocketException
+                ? $"{name} non è raggiungibile: controlla che sia acceso, sulla stessa rete e con Varco aggiornato."
+                : $"Collegamento non riuscito: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Apre il canale verso l'altro PC. Prima prova a collegarsi direttamente; se dopo poco non ci riesce
+    /// (es. il firewall del portatile sul Wi-Fi "Pubblico" blocca le connessioni in ingresso) gli chiede via UDP
+    /// di aprire lui la connessione verso di noi. Vince la prima che arriva; l'abbinamento poi procede identico.
+    /// </summary>
+    private async Task<Stream> OpenPairingStreamAsync(IPEndPoint ep, Guid target, CancellationToken ct)
+    {
+        var token = RandomNumberGenerator.GetBytes(PairingProtocol.CallbackTokenSize);
+        var callback = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_pairGate) _callback = new PendingCallback(token, callback);
+
+        using var race = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        race.CancelAfter(PairConnectTimeout);
+        var direct = ConnectDirectAsync(ep, race.Token);
+        var asking = AskForCallbackAsync(ep.Address, target, token, race.Token);
+        var timeout = Task.Delay(Timeout.Infinite, race.Token);
+        Stream? winner = null;
+        Exception? directError = null;
+        try
+        {
+            var pending = new List<Task> { direct, callback.Task, timeout };
+            while (winner is null)
+            {
+                var done = await Task.WhenAny(pending).ConfigureAwait(false);
+                if (done == direct)
+                {
+                    if (direct.IsCompletedSuccessfully) { winner = direct.Result; break; }
+                    directError = direct.Exception?.InnerException;
+                    pending.Remove(direct);
+                    Log.Info($"Connessione diretta a {ep} non riuscita ({directError?.Message}): aspetto che l'altro PC ci richiami");
+                }
+                else if (done == callback.Task)
+                {
+                    winner = callback.Task.Result;
+                    Log.Info($"Canale di abbinamento con {ep.Address} aperto dall'altro PC (richiamata)");
+                }
+                else
+                {
+                    ct.ThrowIfCancellationRequested();
+                    throw directError as SocketException ?? new SocketException((int)SocketError.TimedOut);
+                }
+            }
+            return winner;
+        }
+        finally
+        {
+            race.Cancel();
+            lock (_pairGate) if (ReferenceEquals(_callback?.Stream, callback)) _callback = null;
+            // Il canale perdente (arrivato in contemporanea o in ritardo) va chiuso.
+            if (!callback.TrySetCanceled() && callback.Task.IsCompletedSuccessfully && !ReferenceEquals(callback.Task.Result, winner))
+                await callback.Task.Result.DisposeAsync().ConfigureAwait(false);
+            _ = direct.ContinueWith(t => { if (t.IsCompletedSuccessfully && !ReferenceEquals(t.Result, winner)) t.Result.Dispose(); }, TaskScheduler.Default);
+            try { await asking.ConfigureAwait(false); } catch { }
+        }
+    }
+
+    private static async Task<Stream> ConnectDirectAsync(IPEndPoint ep, CancellationToken ct)
+    {
+        var socket = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        try
+        {
+            using var connect = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            connect.CancelAfter(4000);
+            await socket.ConnectAsync(ep, connect.Token).ConfigureAwait(false);
+            return new NetworkStream(socket, ownsSocket: true);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Se la connessione diretta tarda, ripete la richiesta di richiamata finché qualcosa non arriva.</summary>
+    private async Task AskForCallbackAsync(IPAddress address, Guid target, byte[] token, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(800, ct).ConfigureAwait(false);
+            while (true)
+            {
+                if (CallbackSenderForTests is { } send) send(address, target, token);
+                else _node?.SendPairCallback(address, target, token);
+                await Task.Delay(300, ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    // ═══════════════════════ richiamata: lato di chi la riceve ═══════════════════════
+
+    /// <summary>Un PC non riesce a raggiungerci e chiede che siamo noi ad aprire la connessione di abbinamento.</summary>
+    internal void OnCallbackRequested(Guid from, IPEndPoint tcpEndpoint, byte[] token)
+    {
+        var key = Convert.ToHexString(token);
+        var now = Environment.TickCount64;
+        lock (_pairGate)
+        {
+            if (_incoming is not null) return; // sto già gestendo una richiesta
+            foreach (var old in _callbacksAnswered.Where(kv => now - kv.Value > 30_000).Select(kv => kv.Key).ToList())
+                _callbacksAnswered.Remove(old);
+            if (_callbacksAnswered.ContainsKey(key) || _callbacksAnswered.Count >= 16) return;
+            _callbacksAnswered[key] = now;
+        }
+        Log.Info($"{tcpEndpoint.Address} chiede di essere richiamato per l'abbinamento");
+        _ = Task.Run(() => AnswerCallbackAsync(tcpEndpoint, token, key));
+    }
+
+    private async Task AnswerCallbackAsync(IPEndPoint ep, byte[] token, string key)
+    {
+        var socket = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        NetworkStream? stream = null;
+        try
+        {
+            using (var t = new CancellationTokenSource(5000))
+            {
+                await socket.ConnectAsync(ep, t.Token).ConfigureAwait(false);
+                stream = new NetworkStream(socket, ownsSocket: true);
+                await Framing.WriteFrameAsync(stream, PairingProtocol.EncodeCallback(token), t.Token).ConfigureAwait(false);
+                var hello = await Framing.ReadFrameAsync(stream, t.Token).ConfigureAwait(false);
+                if (!PairingProtocol.IsPairingFrame(hello)) throw new InvalidDataException("risposta inattesa");
+                var owned = stream;
+                stream = null; // da qui in poi lo stream è della richiesta di abbinamento
+                await HandlePairingRequestAsync(owned, hello, ep).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Info($"Richiamata verso {ep} non riuscita: {(ex is OperationCanceledException ? "timeout" : ex.Message)}");
+            lock (_pairGate) _callbacksAnswered.Remove(key); // alla prossima richiesta si riprova
+            if (stream is not null) await stream.DisposeAsync().ConfigureAwait(false);
+            else socket.Dispose();
+        }
+    }
+
+    /// <summary>Connessione di abbinamento in ingresso: una nuova richiesta, oppure l'altro PC che ci richiama.</summary>
+    private async Task OnPairingConnectionAsync(Stream stream, byte[] first, IPEndPoint remote)
+    {
+        if (!PairingProtocol.IsCallbackFrame(first))
+        {
+            await HandlePairingRequestAsync(stream, first, remote).ConfigureAwait(false);
+            return;
+        }
+        var token = PairingProtocol.DecodeCallback(first);
+        lock (_pairGate)
+        {
+            if (_callback is { } cb && CryptographicOperations.FixedTimeEquals(cb.Token, token) && cb.Stream.TrySetResult(stream))
+                return; // lo stream ora appartiene all'abbinamento in uscita
+        }
+        Log.Debug($"Richiamata da {remote} non attesa: ignorata");
+        await stream.DisposeAsync().ConfigureAwait(false);
     }
 
     private void SetOutgoing(Action<PairProgressDto> change)

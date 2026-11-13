@@ -18,6 +18,10 @@ public sealed class PeerConnection : IAsyncDisposable
     private readonly NetworkStream _stream;
     private readonly FrameCipher _cipher;
     private readonly Channel<byte[]> _outbox = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
+    // Dati voluminosi (appunti): un pezzo per scrittura, dopo i messaggi normali, così un'immagine copiata non rallenta il mouse.
+    private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _bulk = new();
+    /// <summary>Segnaposto nell'outbox: "c'è qualcosa in <see cref="_bulk"/>". Mai inviato.</summary>
+    private static readonly byte[] BulkReady = new byte[0];
     private readonly CancellationTokenSource _cts = new();
     private readonly TaskCompletionSource<string> _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly int _intervalMs;
@@ -85,6 +89,14 @@ public sealed class PeerConnection : IAsyncDisposable
     {
         if (_closing != 0) return;
         if (IsInput(m)) Volatile.Write(ref _lastInput, Environment.TickCount64);
+        if (m is ClipChunk chunk)
+        {
+            // Il primo pezzo di nuovi appunti rende inutile il resto di quelli vecchi ancora in coda.
+            if (chunk.Offset == 0) _bulk.Clear();
+            _bulk.Enqueue(MessageCodec.Encode(m));
+            _outbox.Writer.TryWrite(BulkReady);
+            return;
+        }
         _outbox.Writer.TryWrite(MessageCodec.Encode(m));
     }
 
@@ -173,8 +185,18 @@ public sealed class PeerConnection : IAsyncDisposable
             while (await reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
             {
                 batch.ResetWrittenCount();
+                var bulkPending = false;
                 while (batch.WrittenCount < 64 * 1024 && reader.TryRead(out var plain))
-                    Framing.AppendFrame(batch, _cipher.Seal(plain));
+                {
+                    if (ReferenceEquals(plain, BulkReady)) bulkPending = true;
+                    else Framing.AppendFrame(batch, _cipher.Seal(plain));
+                }
+                // Al massimo un pezzo voluminoso per scrittura; se ne restano, ci si risveglia per il prossimo.
+                if ((bulkPending || !_bulk.IsEmpty) && _bulk.TryDequeue(out var big))
+                {
+                    Framing.AppendFrame(batch, _cipher.Seal(big));
+                    if (!_bulk.IsEmpty) _outbox.Writer.TryWrite(BulkReady);
+                }
                 if (batch.WrittenCount == 0) continue;
                 await _stream.WriteAsync(batch.WrittenMemory, _cts.Token).ConfigureAwait(false);
                 Volatile.Write(ref _lastSent, Environment.TickCount64);

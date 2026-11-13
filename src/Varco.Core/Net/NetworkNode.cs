@@ -71,7 +71,13 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     /// <summary>Un PC con Varco (anche di un altro gruppo) si è annunciato: (id, nome, endpoint TCP, stesso gruppo?).</summary>
     public event Action<Guid, string, IPEndPoint, bool>? Announced;
 
-    /// <summary>Gestore delle richieste di abbinamento in ingresso: riceve lo stream (ne diventa proprietario), il primo frame e l'indirizzo remoto.</summary>
+    /// <summary>Un PC chiede di essere richiamato per l'abbinamento: (suo id, suo endpoint TCP, token).</summary>
+    public event Action<Guid, IPEndPoint, byte[]>? CallbackRequested;
+
+    /// <summary>
+    /// Gestore delle connessioni di abbinamento in ingresso (richiesta, o risposta a una nostra richiamata):
+    /// riceve lo stream (ne diventa proprietario), il primo frame e l'indirizzo remoto.
+    /// </summary>
     public Func<Stream, byte[], IPEndPoint, Task>? PairingRequested { get; set; }
 
     /// <summary>Un peer è stato raggiunto a questo indirizzo: da salvare in config per la prossima volta.</summary>
@@ -95,6 +101,11 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         foreach (var a in options.ManualAddresses)
         {
             if (!TryParseEndpoint(a, options.TcpPort == 0 ? 47800 : options.TcpPort, out var ep)) continue;
+            if (IsOwnEndpoint(ep))
+            {
+                Log.Info($"Indirizzo manuale {a} ignorato: è questo PC");
+                continue;
+            }
             var slot = new PeerSlot(null, a);
             slot.AddEndpoint(ep, front: true);
             _slots["addr:" + a] = slot;
@@ -105,6 +116,7 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
             _discovery = new Discovery(Me, options.DiscoveryPort, ManualDiscoveryTargets);
             _discovery.PeerSeen += OnPeerSeen;
             _discovery.Announced += (id, name, ep, same) => Announced?.Invoke(id, name, ep, same);
+            _discovery.CallbackRequested += (id, ep, token) => CallbackRequested?.Invoke(id, ep, token);
         }
     }
 
@@ -172,6 +184,17 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         _discovery?.Announce();
     }
 
+    /// <summary>Chiede a un PC di aprire lui la connessione di abbinamento verso di noi (vedi <see cref="Discovery.SendCallback"/>).</summary>
+    public void SendPairCallback(IPAddress address, Guid target, byte[] token) => _discovery?.SendCallback(address, target, token);
+
+    /// <summary>L'endpoint è questo stesso PC (un suo indirizzo, o loopback, sulla nostra porta)?</summary>
+    public bool IsOwnEndpoint(IPEndPoint ep)
+    {
+        if (ep.Port != ListenPort) return false;
+        var a = Normalize(ep.Address);
+        return IPAddress.IsLoopback(a) || a.Equals(IPAddress.Any) || Discovery.LocalNetworks().Any(n => n.Address.Equals(a));
+    }
+
     /// <summary>Chiude tutte le connessioni e le riapre (es. dopo il risveglio dallo standby: meglio non fidarsi dei socket vecchi).</summary>
     public void ResetAll(string reason)
     {
@@ -232,7 +255,7 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
             using var t = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
             t.CancelAfter(_opt.HandshakeTimeoutMs);
             var first = await Framing.ReadFrameAsync(stream, t.Token).ConfigureAwait(false);
-            if (PairingProtocol.IsPairingFrame(first))
+            if (PairingProtocol.IsPairingFrame(first) || PairingProtocol.IsCallbackFrame(first))
             {
                 // Richiesta di abbinamento: la gestisce l'host (serve la conferma dell'utente, niente timeout di handshake).
                 var handler = PairingRequested;

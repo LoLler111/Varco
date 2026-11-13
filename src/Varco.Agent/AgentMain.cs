@@ -42,7 +42,8 @@ public static class AgentMain
 
         var store = new ConfigStore(configDir);
         IInputPlatform platform = noInput ? new NullInput() : new WindowsInput();
-        await using var host = new VarcoHost(store, platform, port, discoveryPort);
+        using var clipboard = noInput ? null : new WindowsClipboard();
+        await using var host = new VarcoHost(store, platform, port, discoveryPort, clipboard);
         if (platform is WindowsInput wi) wi.Coordinator = host.Coordinator;
 
         using var responsiveness = new Responsiveness();

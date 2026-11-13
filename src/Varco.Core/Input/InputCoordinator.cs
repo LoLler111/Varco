@@ -64,6 +64,19 @@ public sealed class InputCoordinator
     /// </summary>
     public int MoveIntervalMs { get; init; } = 4;
 
+    // Rotella raggruppata come i movimenti: una rotella a scorrimento libero o ad alta risoluzione manda centinaia di
+    // eventi al secondo. Inviati e iniettati uno per uno, sul Wi-Fi arrivano a raffiche e il PC controllato riceve decine
+    // di scatti tutti insieme: la coda di input si intasa e il cursore resta fermo finché lo scorrimento non è finito.
+    private int _pendWheelV, _pendWheelH;
+    private long _lastWheelSent = long.MinValue / 2;
+    private long _flushDue = long.MaxValue;
+
+    /// <summary>Intervallo minimo tra due invii della rotella (ms). Gli scatti nel frattempo vengono sommati.</summary>
+    public int WheelIntervalMs { get; init; } = 16;
+
+    /// <summary>Delta massimo in un solo evento: WM_MOUSEWHEEL lo porta in uno short. Multiplo di 120 (uno scatto).</summary>
+    private const int MaxWheelDelta = 32760;
+
     // lato target
     private readonly Dictionary<ushort, KeyMsg> _injectedKeys = new();
     private int _injectedButtons;
@@ -72,13 +85,24 @@ public sealed class InputCoordinator
     // Usata solo sul thread di input.
     private int _vx, _vy;
     private bool _vValid;
+    // Scatti di rotella ricevuti e non ancora iniettati: quelli che arrivano mentre il precedente è ancora in coda
+    // si sommano a lui invece di diventare un altro evento.
+    private sealed class WheelSlot { public int Delta; public bool Horizontal; }
+    private WheelSlot? _wheelSlot;
 
     public InputCoordinator(IPeerNetwork net, IInputPlatform platform, LayoutManager layout)
     {
         _net = net;
         _platform = platform;
         _layout = layout;
-        _flushTimer = new Timer(_ => { lock (_gate) FlushMoves(); });
+        _flushTimer = new Timer(_ =>
+        {
+            lock (_gate)
+            {
+                _flushDue = long.MaxValue;
+                FlushPending();
+            }
+        });
         SyncDesktopSize();
     }
 
@@ -100,8 +124,9 @@ public sealed class InputCoordinator
     {
         _mode = mode;
         _peer = peer;
-        _pendDx = _pendDy = 0; // spostamenti non inviati: appartenevano al target precedente
-        var p =mode == InputMode.Local ? (Guid?)null : peer;
+        _pendDx = _pendDy = 0; // spostamenti e rotella non inviati: appartenevano al target precedente
+        _pendWheelV = _pendWheelH = 0;
+        var p = mode == InputMode.Local ? (Guid?)null : peer;
         Log.Info($"Modalità input: {mode}{(p is null ? "" : $" ({p})")}");
         try { ModeChanged?.Invoke(mode, p); } catch { }
     }
@@ -130,7 +155,7 @@ public sealed class InputCoordinator
                     _pendDy += y - _parkY;
                     var waited = ElapsedMs(_lastMoveSent);
                     if (waited >= MoveIntervalMs) FlushMoves();
-                    else _flushTimer.Change(Math.Max(1, MoveIntervalMs - (int)waited), Timeout.Infinite); // invia la coda se il mouse si ferma
+                    else ScheduleFlush(MoveIntervalMs - waited); // invia la coda se il mouse si ferma
                     return true;
 
                 default:
@@ -150,7 +175,7 @@ public sealed class InputCoordinator
                     if (down) _localButtons |= 1 << (int)button; else _localButtons &= ~(1 << (int)button);
                     return false;
                 case InputMode.Controlling:
-                    FlushMoves(); // il clic deve arrivare dopo lo spostamento che lo precede
+                    FlushPending(); // il clic deve arrivare dopo lo spostamento (e lo scorrimento) che lo precede
                     _net.Send(_peer, new MouseButtonMsg(button, down));
                     return true;
                 default:
@@ -168,8 +193,10 @@ public sealed class InputCoordinator
             {
                 case InputMode.Local: return false;
                 case InputMode.Controlling:
-                    FlushMoves();
-                    _net.Send(_peer, new MouseWheel(delta, horizontal));
+                    if (horizontal) _pendWheelH += delta; else _pendWheelV += delta;
+                    var waited = ElapsedMs(_lastWheelSent);
+                    if (waited >= WheelIntervalMs) FlushPending();
+                    else ScheduleFlush(WheelIntervalMs - waited);
                     return true;
                 default:
                     TakeOverLocally();
@@ -207,7 +234,7 @@ public sealed class InputCoordinator
                         _remoteDownKeys.Add(vk);
                         return true;
                     }
-                    FlushMoves();
+                    FlushPending();
                     _net.Send(_peer, new KeyMsg(vk, scan, flags));
                     if (up) _remoteDownKeys.Remove(vk); else _remoteDownKeys.Add(vk);
                     return true;
@@ -270,14 +297,12 @@ public sealed class InputCoordinator
                 case MouseMove m when IsControlledBy(from): InjectMove(m.Dx, m.Dy); break;
                 case MouseButtonMsg b when IsControlledBy(from):
                     if (b.Down) _injectedButtons |= 1 << (int)b.Button; else _injectedButtons &= ~(1 << (int)b.Button);
-                    _platform.Post(() => _platform.InjectButton(b.Button, b.Down));
+                    PostInput(() => _platform.InjectButton(b.Button, b.Down));
                     break;
-                case MouseWheel w when IsControlledBy(from):
-                    _platform.Post(() => _platform.InjectWheel(w.Delta, w.Horizontal));
-                    break;
+                case MouseWheel w when IsControlledBy(from): InjectWheel(w.Delta, w.Horizontal); break;
                 case KeyMsg k when IsControlledBy(from):
                     if (k.Flags.HasFlag(KeyFlags.Up)) _injectedKeys.Remove(k.Vk); else _injectedKeys[k.Vk] = k;
-                    _platform.Post(() => _platform.InjectKey(k.Vk, k.Scan, k.Flags));
+                    PostInput(() => _platform.InjectKey(k.Vk, k.Scan, k.Flags));
                     break;
             }
         }
@@ -296,6 +321,67 @@ public sealed class InputCoordinator
         _net.Send(_peer, new MouseMove(_pendDx, _pendDy));
         _pendDx = _pendDy = 0;
         _lastMoveSent = Stopwatch.GetTimestamp();
+    }
+
+    /// <summary>Invia spostamenti e rotella accumulati: prima il cursore, poi lo scorrimento nel punto dove è arrivato.</summary>
+    private void FlushPending()
+    {
+        FlushMoves();
+        if (_mode != InputMode.Controlling || (_pendWheelV == 0 && _pendWheelH == 0)) return;
+        _pendWheelV = SendWheel(_pendWheelV, false);
+        _pendWheelH = SendWheel(_pendWheelH, true);
+        _lastWheelSent = Stopwatch.GetTimestamp();
+        if (_pendWheelV != 0 || _pendWheelH != 0) ScheduleFlush(WheelIntervalMs); // oltre il massimo di un evento: il resto dopo
+    }
+
+    /// <summary>Invia il delta (al massimo <see cref="MaxWheelDelta"/>) e restituisce quanto resta da inviare.</summary>
+    private int SendWheel(int pending, bool horizontal)
+    {
+        if (pending == 0) return 0;
+        var now = Math.Clamp(pending, -MaxWheelDelta, MaxWheelDelta);
+        _net.Send(_peer, new MouseWheel(now, horizontal));
+        return pending - now;
+    }
+
+    /// <summary>Programma l'invio di ciò che è in attesa, senza mai ritardare un invio già programmato prima.</summary>
+    private void ScheduleFlush(double inMs)
+    {
+        var due = Stopwatch.GetTimestamp() + (long)(inMs * Stopwatch.Frequency / 1000);
+        if (due >= _flushDue) return;
+        _flushDue = due;
+        _flushTimer.Change(Math.Max(1, (int)Math.Ceiling(inMs)), Timeout.Infinite);
+    }
+
+    /// <summary>
+    /// Accoda un'azione sul thread di input. Chiude lo scatto di rotella in attesa: quelli che arrivano dopo non devono
+    /// essere iniettati prima di questa azione.
+    /// </summary>
+    private void PostInput(Action action)
+    {
+        _wheelSlot = null;
+        _platform.Post(action);
+    }
+
+    private void InjectWheel(int delta, bool horizontal)
+    {
+        // Ancora in coda uno scatto nella stessa direzione: si somma a quello (un solo evento, una sola rinfrescata della lista).
+        if (_wheelSlot is { } open && open.Horizontal == horizontal && Math.Abs((long)open.Delta + delta) <= MaxWheelDelta)
+        {
+            open.Delta += delta;
+            return;
+        }
+        var slot = new WheelSlot { Delta = delta, Horizontal = horizontal };
+        _wheelSlot = slot; // sostituisce (e quindi chiude) un eventuale scatto aperto nell'altra direzione
+        _platform.Post(() =>
+        {
+            int d;
+            lock (_gate)
+            {
+                d = slot.Delta;
+                if (_wheelSlot == slot) _wheelSlot = null;
+            }
+            if (d != 0) _platform.InjectWheel(d, slot.Horizontal);
+        });
     }
 
     private void StartControlling(Guid target, Edge edge, float ratio, int x, int y, IReadOnlyList<Rect> monitors)
@@ -329,7 +415,7 @@ public sealed class InputCoordinator
         }
         _latchedEdge = null;
         SetMode(InputMode.Controlled, from);
-        _platform.Post(() =>
+        PostInput(() =>
         {
             var (x, y) = ScreenGeometry.EntryPoint(_platform.GetMonitors(), e.From, e.Ratio);
             _platform.InjectMoveTo(x, y);
@@ -360,7 +446,7 @@ public sealed class InputCoordinator
     private void InjectMove(int dx, int dy)
     {
         var controller = _peer;
-        _platform.Post(() =>
+        PostInput(() =>
         {
             var monitors = _platform.GetMonitors();
             if (!_vValid) { (_vx, _vy) = _platform.GetCursorPos(); _vValid = true; }
@@ -401,7 +487,7 @@ public sealed class InputCoordinator
         _injectedKeys.Clear();
         _injectedButtons = 0;
         _latchedEdge = null;
-        _platform.Post(() =>
+        PostInput(() =>
         {
             _vValid = false;
             foreach (var k in keys) _platform.InjectKey(k.Vk, k.Scan, k.Flags | KeyFlags.Up);
