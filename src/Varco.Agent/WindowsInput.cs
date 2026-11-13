@@ -27,8 +27,32 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     private volatile IReadOnlyList<Rect> _monitors = [];
     private int _ticks;
     private bool _disposed;
+    private volatile bool _controlling;
+    private InputCoordinator? _coordinator;
 
-    public InputCoordinator? Coordinator { get; set; }
+    public InputCoordinator? Coordinator
+    {
+        get => _coordinator;
+        set
+        {
+            if (_coordinator is { } old) old.ModeChanged -= OnModeChanged;
+            _coordinator = value;
+            if (value is not null) value.ModeChanged += OnModeChanged;
+        }
+    }
+
+    /// <summary>
+    /// Mentre si comanda un altro PC l'hook di tastiera deve essere il primo della catena. Windows chiama gli hook
+    /// low-level dal più recente: il client Desktop remoto (anche la sessione avanzata di Hyper-V), quando la sua finestra
+    /// ha il focus, installa un proprio hook di tastiera e si tiene i tasti senza passarli avanti. Così Varco non li
+    /// vedeva e la tastiera continuava a scrivere nella sessione remota invece che sull'altro PC.
+    /// Si reinstalla l'hook appena si inizia a comandare e poi ogni secondo, nel caso l'altro si reinstalli.
+    /// </summary>
+    private void OnModeChanged(InputMode mode, Guid? _)
+    {
+        _controlling = mode == InputMode.Controlling;
+        if (_controlling) _thread?.BringKeyboardHookToFront();
+    }
 
     public WindowsInput()
     {
@@ -79,6 +103,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
 
     public void InjectKey(ushort vk, ushort scan, KeyFlags flags)
     {
+        flags = KeyCodes.ForInjection(vk, scan, flags); // Maiusc destro: mai "esteso" (vale anche con PC che comandano con versioni vecchie)
         uint f = 0;
         if (flags.HasFlag(KeyFlags.Up)) f |= KEYEVENTF_KEYUP;
         if (flags.HasFlag(KeyFlags.Extended)) f |= KEYEVENTF_EXTENDEDKEY;
@@ -111,7 +136,11 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         if (_disposed) return;
         try
         {
-            if (++_ticks % 4 == 0) RefreshMonitors();
+            if (++_ticks % 4 == 0)
+            {
+                RefreshMonitors();
+                if (_controlling) _thread?.BringKeyboardHookToFront();
+            }
             var current = InputDesktopName();
             var t = _thread;
             if (t is null || !t.IsAlive || (current is not null && t.DesktopName is not null && current != t.DesktopName))
@@ -157,9 +186,10 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         }
     }
 
-    internal void DrainWork()
+    internal void DrainWork(Func<bool> alive)
     {
-        while (_work.TryDequeue(out var a))
+        // Un thread di iniezione appena sostituito (cambio di desktop) si ferma subito: niente due thread che iniettano insieme.
+        while (alive() && _work.TryDequeue(out var a))
         {
             try { a(); }
             catch (Exception ex) { Log.Error("Azione di input", ex); }
@@ -176,44 +206,89 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         }
     }
 
-    // ───────────── thread agganciato al desktop di input ─────────────
+    // ───────────── thread agganciati al desktop di input ─────────────
 
+    /// <summary>
+    /// Due thread sul desktop di input: uno ospita gli hook, l'altro esegue le iniezioni (SendInput) e il resto di <see cref="Post"/>.
+    ///
+    /// Devono essere separati. Per ogni evento, anche quelli iniettati da noi, Windows chiama gli hook low-level
+    /// sul thread che li ha installati e aspetta la risposta fino a LowLevelHooksTimeout (di solito 300 ms). Se quel thread
+    /// è occupato a iniettare non risponde: con la rotella ogni scatto aspettava il timeout intero, lo scorrimento andava
+    /// avanti a passi di 300 ms e il cursore restava fermo dietro di lui finché non finiva. Windows, dopo troppi timeout,
+    /// può anche rimuovere l'hook senza avvisare. Il thread degli hook quindi non fa altro che rispondere agli hook.
+    /// </summary>
     private sealed class InputThread
     {
         private readonly WindowsInput _owner;
         private readonly Thread _thread;
+        private readonly Thread _injector;
         private readonly ManualResetEventSlim _ready = new();
+        private readonly AutoResetEvent _workReady = new(false);
         private readonly HookProc _mouseProc;
         private readonly HookProc _keyProc;
         private uint _threadId;
         private volatile bool _alive = true;
 
         public string? DesktopName { get; private set; }
-        public bool IsAlive => _alive && _thread.IsAlive;
+        public bool IsAlive => _alive && _thread.IsAlive && _injector.IsAlive;
 
         public InputThread(WindowsInput owner)
         {
             _owner = owner;
             _mouseProc = MouseHook;
             _keyProc = KeyHook;
-            _thread = new Thread(Run) { IsBackground = true, Name = "Varco input", Priority = ThreadPriority.Highest };
+            _thread = new Thread(Run) { IsBackground = true, Name = "Varco hook", Priority = ThreadPriority.Highest };
+            _injector = new Thread(InjectLoop) { IsBackground = true, Name = "Varco iniezione", Priority = ThreadPriority.Highest };
         }
 
         public void Start()
         {
             _thread.Start();
             _ready.Wait(2000);
+            _injector.Start();
         }
 
-        public void Wake()
+        public void Wake() => _workReady.Set();
+
+        private const int WM_REHOOK_KEYBOARD = WM_APP + 1;
+
+        /// <summary>Reinstalla l'hook di tastiera (sul suo thread), che torna così il primo a ricevere i tasti.</summary>
+        public void BringKeyboardHookToFront()
         {
-            if (_threadId != 0) PostThreadMessage(_threadId, WM_APP, IntPtr.Zero, IntPtr.Zero);
+            if (_threadId != 0) PostThreadMessage(_threadId, WM_REHOOK_KEYBOARD, IntPtr.Zero, IntPtr.Zero);
         }
 
         public void Stop()
         {
             _alive = false;
             if (_threadId != 0) PostThreadMessage(_threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+            _workReady.Set();
+        }
+
+        private void InjectLoop()
+        {
+            IntPtr desk = IntPtr.Zero;
+            try
+            {
+                // SendInput e SetCursorPos agiscono sul desktop del thread chiamante: lo stesso del thread degli hook.
+                desk = OpenInputDesktop(0, false, DESKTOP_ALL | GENERIC_ALL);
+                if (desk != IntPtr.Zero && !SetThreadDesktop(desk))
+                    Log.Warn($"SetThreadDesktop (iniezione) fallito ({Marshal.GetLastWin32Error()})");
+                while (_alive)
+                {
+                    _owner.DrainWork(() => _alive);
+                    _workReady.WaitOne();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Thread di iniezione", ex);
+            }
+            finally
+            {
+                _alive = false;
+                if (desk != IntPtr.Zero) CloseDesktop(desk);
+            }
         }
 
         private void Run()
@@ -245,10 +320,15 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 _ready.Set();
                 Log.Info($"Thread di input attivo sul desktop \"{DesktopName ?? "corrente"}\"");
 
-                _owner.DrainWork();
+                // Solo messaggi: gli hook vengono chiamati da qui dentro. Niente lavoro lungo su questo thread.
                 while (_alive && GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
                 {
-                    if (msg.message == WM_APP) _owner.DrainWork();
+                    if (msg.message != WM_REHOOK_KEYBOARD) continue;
+                    // Prima il nuovo (finisce in cima alla catena), poi via il vecchio: nessun istante senza hook.
+                    var fresh = SetWindowsHookEx(WH_KEYBOARD_LL, _keyProc, hMod, 0);
+                    if (fresh == IntPtr.Zero) { Log.Debug($"Reinstallazione hook tastiera fallita ({Marshal.GetLastWin32Error()})"); continue; }
+                    if (keyHook != IntPtr.Zero) UnhookWindowsHookEx(keyHook);
+                    keyHook = fresh;
                 }
             }
             catch (Exception ex)

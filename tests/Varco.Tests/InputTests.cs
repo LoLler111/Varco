@@ -36,6 +36,24 @@ public class GeometryTests
     }
 }
 
+public class KeyCodeTests
+{
+    [Fact]
+    public void Right_shift_is_never_injected_as_extended()
+    {
+        // Come lo segnala l'hook (misurato): vk A1, scancode 36, esteso
+        Assert.Equal(KeyFlags.None, KeyCodes.ForInjection(0xA1, 0x36, KeyFlags.Extended));
+        Assert.Equal(KeyFlags.Up, KeyCodes.ForInjection(0xA1, 0x36, KeyFlags.Extended | KeyFlags.Up));
+        // Maiusc finti inoltrati (senza VK_RSHIFT): restano finti
+        Assert.Equal(KeyFlags.Extended, KeyCodes.ForInjection(0xFF, 0x36, KeyFlags.Extended));
+        Assert.Equal(KeyFlags.Extended, KeyCodes.ForInjection(0xA0, 0x2A, KeyFlags.Extended));
+        // gli altri tasti estesi restano estesi: Ctrl destro, AltGr, frecce
+        Assert.Equal(KeyFlags.Extended, KeyCodes.ForInjection(0xA3, 0x1D, KeyFlags.Extended));
+        Assert.Equal(KeyFlags.Extended | KeyFlags.Up, KeyCodes.ForInjection(0xA5, 0x38, KeyFlags.Extended | KeyFlags.Up));
+        Assert.Equal(KeyFlags.Extended, KeyCodes.ForInjection(0x26, 0x48, KeyFlags.Extended));
+    }
+}
+
 public class LayoutTests
 {
     private static readonly Guid A = Guid.NewGuid(), B = Guid.NewGuid(), C = Guid.NewGuid();

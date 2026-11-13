@@ -28,6 +28,20 @@ public enum MouseButton : byte { Left = 0, Right = 1, Middle = 2, X1 = 3, X2 = 4
 [Flags]
 public enum KeyFlags : byte { None = 0, Up = 1, Extended = 2 }
 
+public static class KeyCodes
+{
+    public const ushort VK_RSHIFT = 0xA1;
+
+    /// <summary>
+    /// Corregge i flag di un tasto prima di iniettarlo per scancode. L'hook di Windows segnala il Maiusc destro vero
+    /// (VK_RSHIFT, scancode 0x36) come "esteso", ma iniettato come E0 36 diventa il Maiusc "finto" che le tastiere
+    /// mandano attorno ai tasti di navigazione, e Windows lo ignora: sull'altro PC il Maiusc destro non faceva nulla.
+    /// Solo con VK_RSHIFT: un Maiusc finto inoltrato (che non ha quel VK) resta finto.
+    /// </summary>
+    public static KeyFlags ForInjection(ushort vk, ushort scan, KeyFlags flags) =>
+        vk == VK_RSHIFT && scan == 0x36 ? flags & ~KeyFlags.Extended : flags;
+}
+
 /// <summary>Funzioni che un PC sa gestire, annunciate appena connesso (le versioni senza questo messaggio non ne hanno).</summary>
 [Flags]
 public enum PeerCaps : uint { None = 0, Clipboard = 1 }
