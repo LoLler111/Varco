@@ -15,7 +15,7 @@ internal sealed class ControlServer(VarcoHost host, string pipeName) : IDisposab
 
     public void Start() => _ = Task.Run(Loop);
 
-    private static PipeSecurity Security()
+    internal static PipeSecurity Security()
     {
         var sec = new PipeSecurity();
         sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl, AccessControlType.Allow));

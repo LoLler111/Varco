@@ -16,7 +16,7 @@ Ci riesce dopo uno standby, un cambio di rete, un riavvio o un cavo staccato, se
 
 - **Ctrl+Alt+F12** riporta sempre mouse e tastiera sul PC fisico (via di fuga).
 - Se tocchi il mouse o la tastiera del PC comandato, il controllo passa a quel PC.
-- **Appunti condivisi:** copi su un PC e incolli su un altro. Passano testo, testo formattato (HTML, RTF) e immagini. I file no. Restano fuori anche i contenuti che i gestori di password segnano come privati. Funziona tra PC con Varco 0.5 o successivo e si può spegnere in *Avanzate*.
+- **Appunti condivisi:** copi su un PC e incolli su un altro. Passano testo, testo formattato (HTML, RTF), immagini e **file e cartelle** copiati in Esplora risorse. I file passano solo quando li incolli, con la barra di avanzamento di Windows, e non hanno limiti di dimensione. Restano fuori i contenuti che i gestori di password segnano come privati. Testo e immagini richiedono Varco 0.5 su tutti e due i PC, i file Varco 0.5.1. Si può spegnere tutto in *Avanzate*.
 - **Aggiornamenti automatici:** Varco controlla le [release su GitHub](https://github.com/LoLler111/Varco/releases) qualche minuto dopo l'avvio e poi ogni 6 ore circa. Le nuove versioni si installano da sole, senza conferme, appena nessun PC sta usando mouse e tastiera di un altro. Si possono spegnere, o forzare un controllo, in *Avanzate*.
 - Per aggiornare a mano: apri il nuovo `Varco.exe` e premi **Aggiorna**. I PC già collegati restano collegati.
 - Per disinstallare: *Impostazioni → App → App installate → Varco → Disinstalla*.
@@ -55,10 +55,11 @@ Varco.exe --uninstall  → disinstallazione
 │ Varco.exe --agent     (SYSTEM, sessione dell'utente)                   │
 │   ├─ WindowsInput: hook LL + SendInput, segue il desktop attivo        │
 │   ├─ InputCoordinator: Local / Controlling / Controlled               │
-│   ├─ WindowsClipboard + ClipboardSync: appunti condivisi              │
+│   ├─ WindowsClipboard + ClipboardSync: appunti e offerte di file      │
+│   ├─ FilePipeServer: dati dei file incollati per l'icona              │
 │   ├─ NetworkNode: discovery UDP, TCP cifrato, heartbeat, riconnessione │
 │   ├─ Abbinamento: richieste in arrivo, codice di conferma              │
-│   └─ pipe "Varco.Control" ◄── Varco.exe (icona e finestra, utente)     │
+│   └─ pipe "Varco.Control" ◄── Varco.exe (icona e file virtuali)        │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -91,6 +92,21 @@ Varco.exe --uninstall  → disinstallazione
 - **Niente rimbalzi:** le scritture fatte da Varco non vengono rimandate indietro. Un'impronta SHA-256 evita di rispedire un contenuto appena ricevuto.
 - **Chi invia:** non manda gli appunti un PC che sta comandando un altro. In quel momento le copie locali arrivano da programmi, non dall'utente.
 - **Privacy:** si rispettano i formati `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore` e `CanUploadToCloudClipboard = 0`, usati dai gestori di password.
+
+### File
+Funzionano come in Desktop remoto: si copiano in Esplora risorse su un PC e si incollano con Ctrl+V su un altro.
+
+1. Il PC A legge `CF_HDROP` e crea un'**offerta**: nomi relativi, dimensioni e date, anche delle cartelle (al massimo 20.000 elementi). L'offerta viaggia negli appunti come formato `Varco.Files`. Nessun dato viene ancora trasferito.
+2. L'agent del PC B passa l'offerta all'icona con un'attesa lunga sulla pipe di controllo (`filesOffer`). L'icona mette negli appunti un `IDataObject` con `FileGroupDescriptorW`, `FileContents` e `Preferred DropEffect` = copia. Deve farlo l'icona perché Esplora risorse, che gira come utente, deve poter chiamare l'oggetto COM, e l'agent è SYSTEM. L'oggetto vive su un thread STA dedicato.
+3. Quando l'utente incolla, Esplora risorse chiede un `IStream` per ogni file. L'icona lo legge dalla pipe `Varco.Files` dell'agent. L'agent apre una **connessione TCP dedicata** verso A (marcatore `VRCF`, poi lo stesso handshake e la stessa cifratura delle connessioni normali) e chiede "elemento N dell'offerta X dalla posizione P".
+4. A apre il file **con i permessi dell'utente collegato** (`WTSQueryUserToken` e impersonazione). Così un altro PC ottiene solo ciò che quell'utente poteva leggere, e funzionano anche le unità di rete mappate.
+
+Dettagli:
+- **Niente limiti di dimensione:** i dati passano a flusso, a pezzi da 64 KB, senza essere caricati in memoria. Si riprende da metà con `IStream::Seek`.
+- **Il mouse viene prima:** il file usa una connessione diversa da quella di mouse e tastiera. Se nel frattempo il mouse è in uso verso quel PC e la latenza sale oltre 15 ms, l'invio rallenta.
+- **Sicurezza:** chi riceve può chiedere solo gli elementi di un'offerta esistente, mai un percorso. I nomi in arrivo vengono rifiutati se sono assoluti, contengono `..` o caratteri vietati. Se un file cambia durante la copia, l'incolla fallisce invece di lasciare un file troncato.
+- **Compatibilità:** i PC con i file annunciano la capacità `Files`. A un PC con la 0.5 arrivano solo gli eventuali altri formati, così non si svuotano i suoi appunti.
+- Chiudendo l'icona gli appunti si svuotano. Non si usa mai `OleFlushClipboard`, che scaricherebbe tutti i file.
 
 ### Sicurezza
 - **Chiave di gruppo:** 160 bit casuali, creata automaticamente e mai mostrata all'utente.
@@ -157,6 +173,6 @@ dotnet run --project tools/Varco.IconGen
 ## Limiti noti e prossimi passi
 - **Ctrl+Alt+Canc** non si può intercettare: agisce sempre sul PC fisico. Inviarlo al remoto richiede `SendSAS` con la policy *SoftwareSASGeneration*.
 - Sul PC che comanda il cursore resta parcheggiato al centro dello schermo. Si potrebbe nasconderlo.
-- Appunti: i file copiati in Esplora risorse non passano (servirebbe trasferirne il contenuto).
+- File: si incollano con Ctrl+V (o *Incolla*) in Esplora risorse e nei programmi che accettano file virtuali. Il trascinamento diretto da uno schermo all'altro non è ancora supportato. Nomi con percorso relativo oltre 259 caratteri vengono saltati.
 - Wake-on-LAN.
 - Un PC rimosso con *Rimuovi* conosce ancora la vecchia chiave: se torna acceso, si ricollega. Per escluderlo del tutto, su quel PC usa *Avanzate → Scollega questo PC da tutti* oppure disinstalla Varco.

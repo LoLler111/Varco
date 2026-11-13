@@ -43,7 +43,7 @@ public static class AgentMain
         var store = new ConfigStore(configDir);
         IInputPlatform platform = noInput ? new NullInput() : new WindowsInput();
         using var clipboard = noInput ? null : new WindowsClipboard();
-        await using var host = new VarcoHost(store, platform, port, discoveryPort, clipboard);
+        await using var host = new VarcoHost(store, platform, port, discoveryPort, clipboard, clipboard is null ? null : new UserFileAccess());
         if (platform is WindowsInput wi) wi.Coordinator = host.Coordinator;
 
         using var responsiveness = new Responsiveness();
@@ -59,6 +59,8 @@ public static class AgentMain
 
         using var control = new ControlServer(host, Arg(args, "--pipe") ?? ControlProtocol.PipeName);
         control.Start();
+        using var files = new FilePipeServer(host, Arg(args, "--pipe") is { } fp ? fp + ".Files" : ControlProtocol.FilesPipeName);
+        files.Start();
         await host.StartAsync();
 
         // Aggiornamenti automatici solo per l'agent avviato dal servizio (Varco installato), non in sviluppo.

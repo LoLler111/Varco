@@ -44,7 +44,7 @@ public static class KeyCodes
 
 /// <summary>Funzioni che un PC sa gestire, annunciate appena connesso (le versioni senza questo messaggio non ne hanno).</summary>
 [Flags]
-public enum PeerCaps : uint { None = 0, Clipboard = 1 }
+public enum PeerCaps : uint { None = 0, Clipboard = 1, Files = 2 }
 
 public abstract record Message;
 

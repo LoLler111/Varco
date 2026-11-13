@@ -2,6 +2,7 @@
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using Varco.Core.Crypto;
+using Varco.Core.Files;
 using Varco.Core.Protocol;
 
 namespace Varco.Core.Net;
@@ -79,6 +80,9 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     /// riceve lo stream (ne diventa proprietario), il primo frame e l'indirizzo remoto.
     /// </summary>
     public Func<Stream, byte[], IPEndPoint, Task>? PairingRequested { get; set; }
+
+    /// <summary>Apre i file offerti da questo PC quando un altro del gruppo li incolla (null = nessun file condiviso).</summary>
+    public FileOpener? FileProvider { get; set; }
 
     /// <summary>Un peer è stato raggiunto a questo indirizzo: da salvare in config per la prossima volta.</summary>
     public event Action<Guid, string, string>? PeerLearned;
@@ -184,6 +188,28 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         _discovery?.Announce();
     }
 
+    /// <summary>Scarica l'elemento <paramref name="index"/> di un'offerta di file del PC <paramref name="peer"/> (deve essere connesso).</summary>
+    public Task<FileTransfer.RemoteFile> OpenFileAsync(Guid peer, Guid offerId, int index, long offset, CancellationToken ct)
+    {
+        PeerConnection? c;
+        lock (_gate) _conns.TryGetValue(peer, out c);
+        if (c is null) throw new IOException("il PC che ha copiato i file non è collegato");
+        var ep = new IPEndPoint(Normalize(c.RemoteEndPoint.Address), c.PeerListenPort);
+        return FileTransfer.OpenAsync(ep, Me, peer, offerId, index, offset, _opt.ConnectTimeoutMs, _opt.HandshakeTimeoutMs, ct);
+    }
+
+    /// <summary>
+    /// Mentre si usa il mouse verso quel PC, i file rallentano se la latenza sale: prima il cursore, poi la copia.
+    /// Senza mouse in uso (o con latenza bassa, es. via cavo) vanno alla massima velocità.
+    /// </summary>
+    private int ThrottleMs(Guid peer)
+    {
+        PeerConnection? c;
+        lock (_gate) _conns.TryGetValue(peer, out c);
+        if (c is null || !c.InputActive) return 0;
+        return c.RttMs switch { > 40 => 20, > 15 => 4, _ => 0 };
+    }
+
     /// <summary>Chiede a un PC di aprire lui la connessione di abbinamento verso di noi (vedi <see cref="Discovery.SendCallback"/>).</summary>
     public void SendPairCallback(IPAddress address, Guid target, byte[] token) => _discovery?.SendCallback(address, target, token);
 
@@ -262,6 +288,13 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
                 var remoteEp = (IPEndPoint)s.RemoteEndPoint!;
                 if (handler is null) { await stream.DisposeAsync().ConfigureAwait(false); return; }
                 await handler(stream, first, new IPEndPoint(Normalize(remoteEp.Address), remoteEp.Port)).ConfigureAwait(false);
+                return;
+            }
+            if (FileTransfer.IsFileFrame(first))
+            {
+                // Trasferimento di un file incollato su un altro PC: connessione a parte, niente timeout oltre l'handshake.
+                await using (stream)
+                    await FileTransfer.ServeAsync(stream, Me, FileProvider, ThrottleMs, _opt.HandshakeTimeoutMs, _cts.Token).ConfigureAwait(false);
                 return;
             }
             var hs = await Handshake.RunServerAsync(stream, Me, t.Token, first).ConfigureAwait(false);

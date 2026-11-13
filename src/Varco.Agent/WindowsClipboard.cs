@@ -10,11 +10,11 @@ namespace Varco.Agent;
 /// funzionano anche mentre il thread di input passa alla schermata di blocco.
 ///
 /// Si condividono solo formati che hanno senso su un altro PC: testo, HTML, RTF e immagini (DIB e PNG).
-/// I file copiati in Esplora risorse (CF_HDROP) non sono supportati.
+/// I file copiati in Esplora risorse (CF_HDROP) diventano un elenco di percorsi: i dati passano solo quando si incolla.
 /// </summary>
 internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
 {
-    private const uint CF_UNICODETEXT = 13, CF_DIB = 8;
+    private const uint CF_UNICODETEXT = 13, CF_DIB = 8, CF_HDROP = 15;
     private const uint WM_CLOSE = 0x0010, WM_DESTROY = 0x0002, WM_TIMER = 0x0113, WM_CLIPBOARDUPDATE = 0x031D;
     private const uint WM_SET_CONTENT = 0x8000 + 1;
     private const uint GMEM_MOVEABLE = 0x0002;
@@ -179,6 +179,10 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
                 formats.Add(new ClipFormat(name, data));
             }
 
+            // File copiati in Esplora risorse: solo i percorsi, l'host li trasforma in un'offerta (i dati viaggiano quando si incolla).
+            if (IsClipboardFormatAvailable(CF_HDROP) && ReadDropPaths() is { Count: > 0 } paths)
+                formats.Add(new ClipFormat(ClipboardSync.LocalFilesFormat, System.Text.Encoding.UTF8.GetBytes(string.Join('\0', paths))));
+
             Take(CF_UNICODETEXT, "CF_UNICODETEXT");
             foreach (var name in RegisteredFormats) Take(RegisterClipboardFormat(name), name);
             // CF_DIB è il formato immagine più compatibile: Windows lo ricava anche da CF_BITMAP e CF_DIBV5.
@@ -186,7 +190,7 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
 
             if (formats.Count == 0)
             {
-                Log.Debug("Appunti senza formati condivisibili (es. file copiati): restano su questo PC");
+                Log.Debug("Appunti senza formati condivisibili: restano su questo PC");
                 return null;
             }
             return new ClipContent(formats);
@@ -220,6 +224,22 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
         {
             GlobalUnlock(h);
         }
+    }
+
+    private static List<string> ReadDropPaths()
+    {
+        var list = new List<string>();
+        var h = GetClipboardData(CF_HDROP);
+        if (h == IntPtr.Zero) return list;
+        var count = DragQueryFile(h, 0xFFFFFFFF, null, 0);
+        for (uint i = 0; i < count; i++)
+        {
+            var len = DragQueryFile(h, i, null, 0);
+            if (len == 0) continue;
+            var sb = new System.Text.StringBuilder((int)len + 1);
+            if (DragQueryFile(h, i, sb, (uint)sb.Capacity) > 0) list.Add(sb.ToString());
+        }
+        return list;
     }
 
     /// <summary>GlobalSize arrotonda: si tiene il testo fino al terminatore (incluso), così la stessa copia dà sempre gli stessi byte.</summary>
@@ -364,4 +384,6 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
     private static extern bool GlobalUnlock(IntPtr h);
     [DllImport("kernel32.dll")]
     private static extern UIntPtr GlobalSize(IntPtr h);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint DragQueryFile(IntPtr hDrop, uint index, System.Text.StringBuilder? file, uint size);
 }

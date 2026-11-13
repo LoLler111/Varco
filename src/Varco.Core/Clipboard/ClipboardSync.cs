@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
+using Varco.Core.Files;
 using Varco.Core.Net;
 using Varco.Core.Protocol;
 
@@ -35,10 +36,16 @@ public sealed class ClipboardSync
     /// <summary>Oltre questa dimensione (non compressa) gli appunti restano solo sul PC dove si è copiato.</summary>
     public const int MaxRawBytes = 96 * 1024 * 1024;
 
+    /// <summary>Formato locale per i file copiati in Esplora risorse: percorsi completi in UTF-8 separati da '\0'.</summary>
+    public const string LocalFilesFormat = "CF_HDROP";
+    /// <summary>Formato in rete per i file: un <see cref="FileOffer"/> (nomi e dimensioni, i dati arrivano quando si incolla).</summary>
+    public const string FilesFormat = "Varco.Files";
+
     private const byte PayloadVersion = 1;
 
     private readonly IPeerNetwork _net;
     private readonly IClipboardPlatform _platform;
+    private readonly FileOffers? _files;
     private readonly Func<bool> _enabled;
     private readonly Func<bool> _canSend;
     private readonly object _gate = new();
@@ -51,18 +58,23 @@ public sealed class ClipboardSync
     /// <summary>Per i test: scatta dopo aver applicato appunti arrivati da un altro PC.</summary>
     internal event Action<Guid, ClipContent>? Applied;
 
+    /// <summary>Un altro PC ha copiato dei file: vanno messi negli appunti come "file virtuali" (lo fa l'icona, con l'utente).</summary>
+    public event Action<Guid, FileOffer>? FilesOffered;
+
     /// <param name="enabled">Impostazione "condividi gli appunti" di questo PC.</param>
     /// <param name="canSend">Falso mentre questo PC comanda un altro: le copie locali arrivano da programmi, non dall'utente.</param>
-    public ClipboardSync(IPeerNetwork net, IClipboardPlatform platform, Func<bool> enabled, Func<bool> canSend)
+    /// <param name="files">Offerte di file di questo PC; null = i file non si condividono.</param>
+    public ClipboardSync(IPeerNetwork net, IClipboardPlatform platform, Func<bool> enabled, Func<bool> canSend, FileOffers? files = null)
     {
         _net = net;
         _platform = platform;
+        _files = files;
         _enabled = enabled;
         _canSend = canSend;
         _platform.LocalChanged += c => _ = Task.Run(() => OnLocalChanged(c));
     }
 
-    private PeerCaps MyCaps => _enabled() ? PeerCaps.Clipboard : PeerCaps.None;
+    private PeerCaps MyCaps => !_enabled() ? PeerCaps.None : _files is null ? PeerCaps.Clipboard : PeerCaps.Clipboard | PeerCaps.Files;
 
     public void OnPeerConnected(Guid id) => _net.Send(id, new Capabilities(MyCaps));
 
@@ -116,30 +128,65 @@ public sealed class ClipboardSync
                 Log.Info($"Appunti troppo grandi da condividere ({content.TotalBytes / (1024 * 1024)} MB)");
                 return;
             }
+            content = WithFileOffer(content);
+            if (content.Formats.Count == 0) return;
 
             var raw = Serialize(content);
             var hash = SHA256.HashData(raw);
-            List<Guid> targets;
+            List<Guid> full, legacy;
             uint id;
             lock (_gate)
             {
                 if (_lastHash is not null && hash.AsSpan().SequenceEqual(_lastHash)) return;
                 _lastHash = hash;
-                targets = _caps.Where(kv => kv.Value.HasFlag(PeerCaps.Clipboard) && _net.IsConnected(kv.Key)).Select(kv => kv.Key).ToList();
+                var peers = _caps.Where(kv => kv.Value.HasFlag(PeerCaps.Clipboard) && _net.IsConnected(kv.Key)).ToList();
+                full = peers.Where(kv => kv.Value.HasFlag(PeerCaps.Files)).Select(kv => kv.Key).ToList();
+                legacy = peers.Where(kv => !kv.Value.HasFlag(PeerCaps.Files)).Select(kv => kv.Key).ToList();
                 id = ++_nextId;
             }
-            if (targets.Count == 0) return;
 
-            var wire = Compress(raw);
-            Log.Info($"Appunti condivisi ({Describe(content)}, {Kb(wire.Length)} sulla rete) con {targets.Count} PC");
-            foreach (var chunk in Chunks(id, wire))
-                foreach (var t in targets)
-                    _net.Send(t, chunk);
+            // I PC con la 0.5 non conoscono i file: ricevono solo il resto (se c'è), altrimenti svuoterebbero i propri appunti.
+            var hasFiles = content.Formats.Any(f => f.Name == FilesFormat);
+            if (hasFiles)
+            {
+                var rest = new ClipContent(content.Formats.Where(f => f.Name != FilesFormat).ToList());
+                // Stesso id per i due gruppi: sono PC diversi e ognuno ricompone per conto suo.
+                if (rest.Formats.Count > 0) SendTo(legacy, Serialize(rest), rest, id);
+                SendTo(full, raw, content, id);
+            }
+            else
+            {
+                SendTo([.. full, .. legacy], raw, content, id);
+            }
         }
         catch (Exception ex)
         {
             Log.Error("Invio degli appunti", ex);
         }
+    }
+
+    private void SendTo(List<Guid> targets, byte[] raw, ClipContent content, uint id)
+    {
+        if (targets.Count == 0) return;
+        var wire = Compress(raw);
+        Log.Info($"Appunti condivisi ({Describe(content)}, {Kb(wire.Length)} sulla rete) con {targets.Count} PC");
+        foreach (var chunk in Chunks(id, wire))
+            foreach (var t in targets)
+                _net.Send(t, chunk);
+    }
+
+    /// <summary>File copiati: i percorsi locali diventano un'offerta (solo nomi e dimensioni).</summary>
+    private ClipContent WithFileOffer(ClipContent content)
+    {
+        var local = content.Formats.FirstOrDefault(f => f.Name == LocalFilesFormat);
+        if (local is null) return content;
+        var rest = content.Formats.Where(f => f.Name != LocalFilesFormat).ToList();
+        if (_files is null) return new ClipContent(rest);
+        var paths = Encoding.UTF8.GetString(local.Data).Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        var offer = _files.Create(paths);
+        if (offer is null) return new ClipContent(rest);
+        rest.Add(new ClipFormat(FilesFormat, offer.Serialize()));
+        return new ClipContent(rest);
     }
 
     internal static IEnumerable<ClipChunk> Chunks(uint id, byte[] wire)
@@ -204,8 +251,15 @@ public sealed class ClipboardSync
                 if (_lastHash is not null && hash.AsSpan().SequenceEqual(_lastHash)) return;
                 _lastHash = hash;
             }
-            _platform.SetContent(content);
             Log.Info($"Appunti ricevuti ({Describe(content)})");
+            var files = content.Formats.FirstOrDefault(f => f.Name == FilesFormat);
+            var rest = files is null ? content : new ClipContent(content.Formats.Where(f => f != files).ToList());
+            if (rest.Formats.Count > 0) _platform.SetContent(rest);
+            if (files is not null && _files is not null)
+            {
+                if (FileOffer.Deserialize(files.Data) is { } offer) FilesOffered?.Invoke(from, offer);
+                else Log.Warn("Offerta di file non valida o di una versione più recente");
+            }
             Applied?.Invoke(from, content);
         }
         catch (Exception ex)
@@ -274,6 +328,8 @@ public sealed class ClipboardSync
     private static string Describe(ClipContent c)
     {
         var kinds = new List<string>();
+        if (c.Formats.FirstOrDefault(f => f.Name == FilesFormat) is { } ff && FileOffer.Deserialize(ff.Data) is { } offer)
+            kinds.Add($"{offer.FileCount} file da {Kb(offer.TotalBytes)}");
         if (c.Formats.Any(f => f.Name == "CF_UNICODETEXT")) kinds.Add("testo");
         if (c.Formats.Any(f => f.Name is "CF_DIB" or "CF_DIBV5" or "PNG")) kinds.Add("immagine");
         if (kinds.Count == 0) kinds.Add(string.Join("+", c.Formats.Select(f => f.Name)));

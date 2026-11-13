@@ -21,6 +21,7 @@ internal sealed class TrayContext : ApplicationContext
     private readonly Dictionary<Color, Icon> _icons = new();
     private readonly HashSet<Guid> _announced = new();
     private MainForm? _main;
+    private readonly VirtualFileClipboard _files;
     private PairRequestForm? _request;
     private StatusDto? _last;
     private bool _polling;
@@ -44,6 +45,7 @@ internal sealed class TrayContext : ApplicationContext
         _menu.Opening += (_, _) => BuildMenu();
         _timer.Tick += async (_, _) => await Poll();
         _timer.Start();
+        _files = new VirtualFileClipboard();
         _ = Poll();
     }
 
@@ -195,6 +197,7 @@ internal sealed class TrayContext : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _files.Dispose();
         _icon.Visible = false;
         _icon.Dispose();
         base.ExitThreadCore();

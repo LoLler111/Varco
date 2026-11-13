@@ -46,8 +46,9 @@ public sealed partial class VarcoHost : IAsyncDisposable
     /// <summary>Null se l'agent gira senza appunti (es. --no-input per i test di rete).</summary>
     public ClipboardSync? Clipboard { get; }
 
+    /// <param name="fileAccess">Con gli appunti attivi abilita anche i file copiati in Esplora risorse.</param>
     public VarcoHost(ConfigStore store, IInputPlatform platform, int? tcpPort = null, int? discoveryPort = null,
-        IClipboardPlatform? clipboard = null)
+        IClipboardPlatform? clipboard = null, Files.IFileAccess? fileAccess = null)
     {
         _store = store;
         _tcpPortOverride = tcpPort;
@@ -62,9 +63,14 @@ public sealed partial class VarcoHost : IAsyncDisposable
         };
         Coordinator = new InputCoordinator(_net, platform, Layout);
         if (clipboard is not null)
+        {
+            if (fileAccess is not null) FileOffers = new Files.FileOffers(fileAccess);
             Clipboard = new ClipboardSync(_net, clipboard,
                 enabled: () => _store.Current.ShareClipboard,
-                canSend: () => Coordinator.Mode != InputMode.Controlling);
+                canSend: () => Coordinator.Mode != InputMode.Controlling,
+                files: FileOffers);
+            Clipboard.FilesOffered += OnFilesOffered;
+        }
         // Cambi di risoluzione o monitor collegati/scollegati: la dimensione del desktop finisce nel layout condiviso.
         _desktopWatch = new Timer(_ =>
         {
@@ -141,6 +147,10 @@ public sealed partial class VarcoHost : IAsyncDisposable
             node.Announced += OnAnnounced;
             node.CallbackRequested += OnCallbackRequested;
             node.PairingRequested = OnPairingConnectionAsync;
+            if (FileOffers is { } offers)
+                node.FileProvider = (peer, offer, index, offset) => _store.Current.ShareClipboard
+                    ? offers.Open(offer, index, offset)
+                    : (null, 0, "condivisione degli appunti spenta");
             _node = node;
             _net.Node = node;
             node.Start();
@@ -201,6 +211,9 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     _store.Update(c => c.AutoUpdate = req.Enabled != false, immediate: true);
                     if (req.Enabled != false) Updater?.CheckSoon();
                     return new ControlResponse { Status = GetStatus() };
+
+                case "filesOffer":
+                    return new ControlResponse { FilesOffer = await WaitFilesOfferAsync(req.Seq).ConfigureAwait(false) };
 
                 case "setClipboard":
                     _store.Update(c => c.ShareClipboard = req.Enabled != false, immediate: true);

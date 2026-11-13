@@ -71,9 +71,10 @@ internal sealed class AdvancedForm : Form
         _clipboard.Checked = status?.ShareClipboard ?? true;
         _clipboard.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setClipboard", Enabled = _clipboard.Checked });
         clip.Body.Controls.Add(_clipboard);
-        clip.Body.Controls.Add(Ui.Label("Copi su un PC e incolli su un altro: testo, testo formattato e immagini. " +
-            "I file non vengono condivisi, e nemmeno ciò che i gestori di password segnano come privato. " +
-            "Funziona tra PC con Varco 0.5 o successivo.", Ui.Small, Ui.Muted, clip.InnerWidth, Ui.P(0, 8, 0, 0)));
+        clip.Body.Controls.Add(Ui.Label("Copi su un PC e incolli su un altro: testo, testo formattato, immagini e file. " +
+            "I file passano solo quando li incolli, con la barra di avanzamento di Windows. " +
+            "Non passa ciò che i gestori di password segnano come privato. " +
+            "Testo e immagini richiedono Varco 0.5 su tutti e due i PC, i file Varco 0.5.1.", Ui.Small, Ui.Muted, clip.InnerWidth, Ui.P(0, 8, 0, 0)));
         root.Controls.Add(clip);
 
         // problemi

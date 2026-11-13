@@ -10,6 +10,12 @@ public static class ControlProtocol
 {
     public const string PipeName = "Varco.Control";
 
+    /// <summary>
+    /// Pipe dei dati dei file incollati: l'icona manda una riga JSON (<see cref="FileReadRequest"/>), l'agent risponde con
+    /// la lunghezza (int64; -1 = errore, seguito da una riga di testo) e poi i byte del file.
+    /// </summary>
+    public const string FilesPipeName = "Varco.Files";
+
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 }
 
@@ -18,7 +24,7 @@ public sealed class ControlRequest
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
-    /// checkUpdate | setAutoUpdate (Enabled) | setClipboard (Enabled)
+    /// checkUpdate | setAutoUpdate (Enabled) | setClipboard (Enabled) | filesOffer (Seq, attesa lunga)
     /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
@@ -30,6 +36,8 @@ public sealed class ControlRequest
     /// <summary>setLayout: nuove posizioni dei PC nella disposizione 2D.</summary>
     public List<LayoutPositionDto>? Positions { get; set; }
     public bool? Enabled { get; set; }
+    /// <summary>filesOffer: ultimo numero di offerta già visto dall'icona (null = dimmi solo a che punto siamo).</summary>
+    public long? Seq { get; set; }
 }
 
 public sealed class ControlResponse
@@ -38,6 +46,7 @@ public sealed class ControlResponse
     public string? Error { get; set; }
     public string? Key { get; set; }
     public StatusDto? Status { get; set; }
+    public FilesOfferDto? FilesOffer { get; set; }
 }
 
 public sealed class StatusDto
@@ -63,6 +72,34 @@ public sealed class StatusDto
     public bool ShareClipboard { get; set; } = true;
     /// <summary>Null se gli aggiornamenti non sono attivi (agent avviato a mano per sviluppo).</summary>
     public UpdateStatusDto? Update { get; set; }
+}
+
+/// <summary>File copiati su un altro PC, da mettere negli appunti come file virtuali.</summary>
+public sealed class FilesOfferDto
+{
+    public long Seq { get; set; }
+    public Guid PeerId { get; set; }
+    public string PeerName { get; set; } = "";
+    public Guid OfferId { get; set; }
+    public List<FileEntryDto> Entries { get; set; } = [];
+}
+
+public sealed class FileEntryDto
+{
+    public string Path { get; set; } = "";
+    public long Size { get; set; }
+    public uint Attributes { get; set; }
+    public DateTime LastWriteUtc { get; set; }
+    public bool IsDirectory { get; set; }
+}
+
+/// <summary>Richiesta sulla pipe <see cref="ControlProtocol.FilesPipeName"/>.</summary>
+public sealed class FileReadRequest
+{
+    public Guid PeerId { get; set; }
+    public Guid OfferId { get; set; }
+    public int Index { get; set; }
+    public long Offset { get; set; }
 }
 
 public sealed class UpdateStatusDto

@@ -102,7 +102,7 @@ public sealed class PeerConnection : IAsyncDisposable
 
     private static bool IsInput(Message m) => m is MouseMove or MouseButtonMsg or MouseWheel or KeyMsg or Enter;
 
-    private bool InputActive => Environment.TickCount64 - Volatile.Read(ref _lastInput) < ActiveWindowMs;
+    internal bool InputActive => Environment.TickCount64 - Volatile.Read(ref _lastInput) < ActiveWindowMs;
 
     private void RecordRtt(double ms)
     {
