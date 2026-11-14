@@ -61,6 +61,15 @@ public sealed partial class VarcoHost
         lock (_filesGate) return _offerSeq > seq && _lastOffer is not null ? _lastOffer : new FilesOfferDto { Seq = _offerSeq };
     }
 
+    /// <summary>L'icona ha visto copiare dei file in Esplora risorse: si offrono agli altri PC come una copia normale.</summary>
+    private ControlResponse OfferLocalFiles(List<string>? paths)
+    {
+        if (Clipboard is null) return new ControlResponse { Ok = false, Error = "Appunti condivisi non disponibili" };
+        var valid = (paths ?? []).Where(p => !string.IsNullOrWhiteSpace(p) && Path.IsPathFullyQualified(p)).Take(FileOffers.MaxEntries).ToList();
+        if (valid.Count > 0) Clipboard.OfferLocalFiles(valid);
+        return new ControlResponse();
+    }
+
     /// <summary>Apre un file offerto da un altro PC (lo usa la pipe dei file per l'icona).</summary>
     public Task<FileTransfer.RemoteFile> OpenRemoteFileAsync(Guid peer, Guid offerId, int index, long offset, CancellationToken ct)
     {

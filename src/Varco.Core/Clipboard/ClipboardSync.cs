@@ -113,6 +113,18 @@ public sealed class ClipboardSync
 
     // ───────────────────────────── invio ─────────────────────────────
 
+    /// <summary>
+    /// File copiati su questo PC letti dall'icona, che gira con l'utente: l'agent (SYSTEM) a volte vede negli appunti
+    /// di Esplora risorse solo il segnaposto OLE, senza l'elenco. Se li ha letti anche l'agent, la seconda copia è
+    /// identica e viene scartata dal controllo sui duplicati.
+    /// </summary>
+    public void OfferLocalFiles(IReadOnlyList<string> paths)
+    {
+        if (paths.Count == 0) return;
+        var content = new ClipContent([new ClipFormat(LocalFilesFormat, Encoding.UTF8.GetBytes(string.Join('\0', paths)))]);
+        _ = Task.Run(() => OnLocalChanged(content));
+    }
+
     private void OnLocalChanged(ClipContent content)
     {
         try
@@ -199,7 +211,8 @@ public sealed class ClipboardSync
             Log.Info($"File copiati non condivisi: nessuno dei {paths.Length} elementi copiati si può leggere ({string.Join(", ", paths.Take(3))})");
             return new ClipContent(rest);
         }
-        Log.Info($"File copiati: {offer.FileCount} file da {Kb(offer.TotalBytes)} pronti da incollare sugli altri PC");
+        // Niente log qui: la stessa copia può arrivare due volte (agent e icona). Dopo il controllo dei doppioni
+        // c'è sempre una riga: "Appunti condivisi (N file da …)" oppure "File copiati non condivisi: …".
         rest.Add(new ClipFormat(FilesFormat, offer.Serialize()));
         return new ClipContent(rest);
     }

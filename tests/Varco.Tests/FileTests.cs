@@ -220,4 +220,32 @@ public sealed class FileTests : IAsyncLifetime
         Assert.Empty(clipB.Written);   // gli appunti di B li riempie l'icona, non l'agent
         Assert.Empty(clipOld.Written); // la 0.5 non riceve nulla (avrebbe svuotato i suoi appunti)
     }
+
+    [Fact]
+    public async Task Files_read_by_the_tray_become_one_offer_even_if_the_agent_reads_them_too()
+    {
+        var nodes = new Dictionary<Guid, ClipboardSync>();
+        Guid a = Guid.NewGuid(), b = Guid.NewGuid();
+        var clipA = new FakeClipboard();
+        var syncA = new ClipboardSync(new Net(nodes, a), clipA, () => true, () => true, new FileOffers(DirectFileAccess.Instance));
+        var syncB = new ClipboardSync(new Net(nodes, b), new FakeClipboard(), () => true, () => true, new FileOffers(DirectFileAccess.Instance));
+        nodes[a] = syncA; nodes[b] = syncB;
+        syncA.OnPeerConnected(b);
+        syncB.OnPeerConnected(a);
+
+        var offers = new List<FileOffer>();
+        syncB.FilesOffered += (_, o) => { lock (offers) offers.Add(o); };
+        var app = MakeFile("programma.zip", 3000);
+
+        syncA.OfferLocalFiles([app]); // l'icona (utente) ha visto la copia in Esplora risorse
+        await Task.Delay(300);
+        clipA.Copy(new ClipContent([new ClipFormat(ClipboardSync.LocalFilesFormat, Encoding.UTF8.GetBytes(app))])); // e anche l'agent
+        await Task.Delay(300);
+
+        lock (offers)
+        {
+            var offer = Assert.Single(offers);
+            Assert.Equal("programma.zip", offer.Entries.Single().Path);
+        }
+    }
 }

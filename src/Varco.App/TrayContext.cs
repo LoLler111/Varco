@@ -22,6 +22,7 @@ internal sealed class TrayContext : ApplicationContext
     private readonly HashSet<Guid> _announced = new();
     private MainForm? _main;
     private readonly VirtualFileClipboard _files;
+    private readonly CopiedFilesWatcher _copied;
     private PairRequestForm? _request;
     private StatusDto? _last;
     private bool _polling;
@@ -46,6 +47,7 @@ internal sealed class TrayContext : ApplicationContext
         _timer.Tick += async (_, _) => await Poll();
         _timer.Start();
         _files = new VirtualFileClipboard();
+        _copied = new CopiedFilesWatcher();
         _ = Poll();
     }
 
@@ -215,6 +217,7 @@ internal sealed class TrayContext : ApplicationContext
     {
         _timer.Stop();
         _files.Dispose();
+        _copied.Dispose();
         _icon.Visible = false;
         _icon.Dispose();
         base.ExitThreadCore();

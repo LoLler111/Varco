@@ -178,10 +178,14 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
                 return;
             }
             // Ancora niente: l'elenco si chiede direttamente all'oggetto OLE di chi ha copiato.
-            if (ReadOleFiles() is { Count: > 0 } paths)
+            if (ReadOleFiles() is { } paths)
             {
-                Log.Info($"Elenco dei file copiati letto dall'oggetto OLE degli appunti ({paths.Count} elementi)");
-                content = new ClipContent([new ClipFormat(ClipboardSync.LocalFilesFormat, System.Text.Encoding.UTF8.GetBytes(string.Join('\0', paths)))]);
+                if (paths.Count > 0)
+                {
+                    Log.Info($"Elenco dei file copiati letto dall'oggetto OLE degli appunti ({paths.Count} elementi)");
+                    content = new ClipContent([new ClipFormat(ClipboardSync.LocalFilesFormat, System.Text.Encoding.UTF8.GetBytes(string.Join('\0', paths)))]);
+                }
+                else Log.Info("L'oggetto OLE degli appunti ha risposto, ma con un elenco di file vuoto");
             }
         }
         else if (content is not null && _oleRetries > 0)
