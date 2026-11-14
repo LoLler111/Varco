@@ -31,6 +31,7 @@ internal sealed class MainForm : Form
     private readonly Label _version = Ui.Label("", Ui.Small, Ui.Muted);
     private readonly VButton _resume = new("Riattiva connessione", primary: true) { Visible = false };
     private readonly LinkLabel _pause;
+    private readonly LinkLabel _installNow;
 
     private string? _peersSig, _foundSig;
     private StatusDto? _last;
@@ -45,7 +46,8 @@ internal sealed class MainForm : Form
         var state = u.State switch
         {
             "Downloading" => $"scarico la versione {u.Latest}…",
-            "Waiting" => $"la {u.Latest} si installerà appena smetti di usare un altro PC",
+            // Nella finestra principale accanto c'è il link «Aggiorna subito»: basta dire che è pronta.
+            "Waiting" => brief ? $"pronta la {u.Latest}" : $"la {u.Latest} si installerà appena smetti di usare un altro PC",
             "Installing" => $"installo la versione {u.Latest}…",
             "Checking" => brief ? null : "controllo…",
             "Error" => brief ? null : $"ultimo controllo non riuscito ({u.Message})",
@@ -55,6 +57,21 @@ internal sealed class MainForm : Form
         if (!brief && u.LastCheckUtc is { } t && u.State is "UpToDate" or "Error")
             state += $" (controllato alle {t.ToLocalTime():HH:mm})";
         return state is null ? v : $"{v}: {state}";
+    }
+
+    /// <summary>L'aggiornamento è scaricato e aspetta solo che mouse e tastiera siano liberi: si può forzare.</summary>
+    internal static bool CanInstallNow(StatusDto? s) => s?.Update?.State == "Waiting";
+
+    /// <summary>Chiede conferma e manda «installUpdateNow»: questo PC e tutti quelli collegati si aggiornano subito.</summary>
+    internal static async Task InstallNowEverywhere(IWin32Window owner, StatusDto? s, Func<ControlRequest, Task<bool>> send)
+    {
+        var others = s?.Peers.Count(p => p.State == "Connected") ?? 0;
+        var where = others == 0 ? "su questo PC" : others == 1 ? "su questo PC e sull'altro PC collegato" : $"su questo PC e sui {others} PC collegati";
+        if (MessageBox.Show(owner,
+                $"Varco {s?.Update?.Latest} verrà installato subito {where}. Mouse, tastiera e appunti condivisi si fermano " +
+                "per qualche secondo, poi tutto si ricollega da solo. Continuare?",
+                "Varco", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        await send(new ControlRequest { Cmd = "installUpdateNow" });
     }
 
     public MainForm()
@@ -139,7 +156,9 @@ internal sealed class MainForm : Form
         root.Controls.Add(_foundCard);
 
         // piè di pagina
-        var footer = new LineRow(W, Ui.S(28), [Ui.Link("Avanzate…", () => { using var f = new AdvancedForm(_last); f.ShowDialog(this); })], _version)
+        _installNow = Ui.Link("Aggiorna subito", async () => await InstallNowEverywhere(this, _last, Send), Ui.P(14, 0, 0, 0));
+        _installNow.Visible = false;
+        var footer = new LineRow(W, Ui.S(28), [Ui.Link("Avanzate…", () => { using var f = new AdvancedForm(_last); f.ShowDialog(this); }), _installNow], _version)
         {
             Margin = Ui.P(0, 10, 0, 0),
         };
@@ -185,6 +204,11 @@ internal sealed class MainForm : Form
         }
 
         _version.Text = UpdateText(s, brief: true);
+        if (_installNow.Visible != CanInstallNow(s))
+        {
+            _installNow.Visible = CanInstallNow(s);
+            _installNow.Parent?.PerformLayout();
+        }
 
         var connected = s.Peers.Where(p => p.State == "Connected").ToList();
         switch (s.Paused ? "Paused" : s.Mode)

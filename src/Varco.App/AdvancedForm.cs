@@ -14,6 +14,8 @@ internal sealed class AdvancedForm : Form
     private readonly Toggle _autoUpdate = new("Aggiorna Varco automaticamente (consigliato)");
     private readonly Toggle _clipboard = new("Condividi gli appunti tra i PC");
     private readonly Label _updateText;
+    private readonly VButton _installNow = new("Aggiorna subito tutti i PC", primary: true);
+    private StatusDto? _status;
 
     public AdvancedForm(StatusDto? status)
     {
@@ -111,6 +113,15 @@ internal sealed class AdvancedForm : Form
         var updateRow = new LineRow(updates.InnerWidth, Ui.S(44), [check, _updateText], stretch: null) { Margin = Ui.P(0, 10, 0, 0) };
         _updateText.Margin = Ui.P(12, 0, 0, 0);
         updates.Body.Controls.Add(updateRow);
+        _installNow.Margin = Ui.P(0, 10, 0, 0);
+        _installNow.Visible = false;
+        _installNow.Click += async (_, _) => await MainForm.InstallNowEverywhere(this, _status, async r =>
+        {
+            if (await Send(r) is not { } resp) return false;
+            ShowUpdate(resp.Status);
+            return true;
+        });
+        updates.Body.Controls.Add(_installNow);
         root.Controls.Add(updates);
         ShowUpdate(status);
 
@@ -150,8 +161,10 @@ internal sealed class AdvancedForm : Form
     private void ShowUpdate(StatusDto? s)
     {
         if (IsDisposed) return;
+        _status = s;
         _updateText.Text = MainForm.UpdateText(s);
         _updateText.Parent?.PerformLayout();
+        _installNow.Visible = MainForm.CanInstallNow(s);
     }
 
     private async Task<ControlResponse?> Send(ControlRequest req)

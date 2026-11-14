@@ -10,6 +10,7 @@ public enum MsgType : byte
     Pong = 2,
     Layout = 4,
     Capabilities = 5,
+    InstallUpdate = 6,
     MouseMove = 10,
     MouseButton = 11,
     MouseWheel = 12,
@@ -74,6 +75,13 @@ public sealed record LayoutMsg(Layout Layout) : Message;
 public sealed record Capabilities(PeerCaps Caps) : Message;
 
 /// <summary>
+/// "Installa subito l'aggiornamento", mandato a tutti i PC collegati quando l'utente preme «Aggiorna subito tutti i PC».
+/// Chi lo riceve installa (scaricandola se serve) l'ultima release firmata, senza aspettare che mouse e tastiera siano
+/// liberi; se ha già la <paramref name="Version"/> o una più nuova non fa nulla. Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record InstallUpdate(string Version) : Message;
+
+/// <summary>
 /// Un pezzo degli appunti compressi (<paramref name="Total"/> byte in tutto), in ordine di <paramref name="Offset"/>.
 /// Viaggia in coda a bassa priorità: mouse e tastiera passano davanti.
 /// </summary>
@@ -120,6 +128,7 @@ public static class MessageCodec
                 w.Write(JsonSerializer.Serialize(l.Layout, Json));
                 break;
             case Capabilities c: w.Write((byte)MsgType.Capabilities); w.Write((uint)c.Caps); break;
+            case InstallUpdate u: w.Write((byte)MsgType.InstallUpdate); w.Write(u.Version); break;
             case ClipChunk c:
                 w.Write((byte)MsgType.ClipChunk); w.Write(c.ClipId); w.Write(c.Total); w.Write(c.Offset);
                 w.Write(c.Data.Length); w.Write(c.Data);
@@ -150,6 +159,7 @@ public static class MessageCodec
             MsgType.Pong => new Pong(r.ReadInt64()),
             MsgType.Layout => new LayoutMsg(JsonSerializer.Deserialize<Layout>(r.ReadString(), Json) ?? new Layout()),
             MsgType.Capabilities => new Capabilities((PeerCaps)r.ReadUInt32()),
+            MsgType.InstallUpdate => new InstallUpdate(r.ReadString()),
             MsgType.ClipChunk => ReadClipChunk(r),
             MsgType.MouseMove => new MouseMove(r.ReadInt32(), r.ReadInt32()),
             MsgType.MouseButton => new MouseButtonMsg((MouseButton)r.ReadByte(), r.ReadBoolean()),

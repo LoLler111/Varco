@@ -197,6 +197,61 @@ public class UpdateTests : IDisposable
     }
 
     [Fact]
+    public async Task Forced_install_does_not_wait_for_idle_input()
+    {
+        var (gh, launched, make) = Setup();
+        using var u = make(false); // un PC è sempre in uso
+
+        Assert.Null(await u.CheckAndInstallAsync());
+        Assert.Equal("Waiting", u.Status.State);
+
+        // «Aggiorna subito tutti i PC»: usa l'exe già scaricato senza aspettare.
+        Assert.Equal(new Version(0, 3, 0), await u.CheckAndInstallAsync(force: true));
+        Assert.Single(launched);
+        Assert.Equal(1, gh.ExeDownloads);
+    }
+
+    [Fact]
+    public async Task Forced_install_downloads_first_if_needed()
+    {
+        var (gh, launched, make) = Setup();
+        using var u = make(false);
+        Assert.Equal(new Version(0, 3, 0), await u.CheckAndInstallAsync(force: true));
+        Assert.Single(launched);
+    }
+
+    [Fact]
+    public async Task InstallNow_wakes_the_background_loop_and_installs()
+    {
+        var (gh, launched, _) = Setup();
+        var installed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var u = new Updater(new UpdaterOptions
+        {
+            FeedUrl = "https://fake/repos/x/releases/latest",
+            CurrentVersion = new Version(0, 2, 0),
+            DownloadDirectory = Path.Combine(_dir, "updates"),
+            PublicKey = _pub,
+            Handler = gh,
+            ProtectDirectory = false,
+            FirstCheckDelay = TimeSpan.FromHours(1),
+            CanInstallNow = () => false,
+            Enabled = () => false, // anche con gli aggiornamenti automatici spenti
+            Launch = exe => installed.TrySetResult(exe),
+        });
+        u.Start();
+        u.InstallNow();
+        var exe = await installed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("nuovo Varco", File.ReadAllText(exe));
+    }
+
+    [Fact]
+    public void InstallUpdate_message_round_trips()
+    {
+        var m = new Varco.Core.Protocol.InstallUpdate("0.5.6");
+        Assert.Equal(m, Varco.Core.Protocol.MessageCodec.Decode(Varco.Core.Protocol.MessageCodec.Encode(m)));
+    }
+
+    [Fact]
     public async Task Tampered_exe_or_foreign_signature_is_never_launched()
     {
         var (gh, launched, make) = Setup();

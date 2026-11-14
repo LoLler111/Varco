@@ -24,8 +24,8 @@ public sealed class ControlRequest
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
-    /// checkUpdate | setAutoUpdate (Enabled) | setClipboard (Enabled) | setPaused (Enabled = true disattiva la connessione) |
-    /// filesOffer (Seq, attesa lunga)
+    /// checkUpdate | installUpdateNow (anche sugli altri PC collegati) | setAutoUpdate (Enabled) | setClipboard (Enabled) | setPaused (Enabled = true disattiva la connessione) |
+    /// filesOffer (Seq, attesa lunga) | localFiles (Paths: file copiati su questo PC, letti dall'icona)
     /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
@@ -39,6 +39,8 @@ public sealed class ControlRequest
     public bool? Enabled { get; set; }
     /// <summary>filesOffer: ultimo numero di offerta già visto dall'icona (null = dimmi solo a che punto siamo).</summary>
     public long? Seq { get; set; }
+    /// <summary>localFiles: percorsi dei file e delle cartelle appena copiati in Esplora risorse.</summary>
+    public List<string>? Paths { get; set; }
 }
 
 public sealed class ControlResponse

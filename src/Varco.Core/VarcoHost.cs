@@ -145,6 +145,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             };
             node.MessageReceived += (id, m) =>
             {
+                if (m is InstallUpdate iu) { OnInstallUpdateRequested(id, iu.Version); return; }
                 if (Clipboard?.OnMessage(id, m) == true) return;
                 Coordinator.OnMessage(id, m, ConnectedPeers);
             };
@@ -193,6 +194,41 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
     public void OnSuspend() => Coordinator.OnPeerDisconnected(Coordinator.ActivePeer ?? Guid.Empty);
 
+    // ───────────────────────────── aggiornamento immediato ─────────────────────────────
+
+    /// <summary>
+    /// «Aggiorna subito tutti i PC»: avvisa i PC collegati e poco dopo installa anche qui. Prima gli altri, perché
+    /// l'installazione riavvia questo agent e chiude le connessioni.
+    /// </summary>
+    private ControlResponse InstallUpdateEverywhere()
+    {
+        var updater = Updater!;
+        var version = updater.Status.Latest ?? "";
+        var peers = ConnectedPeers().Select(p => p.Item2).ToList();
+        Log.Info($"Aggiornamento immediato{(version.Length > 0 ? $" alla {version}" : "")} richiesto dall'utente; " +
+            (peers.Count == 0 ? "nessun altro PC collegato" : $"avviso {string.Join(", ", peers)}"));
+        _net.Broadcast(new InstallUpdate(version));
+        _ = Task.Delay(peers.Count == 0 ? 0 : 3000).ContinueWith(_ => updater.InstallNow(), TaskScheduler.Default);
+        return new ControlResponse { Status = GetStatus() };
+    }
+
+    private void OnInstallUpdateRequested(Guid from, string version)
+    {
+        var name = ConnectedPeers().FirstOrDefault(p => p.Item1 == from).Item2 ?? from.ToString()[..8];
+        if (Updater is null)
+        {
+            Log.Info($"{name} chiede di aggiornare subito, ma qui gli aggiornamenti non sono attivi (Varco non installato)");
+            return;
+        }
+        if (Update.UpdateSignature.TryParseVersion(version, out var v) && v <= CurrentVersion)
+        {
+            Log.Info($"{name} chiede di aggiornare subito alla {version}: questo PC ha già la {CurrentVersion.ToString(3)}");
+            return;
+        }
+        Log.Info($"{name} chiede di aggiornare subito{(version.Length > 0 ? $" alla {version}" : "")}");
+        Updater.InstallNow();
+    }
+
     // ───────────────────────────── comandi dalla tray ─────────────────────────────
 
     public async Task<ControlResponse> HandleAsync(ControlRequest req)
@@ -212,6 +248,10 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     Updater.CheckSoon();
                     return new ControlResponse { Status = GetStatus() };
 
+                case "installUpdateNow":
+                    if (Updater is null) return Fail("Gli aggiornamenti funzionano solo con Varco installato.");
+                    return InstallUpdateEverywhere();
+
                 case "setAutoUpdate":
                     _store.Update(c => c.AutoUpdate = req.Enabled != false, immediate: true);
                     if (req.Enabled != false) Updater?.CheckSoon();
@@ -219,6 +259,9 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
                 case "filesOffer":
                     return new ControlResponse { FilesOffer = await WaitFilesOfferAsync(req.Seq).ConfigureAwait(false) };
+
+                case "localFiles":
+                    return OfferLocalFiles(req.Paths);
 
                 case "setClipboard":
                     _store.Update(c => c.ShareClipboard = req.Enabled != false, immediate: true);

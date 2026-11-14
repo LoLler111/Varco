@@ -46,6 +46,7 @@ public sealed class Updater : IDisposable
     private TaskCompletionSource _wake = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Task? _loop;
     private string? _ready; // exe scaricato e verificato in attesa del momento giusto
+    private int _force; // 1 = al prossimo giro installa subito, anche se qualcuno sta usando mouse e tastiera
 
     public Updater(UpdaterOptions options)
     {
@@ -90,6 +91,16 @@ public sealed class Updater : IDisposable
     /// <summary>Controllo immediato (pulsante "Controlla aggiornamenti").</summary>
     public void CheckSoon() => _wake.TrySetResult();
 
+    /// <summary>
+    /// Installa subito senza aspettare che mouse e tastiera siano liberi (pulsante «Aggiorna subito tutti i PC», qui o su
+    /// un altro PC del gruppo). Se l'aggiornamento non è ancora stato scaricato lo controlla e lo scarica prima.
+    /// </summary>
+    public void InstallNow()
+    {
+        Interlocked.Exchange(ref _force, 1);
+        _wake.TrySetResult();
+    }
+
     private async Task LoopAsync()
     {
         var ct = _cts.Token;
@@ -100,7 +111,9 @@ public sealed class Updater : IDisposable
             if (ct.IsCancellationRequested) break;
             try
             {
-                if (manual || _o.Enabled()) await CheckAndInstallAsync(ct).ConfigureAwait(false);
+                // Letto dopo l'attesa: una richiesta arrivata a metà di un giro vale per il giro successivo (che parte subito).
+                var force = Interlocked.Exchange(ref _force, 0) == 1;
+                if (force || manual || _o.Enabled()) await CheckAndInstallAsync(ct, force).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (Exception ex)
@@ -131,7 +144,8 @@ public sealed class Updater : IDisposable
     }
 
     /// <summary>Un giro completo: controlla, scarica, verifica, installa. Ritorna la versione installata (o null).</summary>
-    public async Task<Version?> CheckAndInstallAsync(CancellationToken ct = default)
+    /// <param name="force">Installa anche se un PC sta usando mouse e tastiera.</param>
+    public async Task<Version?> CheckAndInstallAsync(CancellationToken ct = default, bool force = false)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -151,7 +165,8 @@ public sealed class Updater : IDisposable
                 _ready = await DownloadAsync(release, ct).ConfigureAwait(false);
             }
 
-            if (!_o.CanInstallNow())
+            if (force) Log.Info("Installazione immediata richiesta dall'utente");
+            else if (!_o.CanInstallNow())
             {
                 SetStatus("Waiting", message: "Installo appena nessun PC sta usando mouse e tastiera.");
                 return null;
