@@ -128,6 +128,8 @@ internal static class Native
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    [DllImport("user32.dll")]
+    public static extern short GetKeyState(int vk);
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll", SetLastError = true)]

@@ -118,6 +118,48 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             Log.Debug($"SendInput tastiera fallito: {Marshal.GetLastWin32Error()}");
     }
 
+    /// <summary>Tasti di blocco: VK, scancode e se va iniettato come "esteso" (Bloc Num sì, come nell'esempio di Microsoft).</summary>
+    private static readonly (LockKeys Key, ushort Vk, ushort Scan, bool Extended)[] LockKeyTable =
+    [
+        (LockKeys.Caps, KeyCodes.VK_CAPITAL, 0x3A, false),
+        (LockKeys.Num, KeyCodes.VK_NUMLOCK, 0x45, true),
+        (LockKeys.Scroll, KeyCodes.VK_SCROLL, 0x46, false),
+    ];
+
+    /// <summary>
+    /// Lo stato di attivazione (bit 0 di GetKeyState) è condiviso da tutta la sessione: è giusto anche letto da un thread
+    /// che non ha il focus, come quello di iniezione (verificato con un processo in background).
+    /// </summary>
+    public LockKeys? GetLockKeys()
+    {
+        var state = LockKeys.None;
+        foreach (var (key, vk, _, _) in LockKeyTable)
+            if ((GetKeyState(vk) & 1) != 0) state |= key;
+        return state;
+    }
+
+    public void SetLockKeys(LockKeys wanted)
+    {
+        var now = GetLockKeys() ?? LockKeys.None;
+        var inputs = new List<INPUT>();
+        foreach (var (key, vk, scan, extended) in LockKeyTable)
+        {
+            if (now.HasFlag(key) == wanted.HasFlag(key)) continue;
+            // Per VK (non per scancode): così Windows cambia di sicuro lo stato del tasto di blocco.
+            var f = extended ? KEYEVENTF_EXTENDEDKEY : 0u;
+            foreach (var up in new[] { 0u, KEYEVENTF_KEYUP })
+                inputs.Add(new INPUT
+                {
+                    type = INPUT_KEYBOARD,
+                    U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, wScan = scan, dwFlags = f | up, dwExtraInfo = Marker } },
+                });
+        }
+        if (inputs.Count == 0) return;
+        Log.Info($"Tasti di blocco: {now} → {wanted}");
+        if (SendInput((uint)inputs.Count, [.. inputs], Marshal.SizeOf<INPUT>()) == 0)
+            Log.Debug($"SendInput tasti di blocco fallito: {Marshal.GetLastWin32Error()}");
+    }
+
     private static void SendMouse(int dx, int dy, uint data, uint flags)
     {
         var input = new INPUT

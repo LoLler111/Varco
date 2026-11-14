@@ -20,6 +20,10 @@ public interface IInputPlatform
     void InjectButton(MouseButton button, bool down);
     void InjectWheel(int delta, bool horizontal);
     void InjectKey(ushort vk, ushort scan, KeyFlags flags);
+    /// <summary>Stato attuale di Bloc Maiusc/Num/Scorr; null se la piattaforma non lo conosce.</summary>
+    LockKeys? GetLockKeys() => null;
+    /// <summary>Porta Bloc Maiusc/Num/Scorr allo stato indicato, premendo solo i tasti che sono diversi.</summary>
+    void SetLockKeys(LockKeys state) { }
 }
 
 public enum InputMode { Local, Controlling, Controlled }
@@ -236,6 +240,10 @@ public sealed class InputCoordinator
                     }
                     FlushPending();
                     _net.Send(_peer, new KeyMsg(vk, scan, flags));
+                    // Bloc Maiusc/Num/Scorr cambiano su tutti e due i PC: il tasto passa anche al PC locale, così la spia
+                    // della tastiera resta giusta e al ritorno gli stati coincidono. Non va in _remoteDownKeys: il PC
+                    // locale lo vede premere e deve vederlo anche rilasciare, pure se nel frattempo il controllo è tornato qui.
+                    if (KeyCodes.LockKeyOf(vk) is not null) return false;
                     if (up) _remoteDownKeys.Remove(vk); else _remoteDownKeys.Add(vk);
                     return true;
 
@@ -303,6 +311,9 @@ public sealed class InputCoordinator
                 case KeyMsg k when IsControlledBy(from):
                     if (k.Flags.HasFlag(KeyFlags.Up)) _injectedKeys.Remove(k.Vk); else _injectedKeys[k.Vk] = k;
                     PostInput(() => _platform.InjectKey(k.Vk, k.Scan, k.Flags));
+                    break;
+                case LockKeysMsg l when IsControlledBy(from):
+                    PostInput(() => _platform.SetLockKeys(l.State));
                     break;
             }
         }
@@ -393,6 +404,22 @@ public sealed class InputCoordinator
         _remoteDownKeys.Clear();
         SetMode(InputMode.Controlling, target);
         _net.Send(target, new Enter(ScreenGeometry.Opposite(edge), ratio));
+        SendLockKeys(target);
+    }
+
+    /// <summary>
+    /// Manda al target lo stato dei tasti di blocco di questo PC, che ha la tastiera fisica e quindi le spie giuste.
+    /// Letto sul thread di input (agganciato al desktop attivo, anche sulla schermata di blocco), poi inviato solo se
+    /// nel frattempo il controllo non è passato altrove.
+    /// </summary>
+    private void SendLockKeys(Guid target)
+    {
+        _platform.Post(() =>
+        {
+            if (_platform.GetLockKeys() is not { } state) return;
+            lock (_gate)
+                if (_mode == InputMode.Controlling && _peer == target) _net.Send(target, new LockKeysMsg(state));
+        });
     }
 
     private void ReturnLocal(int x, int y)
@@ -440,6 +467,7 @@ public sealed class InputCoordinator
             _net.Send(from, new Leave());
             SetMode(InputMode.Controlling, hop.Id);
             _net.Send(hop.Id, new Enter(entry, hop.Ratio));
+            SendLockKeys(hop.Id);
         }
     }
 

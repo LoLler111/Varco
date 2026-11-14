@@ -18,6 +18,7 @@ public enum MsgType : byte
     EdgeHit = 21,
     Leave = 22,
     TakeOver = 23,
+    LockKeys = 24,
     ClipChunk = 30,
 }
 
@@ -31,6 +32,16 @@ public enum KeyFlags : byte { None = 0, Up = 1, Extended = 2 }
 public static class KeyCodes
 {
     public const ushort VK_RSHIFT = 0xA1;
+    public const ushort VK_CAPITAL = 0x14, VK_NUMLOCK = 0x90, VK_SCROLL = 0x91;
+
+    /// <summary>Il tasto di blocco corrispondente al VK, o null se non è un tasto di blocco.</summary>
+    public static LockKeys? LockKeyOf(ushort vk) => vk switch
+    {
+        VK_CAPITAL => LockKeys.Caps,
+        VK_NUMLOCK => LockKeys.Num,
+        VK_SCROLL => LockKeys.Scroll,
+        _ => null,
+    };
 
     /// <summary>
     /// Corregge i flag di un tasto prima di iniettarlo per scancode. L'hook di Windows segnala il Maiusc destro vero
@@ -41,6 +52,10 @@ public static class KeyCodes
     public static KeyFlags ForInjection(ushort vk, ushort scan, KeyFlags flags) =>
         vk == VK_RSHIFT && scan == 0x36 ? flags & ~KeyFlags.Extended : flags;
 }
+
+/// <summary>Stato dei tasti di blocco (le spie della tastiera).</summary>
+[Flags]
+public enum LockKeys : byte { None = 0, Caps = 1, Num = 2, Scroll = 4 }
 
 /// <summary>Funzioni che un PC sa gestire, annunciate appena connesso (le versioni senza questo messaggio non ne hanno).</summary>
 [Flags]
@@ -82,6 +97,11 @@ public sealed record EdgeHit(Edge Edge, float Ratio) : Message;
 public sealed record Leave() : Message;
 /// <summary>Target → controller: qualcuno ha usato mouse/tastiera fisici del target, riprendo il controllo.</summary>
 public sealed record TakeOver() : Message;
+/// <summary>
+/// Controller → target, subito dopo <see cref="Enter"/>: lo stato di Bloc Maiusc/Num/Scorr del PC con la tastiera fisica,
+/// che il target copia. Così le spie della tastiera valgono anche per il PC comandato. Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record LockKeysMsg(LockKeys State) : Message;
 
 public static class MessageCodec
 {
@@ -112,6 +132,7 @@ public static class MessageCodec
             case EdgeHit e: w.Write((byte)MsgType.EdgeHit); w.Write((byte)e.Edge); w.Write(e.Ratio); break;
             case Leave: w.Write((byte)MsgType.Leave); break;
             case TakeOver: w.Write((byte)MsgType.TakeOver); break;
+            case LockKeysMsg l: w.Write((byte)MsgType.LockKeys); w.Write((byte)l.State); break;
             default: throw new ArgumentException($"Messaggio non supportato: {m.GetType().Name}");
         }
         w.Flush();
@@ -138,6 +159,7 @@ public static class MessageCodec
             MsgType.EdgeHit => new EdgeHit((Edge)r.ReadByte(), r.ReadSingle()),
             MsgType.Leave => new Leave(),
             MsgType.TakeOver => new TakeOver(),
+            MsgType.LockKeys => new LockKeysMsg((LockKeys)r.ReadByte()),
             _ => null,
         };
     }

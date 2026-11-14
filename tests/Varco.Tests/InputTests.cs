@@ -235,6 +235,9 @@ public class CoordinatorTests
     {
         public readonly List<string> Log = [];
         public (int X, int Y) Cursor = (100, 100);
+        public LockKeys Locks = LockKeys.Num;
+        public LockKeys? GetLockKeys() => Locks;
+        public void SetLockKeys(LockKeys state) { Locks = state; Log.Add($"locks {state}"); }
         public void Post(Action action) => action();
         public IReadOnlyList<Rect> GetMonitors() => [new Rect(0, 0, 1920, 1080)];
         public (int X, int Y) GetCursorPos() => Cursor;
@@ -361,6 +364,72 @@ public class CoordinatorTests
         public void InjectButton(MouseButton b, bool down) => inner.InjectButton(b, down);
         public void InjectWheel(int d, bool h) => inner.InjectWheel(d, h);
         public void InjectKey(ushort vk, ushort scan, KeyFlags f) => inner.InjectKey(vk, scan, f);
+        public LockKeys? GetLockKeys() => inner.GetLockKeys();
+        public void SetLockKeys(LockKeys state) => inner.SetLockKeys(state);
+    }
+
+    [Fact]
+    public void Lock_keys_message_survives_the_codec()
+    {
+        var m = new LockKeysMsg(LockKeys.Caps | LockKeys.Scroll);
+        Assert.Equal(m, MessageCodec.Decode(MessageCodec.Encode(m)));
+    }
+
+    [Fact]
+    public void Crossing_sends_the_local_lock_keys_right_after_enter()
+    {
+        var (c, net, p, other) = Setup();
+        p.Locks = LockKeys.Caps | LockKeys.Num;
+        c.OnLocalMouseMove(1919, 540);
+        var toOther = net.Sent.Where(s => s.To == other).Select(s => s.Msg).ToList();
+        Assert.IsType<Enter>(toOther[^2]);
+        Assert.Equal(new LockKeysMsg(LockKeys.Caps | LockKeys.Num), toOther[^1]);
+    }
+
+    [Fact]
+    public void Lock_key_while_controlling_toggles_both_pcs()
+    {
+        var (c, net, _, other) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        Assert.False(c.OnLocalKey(KeyCodes.VK_CAPITAL, 0x3A, KeyFlags.None)); // passa anche al PC locale…
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is KeyMsg { Vk: KeyCodes.VK_CAPITAL, Flags: KeyFlags.None }); // …e va al target
+
+        // Il controllo torna qui prima del rilascio: il PC locale, che l'ha visto premere, deve vederlo rilasciare.
+        c.OnMessage(other, new EdgeHit(Edge.Left, 0.5f), () => []);
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.False(c.OnLocalKey(KeyCodes.VK_CAPITAL, 0x3A, KeyFlags.Up));
+    }
+
+    [Fact]
+    public void Target_copies_lock_keys_only_from_its_controller()
+    {
+        var (c, _, p, other) = Setup();
+        c.OnMessage(other, new LockKeysMsg(LockKeys.Caps), () => []); // non controllato: ignorato
+        Assert.Equal(LockKeys.Num, p.Locks);
+
+        c.OnMessage(other, new Enter(Edge.Right, 0.5f), () => []);
+        c.OnMessage(Guid.NewGuid(), new LockKeysMsg(LockKeys.Scroll), () => []); // da un altro PC: ignorato
+        c.OnMessage(other, new LockKeysMsg(LockKeys.Caps), () => []);
+        Assert.Equal(LockKeys.Caps, p.Locks);
+    }
+
+    [Fact]
+    public void Lock_keys_follow_the_cursor_to_the_next_pc()
+    {
+        var self = Guid.NewGuid();
+        var mid = Guid.NewGuid();
+        var far = Guid.NewGuid();
+        var net = new FakeNet(self);
+        net.Connected.UnionWith([mid, far]);
+        var layout = new LayoutManager(self, "me", new Layout());
+        layout.SetRow([(self, "me"), (mid, "mid"), (far, "far")]);
+        var p = new FakePlatform { Locks = LockKeys.Caps };
+        var c = new InputCoordinator(net, p, layout);
+
+        c.OnLocalMouseMove(1919, 540);
+        c.OnMessage(mid, new EdgeHit(Edge.Right, 0.5f), () => []);
+        Assert.Equal(far, c.ActivePeer);
+        Assert.Contains(net.Sent, s => s.To == far && s.Msg is LockKeysMsg { State: LockKeys.Caps });
     }
 
     [Fact]
