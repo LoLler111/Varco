@@ -139,7 +139,11 @@ public sealed class FileOffers(IFileAccess access)
         {
             var path = raw.TrimEnd('\\');
             FileSystemInfo info = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
-            if (!info.Exists) continue;
+            if (!info.Exists)
+            {
+                Log.Info($"Elemento copiato non trovato o non leggibile con i permessi dell'utente: {path}");
+                continue;
+            }
             var name = UniqueName(names, info.Name);
             if (!Add(list, info, name)) return null;
         }

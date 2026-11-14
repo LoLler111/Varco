@@ -156,15 +156,22 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
             foreach (var marker in PrivateMarkers)
                 if (IsClipboardFormatAvailable(RegisterClipboardFormat(marker)))
                 {
-                    Log.Debug($"Appunti marcati come privati ({marker}): non li condivido");
+                    LogSkipped($"Appunti marcati come privati ({marker}): non li condivido");
                     return null;
                 }
             // "Non sincronizzare con altri dispositivi" (lo usano anche Windows e i gestori di password).
             var cloud = RegisterClipboardFormat("CanUploadToCloudClipboard");
             if (IsClipboardFormatAvailable(cloud) && ReadBytes(cloud, 16) is { Length: >= 4 } flag && BitConverter.ToInt32(flag) == 0)
             {
-                Log.Debug("Appunti esclusi dalla sincronizzazione dal programma che li ha copiati");
+                LogSkipped("Appunti esclusi dalla sincronizzazione dal programma che li ha copiati");
                 return null;
+            }
+
+            // Scarti normali (password, testo privato) restano nel log dettagliato; con dei file di mezzo si vede sempre.
+            static void LogSkipped(string why)
+            {
+                if (IsClipboardFormatAvailable(CF_HDROP)) Log.Info("File copiati non condivisi: " + why);
+                else Log.Debug(why);
             }
 
             var formats = new List<ClipFormat>();
@@ -180,8 +187,13 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
             }
 
             // File copiati in Esplora risorse: solo i percorsi, l'host li trasforma in un'offerta (i dati viaggiano quando si incolla).
-            if (IsClipboardFormatAvailable(CF_HDROP) && ReadDropPaths() is { Count: > 0 } paths)
-                formats.Add(new ClipFormat(ClipboardSync.LocalFilesFormat, System.Text.Encoding.UTF8.GetBytes(string.Join('\0', paths))));
+            if (IsClipboardFormatAvailable(CF_HDROP))
+            {
+                if (ReadDropPaths() is { Count: > 0 } paths)
+                    formats.Add(new ClipFormat(ClipboardSync.LocalFilesFormat, System.Text.Encoding.UTF8.GetBytes(string.Join('\0', paths))));
+                else
+                    Log.Info($"File copiati non condivisi: l'elenco dei file negli appunti non si legge ({Marshal.GetLastWin32Error()})");
+            }
 
             Take(CF_UNICODETEXT, "CF_UNICODETEXT");
             foreach (var name in RegisteredFormats) Take(RegisterClipboardFormat(name), name);

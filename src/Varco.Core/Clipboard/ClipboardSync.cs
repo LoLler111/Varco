@@ -118,9 +118,11 @@ public sealed class ClipboardSync
         try
         {
             if (!_enabled() || content.Formats.Count == 0) return;
+            var copiedFiles = content.Formats.Any(f => f.Name == LocalFilesFormat);
             if (!_canSend())
             {
-                Log.Debug("Appunti cambiati mentre questo PC ne comanda un altro: non li condivido");
+                if (copiedFiles) Log.Info("File copiati non condivisi: questo PC ne sta comandando un altro");
+                else Log.Debug("Appunti cambiati mentre questo PC ne comanda un altro: non li condivido");
                 return;
             }
             if (content.TotalBytes > MaxRawBytes)
@@ -149,6 +151,10 @@ public sealed class ClipboardSync
             var hasFiles = content.Formats.Any(f => f.Name == FilesFormat);
             if (hasFiles)
             {
+                if (full.Count == 0)
+                    Log.Info(legacy.Count > 0
+                        ? $"File copiati non condivisi: {legacy.Count} PC collegati hanno una versione di Varco che non riceve file"
+                        : "File copiati non condivisi: nessun PC collegato con gli appunti condivisi attivi");
                 var rest = new ClipContent(content.Formats.Where(f => f.Name != FilesFormat).ToList());
                 // Stesso id per i due gruppi: sono PC diversi e ognuno ricompone per conto suo.
                 if (rest.Formats.Count > 0) SendTo(legacy, Serialize(rest), rest, id);
@@ -181,10 +187,19 @@ public sealed class ClipboardSync
         var local = content.Formats.FirstOrDefault(f => f.Name == LocalFilesFormat);
         if (local is null) return content;
         var rest = content.Formats.Where(f => f.Name != LocalFilesFormat).ToList();
-        if (_files is null) return new ClipContent(rest);
+        if (_files is null)
+        {
+            Log.Info("File copiati non condivisi: su questo PC la condivisione dei file non è disponibile");
+            return new ClipContent(rest);
+        }
         var paths = Encoding.UTF8.GetString(local.Data).Split('\0', StringSplitOptions.RemoveEmptyEntries);
         var offer = _files.Create(paths);
-        if (offer is null) return new ClipContent(rest);
+        if (offer is null)
+        {
+            Log.Info($"File copiati non condivisi: nessuno dei {paths.Length} elementi copiati si può leggere ({string.Join(", ", paths.Take(3))})");
+            return new ClipContent(rest);
+        }
+        Log.Info($"File copiati: {offer.FileCount} file da {Kb(offer.TotalBytes)} pronti da incollare sugli altri PC");
         rest.Add(new ClipFormat(FilesFormat, offer.Serialize()));
         return new ClipContent(rest);
     }
