@@ -202,7 +202,8 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
 
             if (formats.Count == 0)
             {
-                Log.Debug("Appunti senza formati condivisibili: restano su questo PC");
+                // Raro (testo, immagini e file coprono quasi tutto): l'elenco dei formati dice cosa c'era davvero.
+                Log.Info($"Appunti senza formati condivisibili, restano su questo PC (formati: {DescribeFormats()})");
                 return null;
             }
             return new ClipContent(formats);
@@ -211,6 +212,23 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
         {
             CloseClipboard();
         }
+    }
+
+    /// <summary>Nomi dei formati presenti negli appunti (aperti), per il log.</summary>
+    private static string DescribeFormats()
+    {
+        var names = new List<string>();
+        uint f = 0;
+        while ((f = EnumClipboardFormats(f)) != 0 && names.Count < 20)
+        {
+            var sb = new System.Text.StringBuilder(128);
+            names.Add(GetClipboardFormatName(f, sb, sb.Capacity) > 0 ? sb.ToString() : f switch
+            {
+                1 => "CF_TEXT", 2 => "CF_BITMAP", 7 => "CF_OEMTEXT", 8 => "CF_DIB", 13 => "CF_UNICODETEXT",
+                15 => "CF_HDROP", 16 => "CF_LOCALE", 17 => "CF_DIBV5", _ => f.ToString(),
+            });
+        }
+        return names.Count == 0 ? $"nessuno ({Marshal.GetLastWin32Error()})" : string.Join(", ", names);
     }
 
     private static byte[]? ReadBytes(uint format, long max)
@@ -320,7 +338,7 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
             if (OpenClipboard(_hwnd)) return true;
             Thread.Sleep(30);
         }
-        Log.Debug($"OpenClipboard fallito ({Marshal.GetLastWin32Error()})");
+        Log.Info($"Appunti occupati da un altro programma: non riesco ad aprirli ({Marshal.GetLastWin32Error()})");
         return false;
     }
 
@@ -383,6 +401,10 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
     private static extern uint RegisterClipboardFormat(string name);
     [DllImport("user32.dll")]
     private static extern IntPtr GetClipboardData(uint format);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint EnumClipboardFormats(uint format);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClipboardFormatName(uint format, System.Text.StringBuilder name, int max);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetClipboardData(uint format, IntPtr hMem);
 
