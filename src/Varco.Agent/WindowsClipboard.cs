@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using Varco.Core;
+using ComTypes = System.Runtime.InteropServices.ComTypes;
 using Varco.Core.Clipboard;
 
 namespace Varco.Agent;
@@ -23,6 +24,17 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
 
     /// <summary>Molti programmi scrivono gli appunti in più passaggi: si legge solo quando smettono.</summary>
     private const uint DebounceMs = 150;
+
+    /// <summary>
+    /// File copiati in Esplora risorse: gli appunti sono "OLE" e all'agent (SYSTEM) può capitare di vedere solo il
+    /// segnaposto "DataObject", senza l'elenco dei file. Si riprova qualche volta, poi si chiede l'elenco all'oggetto OLE.
+    /// </summary>
+    private const uint OleRetryMs = 250;
+    private const int OleRetries = 3;
+    private int _oleRetries;
+
+    /// <summary>Appunti senza nulla da condividere: i formati presenti (per il log) e se c'è un oggetto OLE.</summary>
+    private sealed record Unshared(string Formats, bool OleObject);
 
     /// <summary>Formati registrati condivisi (stesso nome su tutti i PC, id diverso).</summary>
     private static readonly string[] RegisteredFormats = ["HTML Format", "Rich Text Format", "PNG"];
@@ -65,6 +77,9 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
     {
         try
         {
+            // OLE serve per leggere gli appunti di Esplora risorse dal suo oggetto (vedi ReadOleFiles). Il thread è già STA.
+            var ole = OleInitialize(IntPtr.Zero);
+            if (ole < 0) Log.Warn($"OleInitialize fallito (0x{ole:X8}): i file copiati potrebbero non arrivare agli altri PC");
             var hInst = Native.GetModuleHandle(null);
             var cls = new WNDCLASSEX
             {
@@ -115,13 +130,14 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
                 case WM_CLIPBOARDUPDATE:
                     // Scritture nostre (appunti arrivati da un altro PC): non vanno rimandate indietro.
                     if (GetClipboardOwner() == _hwnd || GetClipboardSequenceNumber() == _ownSeq) return IntPtr.Zero;
+                    _oleRetries = 0;
                     SetTimer(hwnd, TimerId, DebounceMs, IntPtr.Zero);
                     return IntPtr.Zero;
 
                 case WM_TIMER when wParam == TimerId:
                     KillTimer(hwnd, TimerId);
                     if (GetClipboardOwner() == _hwnd) return IntPtr.Zero;
-                    if (Read() is { } content) LocalChanged?.Invoke(content);
+                    OnClipboardSettled();
                     return IntPtr.Zero;
 
                 case WM_SET_CONTENT:
@@ -148,8 +164,76 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
 
     // ───────────── lettura ─────────────
 
-    private ClipContent? Read()
+    /// <summary>Gli appunti hanno smesso di cambiare: si leggono e, se c'è qualcosa da condividere, si avvisa.</summary>
+    private void OnClipboardSettled()
     {
+        var content = Read(out var unshared);
+        if (content is null && unshared is { OleObject: true })
+        {
+            // Solo l'oggetto OLE, senza l'elenco dei file: forse Esplora risorse sta ancora riempiendo gli appunti.
+            if (_oleRetries < OleRetries)
+            {
+                _oleRetries++;
+                SetTimer(_hwnd, TimerId, OleRetryMs, IntPtr.Zero);
+                return;
+            }
+            // Ancora niente: l'elenco si chiede direttamente all'oggetto OLE di chi ha copiato.
+            if (ReadOleFiles() is { Count: > 0 } paths)
+            {
+                Log.Info($"Elenco dei file copiati letto dall'oggetto OLE degli appunti ({paths.Count} elementi)");
+                content = new ClipContent([new ClipFormat(ClipboardSync.LocalFilesFormat, System.Text.Encoding.UTF8.GetBytes(string.Join('\0', paths)))]);
+            }
+        }
+        else if (content is not null && _oleRetries > 0)
+        {
+            Log.Info($"Appunti completi dopo {_oleRetries} attese di {OleRetryMs} ms");
+        }
+
+        if (content is not null) LocalChanged?.Invoke(content);
+        // Raro (testo, immagini e file coprono quasi tutto): l'elenco dei formati dice cosa c'era davvero.
+        else if (unshared is not null) Log.Info($"Appunti senza formati condivisibili, restano su questo PC (formati: {unshared.Formats})");
+    }
+
+    /// <summary>
+    /// Elenco dei file preso dall'oggetto OLE degli appunti (IDataObject di Esplora risorse) invece che dal formato
+    /// CF_HDROP pubblicato negli appunti. Null se non c'è o non si legge (il motivo va nel log).
+    /// </summary>
+    private static List<string>? ReadOleFiles()
+    {
+        ComTypes.IDataObject? obj = null;
+        try
+        {
+            var hr = OleGetClipboard(out obj);
+            if (hr != 0 || obj is null)
+            {
+                Log.Info($"Oggetto OLE degli appunti non disponibile (0x{hr:X8})");
+                return null;
+            }
+            var format = new ComTypes.FORMATETC
+            {
+                cfFormat = (short)CF_HDROP,
+                dwAspect = ComTypes.DVASPECT.DVASPECT_CONTENT,
+                lindex = -1,
+                tymed = ComTypes.TYMED.TYMED_HGLOBAL,
+            };
+            obj.GetData(ref format, out var medium);
+            try { return ReadDropPaths(medium.unionmember); }
+            finally { ReleaseStgMedium(ref medium); }
+        }
+        catch (Exception ex)
+        {
+            Log.Info($"Elenco dei file non letto dall'oggetto OLE degli appunti: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            if (obj is not null) Marshal.ReleaseComObject(obj);
+        }
+    }
+
+    private ClipContent? Read(out Unshared? unshared)
+    {
+        unshared = null;
         if (!OpenWithRetry()) return null;
         try
         {
@@ -202,8 +286,7 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
 
             if (formats.Count == 0)
             {
-                // Raro (testo, immagini e file coprono quasi tutto): l'elenco dei formati dice cosa c'era davvero.
-                Log.Info($"Appunti senza formati condivisibili, restano su questo PC (formati: {DescribeFormats()})");
+                unshared = new Unshared(DescribeFormats(), IsClipboardFormatAvailable(RegisterClipboardFormat("DataObject")));
                 return null;
             }
             return new ClipContent(formats);
@@ -256,10 +339,11 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
         }
     }
 
-    private static List<string> ReadDropPaths()
+    private static List<string> ReadDropPaths() => ReadDropPaths(GetClipboardData(CF_HDROP));
+
+    private static List<string> ReadDropPaths(IntPtr h)
     {
         var list = new List<string>();
-        var h = GetClipboardData(CF_HDROP);
         if (h == IntPtr.Zero) return list;
         var count = DragQueryFile(h, 0xFFFFFFFF, null, 0);
         for (uint i = 0; i < count; i++)
@@ -403,6 +487,12 @@ internal sealed class WindowsClipboard : IClipboardPlatform, IDisposable
     private static extern IntPtr GetClipboardData(uint format);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint EnumClipboardFormats(uint format);
+    [DllImport("ole32.dll")]
+    private static extern int OleInitialize(IntPtr reserved);
+    [DllImport("ole32.dll")]
+    private static extern int OleGetClipboard(out ComTypes.IDataObject? dataObject);
+    [DllImport("ole32.dll")]
+    private static extern void ReleaseStgMedium(ref ComTypes.STGMEDIUM medium);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClipboardFormatName(uint format, System.Text.StringBuilder name, int max);
     [DllImport("user32.dll", SetLastError = true)]
