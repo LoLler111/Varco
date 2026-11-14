@@ -126,6 +126,11 @@ internal sealed class TrayContext : ApplicationContext
             color = Gray;
             text = "Varco: servizio non attivo";
         }
+        else if (_last.Paused)
+        {
+            color = Gray;
+            text = "Varco: connessione disattivata";
+        }
         else
         {
             var connected = _last.Peers.Count(p => p.State == "Connected");
@@ -161,10 +166,22 @@ internal sealed class TrayContext : ApplicationContext
         }
 
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add("Riconnetti ora", null, async (_, _) =>
+        if (_last is not null)
         {
-            try { await ControlClient.SendAsync(new ControlRequest { Cmd = "reconnect" }); } catch { }
-        });
+            var paused = _last.Paused;
+            _menu.Items.Add(paused ? "Riattiva connessione" : "Disattiva connessione", null, async (_, _) =>
+            {
+                try { await ControlClient.SendAsync(new ControlRequest { Cmd = "setPaused", Enabled = !paused }, 5000); } catch { }
+                await Poll();
+            });
+        }
+        if (_last is not { Paused: true })
+        {
+            _menu.Items.Add("Riconnetti ora", null, async (_, _) =>
+            {
+                try { await ControlClient.SendAsync(new ControlRequest { Cmd = "reconnect" }); } catch { }
+            });
+        }
         _menu.Items.Add("Nascondi icona", null, (_, _) => ExitThread());
     }
 

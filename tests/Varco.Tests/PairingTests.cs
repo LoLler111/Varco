@@ -117,6 +117,38 @@ public class PairingTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Paused_connection_disconnects_and_resumes()
+    {
+        var (a, sa) = await NewHost("PC-A");
+        var (b, _) = await NewHost("PC-B");
+        await a.HandleAsync(new ControlRequest { Cmd = "pair", Address = $"127.0.0.1:{b.Node!.ListenPort}" });
+        var req = await Eventually(() => b.GetStatus().IncomingPair, what: "richiesta su B");
+        await b.HandleAsync(new ControlRequest { Cmd = "pairAnswer", RequestId = req.RequestId, Accept = true });
+        await Eventually(() =>
+            a.GetStatus().Peers.Any(p => p.Name == "PC-B" && p.State == "Connected") ? "" : null,
+            timeoutMs: 10000, what: "connessione dopo l'abbinamento");
+
+        var r = await a.HandleAsync(new ControlRequest { Cmd = "setPaused", Enabled = true });
+        Assert.True(r.Ok, r.Error);
+        Assert.True(r.Status!.Paused);
+        Assert.True(sa.Current.Paused); // resta disattivata anche dopo un riavvio
+        Assert.Null(a.Node);
+        Assert.Contains(r.Status.Peers, p => p.Name == "PC-B" && p.State == "Paused"); // i PC noti restano visibili
+        await Eventually(() => b.GetStatus().Peers.All(p => p.State != "Connected") ? "" : null, what: "B vede A scollegato");
+
+        var pair = await a.HandleAsync(new ControlRequest { Cmd = "pair", Address = $"127.0.0.1:{b.Node!.ListenPort}" });
+        Assert.False(pair.Ok);
+
+        r = await a.HandleAsync(new ControlRequest { Cmd = "setPaused", Enabled = false });
+        Assert.True(r.Ok, r.Error);
+        Assert.False(sa.Current.Paused);
+        await Eventually(() =>
+            a.GetStatus().Peers.Any(p => p.Name == "PC-B" && p.State == "Connected") &&
+            b.GetStatus().Peers.Any(p => p.Name == "PC-A" && p.State == "Connected") ? "" : null,
+            timeoutMs: 10000, what: "ricollegamento dopo la riattivazione");
+    }
+
+    [Fact]
     public async Task Pairing_with_own_address_is_refused()
     {
         var (a, sa) = await NewHost("PC-A");

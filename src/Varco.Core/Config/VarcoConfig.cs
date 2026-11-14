@@ -34,6 +34,9 @@ public sealed class VarcoConfig
     /// <summary>Appunti condivisi fra i PC del gruppo (testo, testo formattato, immagini).</summary>
     public bool ShareClipboard { get; set; } = true;
 
+    /// <summary>Connessione disattivata dall'utente: rete chiusa (niente collegamenti né ricerca) finché non la riattiva.</summary>
+    public bool Paused { get; set; }
+
     /// <summary>Aggiornamenti automatici da GitHub (firmati), installati senza chiedere nulla.</summary>
     public bool AutoUpdate { get; set; } = true;
     /// <summary>Solo per i test: indirizzo alternativo della release (formato API di GitHub). Null = GitHub.</summary>

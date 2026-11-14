@@ -29,6 +29,8 @@ internal sealed class MainForm : Form
     private long? _myAddressAt;
 
     private readonly Label _version = Ui.Label("", Ui.Small, Ui.Muted);
+    private readonly VButton _resume = new("Riattiva connessione", primary: true) { Visible = false };
+    private readonly LinkLabel _pause;
 
     private string? _peersSig, _foundSig;
     private StatusDto? _last;
@@ -81,6 +83,12 @@ internal sealed class MainForm : Form
         titles.Controls.Add(titleRow);
         _subtitle.Margin = Ui.P(1, 4, 0, 0);
         titles.Controls.Add(_subtitle);
+        _resume.Margin = Ui.P(0, 10, 0, 0);
+        _resume.Click += async (_, _) => await Send(new ControlRequest { Cmd = "setPaused", Enabled = false });
+        titles.Controls.Add(_resume);
+        _pause = Ui.Link("Disattiva connessione", async () => await Send(new ControlRequest { Cmd = "setPaused", Enabled = true }), Ui.P(1, 6, 0, 0));
+        _pause.Visible = false;
+        titles.Controls.Add(_pause);
         header.Controls.Add(titles);
         root.Controls.Add(header);
 
@@ -167,6 +175,8 @@ internal sealed class MainForm : Form
         if (IsDisposed) return;
         _last = s;
         RefreshMyAddress();
+        _resume.Visible = s?.Paused == true;
+        _pause.Visible = s is { Paused: false };
         if (s is null)
         {
             _chip.Set("Servizio spento", Ui.Bad, Ui.BadSoft);
@@ -177,8 +187,12 @@ internal sealed class MainForm : Form
         _version.Text = UpdateText(s, brief: true);
 
         var connected = s.Peers.Where(p => p.State == "Connected").ToList();
-        switch (s.Mode)
+        switch (s.Paused ? "Paused" : s.Mode)
         {
+            case "Paused":
+                _chip.Set("Disattivato", Ui.Idle, Ui.IdleSoft);
+                _subtitle.Text = $"La connessione è disattivata: {s.MachineName} non si collega agli altri PC finché non la riattivi.";
+                break;
             case "Controlling":
                 _chip.Set($"Stai usando {s.ActivePeerName}", Ui.Accent, Ui.AccentSoft);
                 _subtitle.Text = "Mouse e tastiera di questo PC comandano l'altro. Ctrl+Alt+F12 per tornare qui.";
@@ -227,11 +241,13 @@ internal sealed class MainForm : Form
         }
 
         // PC trovati
-        var foundSig = s.Peers.Count + "#" + string.Join("|", s.Discovered.Select(d => d.Id + d.Name + d.Address));
+        var foundSig = s.Peers.Count + "#" + s.Paused + "#" + string.Join("|", s.Discovered.Select(d => d.Id + d.Name + d.Address));
         if (foundSig != _foundSig)
         {
             _foundSig = foundSig;
-            var empty = s.Peers.Count == 0
+            var empty = s.Paused
+                ? "Con la connessione disattivata Varco non cerca altri PC nella rete."
+                : s.Peers.Count == 0
                 ? "Nessun altro PC trovato per ora. Installa Varco anche sull'altro PC e tienilo acceso: comparirà qui da solo, anche se uno è via cavo e l'altro in Wi-Fi."
                 : "Nessun altro PC da collegare. Per aggiungerne uno, installa Varco anche lì: comparirà qui.";
             Rebuild(_found, s.Discovered.Count == 0
@@ -259,6 +275,7 @@ internal sealed class MainForm : Form
         {
             "Connected" => (Ui.Ok, false, p.RttMs >= 0 ? $"collegato · {p.RttMs:0} ms" : "collegato"),
             "Connecting" => (Ui.Idle, true, "collegamento in corso…"),
+            "Paused" => (Ui.Idle, true, "connessione disattivata"),
             _ => (Ui.Idle, true, "spento o non raggiungibile"),
         };
         var name = Ui.Label(p.Name, Ui.BodyStrong, margin: Ui.P(10, 0, 10, 0));

@@ -97,6 +97,11 @@ public sealed partial class VarcoHost : IAsyncDisposable
             }
 
             var cfg = _store.Current;
+            if (cfg.Paused)
+            {
+                Log.Info("Connessione disattivata dall'utente: rete chiusa");
+                return;
+            }
             if (!GroupKey.TryParse(cfg.GroupKey, out var key))
             {
                 // Primo avvio: ogni PC nasce come gruppo di uno. L'abbinamento poi unisce i gruppi.
@@ -221,6 +226,17 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     Clipboard?.AnnounceCaps();
                     return new ControlResponse { Status = GetStatus() };
 
+                case "setPaused":
+                {
+                    var paused = req.Enabled == true;
+                    if (paused == _store.Current.Paused) return new ControlResponse { Status = GetStatus() };
+                    if (paused) CancelPairing();
+                    _store.Update(c => c.Paused = paused, immediate: true);
+                    Log.Info($"Connessione {(paused ? "disattivata" : "riattivata")} dall'utente");
+                    await RestartNetworkAsync().ConfigureAwait(false);
+                    return new ControlResponse { Status = GetStatus() };
+                }
+
                 case "newGroup":
                 {
                     var key = GroupKey.Generate();
@@ -262,6 +278,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     return new ControlResponse { Status = GetStatus() };
 
                 case "pair":
+                    if (_store.Current.Paused) return Fail("La connessione è disattivata: riattivala per collegare un altro PC.");
                     return StartPairing(req.Id, req.Address);
 
                 case "pairAnswer":
@@ -314,6 +331,9 @@ public sealed partial class VarcoHost : IAsyncDisposable
     {
         var cfg = _store.Current;
         var peers = _node?.GetStatus() ?? [];
+        // In pausa il nodo non c'è: mostro comunque i PC noti, così la finestra non sembra quella del primo avvio.
+        if (cfg.Paused && _node is null)
+            peers = cfg.KnownPeers.Select(p => new PeerStatus(p.Id, p.Name, PeerState.Disconnected, null, -1, null)).ToList();
         var active = Coordinator.ActivePeer;
         var (incoming, outgoing) = PairingStatus();
         return new StatusDto
@@ -321,6 +341,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             MachineId = cfg.MachineId,
             MachineName = cfg.MachineName,
             HasKey = GroupKey.TryParse(cfg.GroupKey, out _),
+            Paused = cfg.Paused,
             Mode = Coordinator.Mode.ToString(),
             ActivePeerName = active is Guid a ? peers.FirstOrDefault(p => p.Id == a)?.Name : null,
             ListenPort = _node?.ListenPort ?? 0,
@@ -328,7 +349,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             {
                 Id = p.Id,
                 Name = p.Name,
-                State = p.State.ToString(),
+                State = cfg.Paused ? "Paused" : p.State.ToString(),
                 Address = p.Address,
                 RttMs = Math.Round(p.RttMs, 1),
                 LastError = p.LastError,

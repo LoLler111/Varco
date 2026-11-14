@@ -24,7 +24,8 @@ public sealed class ControlRequest
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
-    /// checkUpdate | setAutoUpdate (Enabled) | setClipboard (Enabled) | filesOffer (Seq, attesa lunga)
+    /// checkUpdate | setAutoUpdate (Enabled) | setClipboard (Enabled) | setPaused (Enabled = true disattiva la connessione) |
+    /// filesOffer (Seq, attesa lunga)
     /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
@@ -54,6 +55,8 @@ public sealed class StatusDto
     public Guid MachineId { get; set; }
     public string MachineName { get; set; } = "";
     public bool HasKey { get; set; }
+    /// <summary>Connessione disattivata dall'utente.</summary>
+    public bool Paused { get; set; }
     public string Mode { get; set; } = "Local";
     public string? ActivePeerName { get; set; }
     public int ListenPort { get; set; }
@@ -147,7 +150,7 @@ public sealed class PeerDto
 {
     public Guid? Id { get; set; }
     public string Name { get; set; } = "";
-    /// <summary>Connected | Connecting | Disconnected</summary>
+    /// <summary>Connected | Connecting | Disconnected | Paused (connessione disattivata su questo PC)</summary>
     public string State { get; set; } = "Disconnected";
     public string? Address { get; set; }
     public double RttMs { get; set; }

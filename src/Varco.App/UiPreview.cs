@@ -44,6 +44,13 @@ internal static class UiPreview
         Save(() => { var f = new MainForm(); f.UpdateStatus(empty); return f; }, Path.Combine(dir, "main-vuota.png"));
         Save(() => { var f = new MainForm(); f.UpdateStatus(found); return f; }, Path.Combine(dir, "main-trovato.png"));
         Save(() => { var f = new MainForm(); f.UpdateStatus(linked); return f; }, Path.Combine(dir, "main-collegati.png"));
+        var paused = new StatusDto
+        {
+            MachineId = me, MachineName = "DESKTOP-CASA", Version = linked.Version, Update = linked.Update, Paused = true,
+            Peers = linked.Peers.Select(p => new PeerDto { Id = p.Id, Name = p.Name, State = "Paused" }).ToList(),
+            Layout = linked.Layout,
+        };
+        Save(() => { var f = new MainForm(); f.UpdateStatus(paused); return f; }, Path.Combine(dir, "main-disattivato.png"));
         Save(() => new MainForm(), Path.Combine(dir, "main-servizio-spento.png"), s => ((MainForm)s).UpdateStatus(null));
         Save(() => new AdvancedForm(linked), Path.Combine(dir, "avanzate.png"));
         Save(() => new PairRequestForm(new PairRequestDto { PeerName = "PORTATILE", Code = "482 913" }), Path.Combine(dir, "richiesta.png"));
