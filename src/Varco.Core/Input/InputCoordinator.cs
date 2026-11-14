@@ -52,6 +52,9 @@ public sealed class InputCoordinator
     // lato controller
     private int _parkX, _parkY;
     private int _returnX, _returnY;
+    // Ritorno al PC locale in corso: dove deve finire il cursore e quando è stato deciso (vedi ReturnLocal).
+    private (int X, int Y)? _homing;
+    private long _homingSince;
     private int _localButtons;
     private readonly HashSet<ushort> _localDownKeys = new();
     private readonly HashSet<ushort> _remoteDownKeys = new();
@@ -127,6 +130,7 @@ public sealed class InputCoordinator
     {
         _mode = mode;
         _peer = peer;
+        _homing = null;
         _pendDx = _pendDy = 0; // spostamenti e rotella non inviati: appartenevano al target precedente
         _pendWheelV = _pendWheelH = 0;
         var p = mode == InputMode.Local ? (Guid?)null : peer;
@@ -144,6 +148,18 @@ public sealed class InputCoordinator
             switch (_mode)
             {
                 case InputMode.Local:
+                    if (_homing is { } home)
+                    {
+                        _homing = null;
+                        // Primo movimento dopo il ritorno: la sua posizione può essere calcolata dal cursore ancora
+                        // parcheggiato al centro. Lo scarto e rimetto il cursore sul bordo da qui, dal thread degli hook:
+                        // Windows sta aspettando questa risposta, quindi nessun evento vecchio può più sovrascriverlo.
+                        if (ElapsedMs(_homingSince) < HomingWindowMs)
+                        {
+                            _platform.SetCursorPos(home.X, home.Y);
+                            return true;
+                        }
+                    }
                     if (_localButtons != 0) return false; // niente passaggio durante un trascinamento
                     var monitors = _platform.GetMonitors();
                     if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) return false;
@@ -421,10 +437,31 @@ public sealed class InputCoordinator
         });
     }
 
+    /// <summary>Entro quanto tempo dal ritorno il primo movimento del mouse viene corretto (ms).</summary>
+    private const int HomingWindowMs = 500;
+
+    /// <summary>
+    /// Riporta il controllo qui e il cursore nel punto (x, y).
+    ///
+    /// Spostare il cursore solo dal thread di iniezione non basta: se in quel momento il mouse fisico si sta muovendo,
+    /// Windows ha già calcolato la posizione dell'evento successivo partendo dal centro (dove il cursore era parcheggiato)
+    /// e sta aspettando la risposta dell'hook. Se SetCursorPos arriva in mezzo, appena l'hook risponde Windows applica
+    /// quella posizione vecchia e il cursore riparte dal centro invece che dal bordo. Per questo il primo movimento
+    /// dopo il ritorno passa da <see cref="OnLocalMouseMove"/>, che lo scarta e rimette il cursore sul bordo.
+    /// </summary>
     private void ReturnLocal(int x, int y)
     {
         SetMode(InputMode.Local, Guid.Empty);
-        _platform.Post(() => _platform.SetCursorPos(x, y));
+        var home = (x, y);
+        _homing = home;
+        _homingSince = Stopwatch.GetTimestamp();
+        // Per quando il mouse è fermo (Ctrl+Alt+F12, disconnessione, input fisico sull'altro PC): nessun evento da correggere.
+        _platform.Post(() =>
+        {
+            lock (_gate)
+                if (_homing != home) return; // già sistemato dall'hook, o il controllo è ripartito
+            _platform.SetCursorPos(x, y);
+        });
     }
 
     private void HandleEnter(Guid from, Enter e)

@@ -541,6 +541,43 @@ public class CoordinatorTests
     }
 
     [Fact]
+    public void Returning_home_while_the_mouse_moves_does_not_restart_from_the_center()
+    {
+        var p = new FakePlatform();
+        var queued = new List<Action>();
+        var self = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        var net = new FakeNet(self);
+        net.Connected.Add(other);
+        var layout = new LayoutManager(self, "me", new Layout());
+        layout.SetRow([(self, "me"), (other, "other")]);
+        var c = new InputCoordinator(net, new DeferredPlatform(p, queued), layout);
+
+        c.OnLocalMouseMove(1919, 540); // parcheggiato al centro (dal thread degli hook, subito)
+        Assert.Equal((960, 540), p.Cursor);
+        c.OnMessage(other, new EdgeHit(Edge.Left, 0.25f), () => []); // il controllo torna qui
+        Assert.Equal(InputMode.Local, c.Mode);
+
+        // Il mouse si stava muovendo: Windows aveva già calcolato il prossimo evento partendo dal centro.
+        Assert.True(c.OnLocalMouseMove(955, 540)); // scartato…
+        var home = (1919 - ScreenGeometry.EntryInset, 270);
+        Assert.Equal(home, p.Cursor);              // …e il cursore va sul bordo
+        foreach (var a in queued) a();             // lo spostamento accodato non serve più
+        Assert.Equal(home, p.Cursor);
+
+        Assert.False(c.OnLocalMouseMove(home.Item1 - 3, 270)); // i movimenti dopo passano normalmente
+    }
+
+    [Fact]
+    public void Returning_home_with_the_mouse_still_moves_the_cursor()
+    {
+        var (c, _, p, other) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnMessage(other, new EdgeHit(Edge.Left, 0.25f), () => []);
+        Assert.Equal((1919 - ScreenGeometry.EntryInset, 270), p.Cursor);
+    }
+
+    [Fact]
     public void Target_reports_edge_once_and_physical_input_takes_over()
     {
         var (c, net, _, other) = Setup(otherOnRight: false);
