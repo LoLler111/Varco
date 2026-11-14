@@ -85,9 +85,9 @@ internal sealed class MainForm : Form
         root.Controls.Add(header);
 
         // i tuoi PC
-        _stripHint = Ui.Label("Trascina i PC come sono messi sulla scrivania: il mouse passa dove gli schermi si toccano.",
+        _stripHint = Ui.Label("Trascina i PC come sono messi sulla scrivania: il mouse passa dove gli schermi si toccano. Tieni premuto Alt per non allineare i bordi.",
             Ui.Small, Ui.Muted, _pcCard.InnerWidth, Ui.P(0, 6, 0, 6));
-        _strip.Size = new Size(_pcCard.InnerWidth, Ui.S(180));
+        _strip.Size = new Size(_pcCard.InnerWidth, Ui.S(220));
         _strip.Margin = Padding.Empty;
         _pcCard.Body.Controls.Add(_strip);
         _pcCard.Body.Controls.Add(_stripHint);
@@ -210,7 +210,7 @@ internal sealed class MainForm : Form
         var online = connected.Select(p => p.Id).ToHashSet();
         var items = s.Layout.OrderBy(e => e.Y).ThenBy(e => e.X)
             .Select(e => new LayoutCanvas.Item(e.Id, e.Name, e.Id == s.MachineId, e.Id == s.MachineId || online.Contains(e.Id),
-                e.X, e.Y, e.Width, e.Height))
+                e.X, e.Y, e.Width, e.Height, e.Monitors))
             .ToList();
         var showStrip = items.Count > 1;
         _strip.Visible = _stripHint.Visible = showStrip;

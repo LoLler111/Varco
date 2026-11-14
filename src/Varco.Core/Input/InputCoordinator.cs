@@ -110,13 +110,12 @@ public sealed class InputCoordinator
         SyncDesktopSize();
     }
 
-    /// <summary>Comunica al layout la dimensione attuale del desktop (cambia se si cambia risoluzione o si collega un monitor).</summary>
+    /// <summary>Comunica al layout i monitor attuali (cambiano se si cambia risoluzione, si collega o si sposta un monitor).</summary>
     public void SyncDesktopSize()
     {
         var monitors = _platform.GetMonitors();
         if (monitors.Count == 0) return;
-        var b = ScreenGeometry.Bounds(monitors);
-        _layout.SetSelfSize(b.Width, b.Height);
+        _layout.SetSelfMonitors(monitors);
     }
 
     public InputMode Mode { get { lock (_gate) return _mode; } }

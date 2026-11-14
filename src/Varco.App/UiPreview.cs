@@ -34,8 +34,9 @@ internal static class UiPreview
             ],
             Layout =
             [
-                new LayoutEntry { Id = me, Name = "DESKTOP-CASA", X = 0, Y = 0, Width = 1920, Height = 1080 },
-                new LayoutEntry { Id = lap, Name = "PORTATILE", X = 1920, Y = 200, Width = 1536, Height = 864 },
+                new LayoutEntry { Id = me, Name = "DESKTOP-CASA", X = 0, Y = 0, Width = 3440, Height = 2520,
+                    Monitors = [new LayoutMonitor(0, 0, 3440, 1440), new LayoutMonitor(760, 1440, 1920, 1080)] },
+                new LayoutEntry { Id = lap, Name = "PORTATILE", X = 2680, Y = 1500, Width = 1536, Height = 864 },
                 new LayoutEntry { Id = off, Name = "UFFICIO", X = -1920, Y = 0, Width = 1920, Height = 1080 },
             ],
         };

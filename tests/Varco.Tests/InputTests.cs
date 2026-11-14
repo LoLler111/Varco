@@ -217,6 +217,67 @@ public class LayoutTests
         // sotto, centrato
         Assert.Equal((300, 1080), LayoutSnap.Snap(desk, 1366, 768, 300, 1150, 0));
     }
+
+    /// <summary>Fisso con due monitor uno sopra l'altro (3440×1440 e, sotto a sinistra, 1920×1080); portatile 1366×768.</summary>
+    private static LayoutEntry TwoMonitorDesk() => new()
+    {
+        Id = A, Name = "Fisso", X = 0, Y = 0, Width = 3440, Height = 2520,
+        Monitors = [new LayoutMonitor(0, 0, 3440, 1440), new LayoutMonitor(0, 1440, 1920, 1080)],
+    };
+
+    [Fact]
+    public void Crossing_uses_the_monitors_not_the_bounding_box()
+    {
+        // Portatile a destra del monitor in basso (x = 1920), dentro il rettangolo complessivo del fisso.
+        var l = new Layout { Entries = [TwoMonitorDesk(), new LayoutEntry { Id = B, X = 1920, Y = 1600, Width = 1366, Height = 768 }] };
+        var hop = l.Cross(A, Edge.Right, RatioOfPixel(1700, 2520));
+        Assert.Equal(B, hop?.Id);
+        Assert.Equal(1700 - 1600, (int)(hop!.Value.Ratio * 768));
+        Assert.Equal(A, l.Cross(B, Edge.Left, RatioOfPixel(100, 768))?.Id);
+        // dal monitor in alto verso destra non c'è nessuno (il portatile tocca solo quello in basso)
+        Assert.Null(l.Cross(A, Edge.Right, RatioOfPixel(700, 2520)));
+        // il portatile all'estrema destra del rettangolo, in basso: non tocca nessun monitor
+        var far = new Layout { Entries = [TwoMonitorDesk(), new LayoutEntry { Id = B, X = 3440, Y = 1600, Width = 1366, Height = 768 }] };
+        Assert.Null(far.Cross(A, Edge.Right, RatioOfPixel(1700, 2520)));
+        Assert.Null(far.Cross(B, Edge.Left, RatioOfPixel(100, 768)));
+    }
+
+    [Fact]
+    public void Snap_attaches_to_the_monitors_of_the_other_pc()
+    {
+        var others = TwoMonitorDesk().Screens();
+        // lasciato nel vuoto in basso a destra (sotto il 3440, a destra del 1920) → si attacca a uno dei due monitor
+        var (x, y) = LayoutSnap.Snap(others, 1366, 768, 2000, 1600, 0);
+        Assert.Equal((1920, 1600), (x, y));
+        // un PC con due monitor affiancati si aggancia con quello giusto senza sovrapporsi
+        IReadOnlyList<Rect> mine = [new Rect(0, 0, 1000, 800), new Rect(1000, 0, 2000, 800)];
+        var (px, py) = LayoutSnap.Snap(others, mine, 3500, 100, 0);
+        Assert.Equal((3440, 100), (px, py));
+    }
+
+    [Fact]
+    public void Self_monitors_are_published_relative_to_the_desktop_corner()
+    {
+        var lm = new LayoutManager(A, "A", new Layout());
+        // primario a destra: Windows dà coordinate negative al monitor di sinistra
+        lm.SetSelfMonitors([new Rect(0, 0, 2560, 1440), new Rect(-1920, 200, 0, 1280)]);
+        var me = lm.Current.Find(A)!;
+        Assert.Equal((4480, 1440), (me.Width, me.Height));
+        Assert.Equal([new LayoutMonitor(1920, 0, 2560, 1440), new LayoutMonitor(0, 200, 1920, 1080)], me.Monitors);
+        var v = lm.Current.Version;
+        lm.SetSelfMonitors([new Rect(0, 0, 2560, 1440), new Rect(-1920, 200, 0, 1280)]);
+        Assert.Equal(v, lm.Current.Version); // invariati: niente propagazione
+        lm.SetSelfMonitors([new Rect(0, 0, 2560, 1440), new Rect(-1920, 0, 0, 1080)]); // spostato in Impostazioni
+        Assert.Equal(new LayoutMonitor(0, 0, 1920, 1080), lm.Current.Find(A)!.Monitors[1]);
+    }
+
+    [Fact]
+    public void Monitors_survive_the_wire_format()
+    {
+        var l = new Layout { Entries = [TwoMonitorDesk()] };
+        var back = (LayoutMsg)MessageCodec.Decode(MessageCodec.Encode(new LayoutMsg(l)))!;
+        Assert.Equal(l.Entries[0].Monitors, back.Layout.Entries[0].Monitors);
+    }
 }
 
 public class CoordinatorTests

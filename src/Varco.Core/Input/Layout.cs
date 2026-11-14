@@ -16,11 +16,34 @@ public sealed class LayoutEntry
     public int Y { get; set; }
     public int Width { get; set; }
     public int Height { get; set; }
+    /// <summary>
+    /// I monitor del PC come li dispone Windows, relativi all'angolo in alto a sinistra del rettangolo.
+    /// Vuota (PC con una versione precedente): un unico monitor grande quanto il rettangolo.
+    /// </summary>
+    public List<LayoutMonitor> Monitors { get; set; } = [];
 
     [JsonIgnore] public int Right => X + Width;
     [JsonIgnore] public int Bottom => Y + Height;
 
-    public LayoutEntry Clone() => new() { Id = Id, Name = Name, X = X, Y = Y, Width = Width, Height = Height };
+    /// <summary>I monitor in coordinate virtuali (almeno uno).</summary>
+    public List<Rect> Screens()
+    {
+        if (Monitors.Count == 0) return [new Rect(X, Y, Right, Bottom)];
+        return Monitors.Select(m => new Rect(X + m.X, Y + m.Y, X + m.X + m.Width, Y + m.Y + m.Height)).ToList();
+    }
+
+    public LayoutEntry Clone() => new() { Id = Id, Name = Name, X = X, Y = Y, Width = Width, Height = Height, Monitors = Monitors.ToList() };
+}
+
+/// <summary>Un monitor di un PC, relativo all'angolo in alto a sinistra del suo desktop (pixel fisici).</summary>
+public sealed record LayoutMonitor(int X, int Y, int Width, int Height)
+{
+    /// <summary>I monitor riportati all'angolo in alto a sinistra del desktop (il primario non è sempre lì).</summary>
+    public static List<LayoutMonitor> From(IReadOnlyList<Rect> monitors)
+    {
+        var b = ScreenGeometry.Bounds(monitors);
+        return monitors.Select(m => new LayoutMonitor(m.Left - b.Left, m.Top - b.Top, m.Width, m.Height)).ToList();
+    }
 }
 
 /// <summary>Il PC raggiunto attraversando un bordo e la posizione (0..1) lungo il suo bordo d'ingresso.</summary>
@@ -58,23 +81,39 @@ public sealed class Layout
         ratio = Math.Clamp(ratio, 0f, 1f);
         var sideways = edge is Edge.Left or Edge.Right;
         double along = sideways ? f.Y + ratio * f.Height : f.X + ratio * f.Width;
+        bool Spans(Rect r) => sideways ? along >= r.Top && along < r.Bottom : along >= r.Left && along < r.Right;
 
+        // Il monitor da cui esce il cursore: il più esterno in quella direzione, a quell'altezza.
+        var mine = f.Screens().Where(Spans).ToList();
+        if (mine.Count == 0) mine = [new Rect(f.X, f.Y, f.Right, f.Bottom)];
+        var src = edge switch
+        {
+            Edge.Right => mine.MaxBy(r => r.Right),
+            Edge.Left => mine.MinBy(r => r.Left),
+            Edge.Bottom => mine.MaxBy(r => r.Bottom),
+            _ => mine.MinBy(r => r.Top),
+        };
+
+        // Il PC con un monitor che tocca quel tratto di bordo.
         LayoutEntry? best = null;
         int bestGap = int.MaxValue;
         foreach (var n in Entries)
         {
             if (n.Id == from || n.Width <= 0 || n.Height <= 0) continue;
-            if (sideways ? along < n.Y || along >= n.Bottom : along < n.X || along >= n.Right) continue;
-            // gap > 0: spazio vuoto fra i due; gap < 0: si sovrappongono (es. dopo un cambio di risoluzione).
-            var (gap, beyond) = edge switch
+            foreach (var m in n.Screens())
             {
-                Edge.Right => (n.X - f.Right, n.Right > f.Right),
-                Edge.Left => (f.X - n.Right, n.X < f.X),
-                Edge.Bottom => (n.Y - f.Bottom, n.Bottom > f.Bottom),
-                _ => (f.Y - n.Bottom, n.Y < f.Y),
-            };
-            if (gap > EdgeTolerance || !beyond) continue;
-            if (Math.Abs(gap) < bestGap) { bestGap = Math.Abs(gap); best = n; }
+                if (!Spans(m)) continue;
+                // gap > 0: spazio vuoto fra i due; gap < 0: si sovrappongono (es. dopo un cambio di risoluzione).
+                var (gap, beyond) = edge switch
+                {
+                    Edge.Right => (m.Left - src.Right, m.Right > src.Right),
+                    Edge.Left => (src.Left - m.Right, m.Left < src.Left),
+                    Edge.Bottom => (m.Top - src.Bottom, m.Bottom > src.Bottom),
+                    _ => (src.Top - m.Bottom, m.Top < src.Top),
+                };
+                if (gap > EdgeTolerance || !beyond) continue;
+                if (Math.Abs(gap) < bestGap) { bestGap = Math.Abs(gap); best = n; }
+            }
         }
         if (best is null) return null;
         var r = sideways ? (along - best.Y) / best.Height : (along - best.X) / best.Width;
@@ -141,40 +180,49 @@ public static class LayoutSnap
     /// <summary>Lunghezza minima (pixel virtuali) del tratto di bordo in comune, perché il mouse possa passare.</summary>
     public const int MinShared = 120;
 
+    /// <summary>Come l'altra, per un PC con un solo monitor <paramref name="w"/>×<paramref name="h"/>.</summary>
+    public static (int X, int Y) Snap(IReadOnlyList<Rect> others, int w, int h, int x, int y, int align) =>
+        Snap(others, [new Rect(0, 0, w, h)], x, y, align);
+
     /// <summary>
-    /// La posizione più vicina a (<paramref name="x"/>,<paramref name="y"/>) in cui un rettangolo <paramref name="w"/>×<paramref name="h"/>
-    /// tocca almeno uno degli altri lungo un bordo senza sovrapporsi a nessuno. I bordi vicini entro
-    /// <paramref name="align"/> si allineano (stessa altezza in alto o in basso, stessa posizione a sinistra o a destra).
+    /// La posizione più vicina a (<paramref name="x"/>,<paramref name="y"/>) in cui un PC con i monitor <paramref name="mine"/>
+    /// (relativi al suo angolo in alto a sinistra) tocca con almeno un monitor uno dei monitor <paramref name="others"/>
+    /// lungo un bordo, senza sovrapporsi a nessuno. I bordi vicini entro <paramref name="align"/> si allineano
+    /// (stessa altezza in alto o in basso, stessa posizione a sinistra o a destra); 0 = nessun allineamento.
     /// </summary>
-    public static (int X, int Y) Snap(IReadOnlyList<Rect> others, int w, int h, int x, int y, int align)
+    public static (int X, int Y) Snap(IReadOnlyList<Rect> others, IReadOnlyList<Rect> mine, int x, int y, int align)
     {
-        if (others.Count == 0) return (x, y);
+        if (others.Count == 0 || mine.Count == 0) return (x, y);
         (int X, int Y)? best = null;
         long bestDist = long.MaxValue;
 
+        foreach (var m in mine)
         foreach (var o in others)
         {
             // accanto (a sinistra o a destra)
-            var mY = Math.Max(1, Math.Min(MinShared, Math.Min(h, o.Height) / 2));
-            var cy = Math.Clamp(y, o.Top - h + mY, o.Bottom - mY);
-            cy = Align(cy, h, o.Top, o.Bottom, align);
-            Consider(o.Left - w, cy);
-            Consider(o.Right, cy);
+            var mY = Math.Max(1, Math.Min(MinShared, Math.Min(m.Height, o.Height) / 2));
+            var cy = Math.Clamp(y + m.Top, o.Top - m.Height + mY, o.Bottom - mY);
+            cy = Align(cy, m.Height, o.Top, o.Bottom, align) - m.Top;
+            Consider(o.Left - m.Right, cy);
+            Consider(o.Right - m.Left, cy);
 
             // sopra o sotto
-            var mX = Math.Max(1, Math.Min(MinShared, Math.Min(w, o.Width) / 2));
-            var cx = Math.Clamp(x, o.Left - w + mX, o.Right - mX);
-            cx = Align(cx, w, o.Left, o.Right, align);
-            Consider(cx, o.Top - h);
-            Consider(cx, o.Bottom);
+            var mX = Math.Max(1, Math.Min(MinShared, Math.Min(m.Width, o.Width) / 2));
+            var cx = Math.Clamp(x + m.Left, o.Left - m.Width + mX, o.Right - mX);
+            cx = Align(cx, m.Width, o.Left, o.Right, align) - m.Left;
+            Consider(cx, o.Top - m.Bottom);
+            Consider(cx, o.Bottom - m.Top);
         }
         return best ?? (x, y);
 
         void Consider(int cx, int cy)
         {
-            var r = new Rect(cx, cy, cx + w, cy + h);
-            foreach (var o in others)
-                if (r.Left < o.Right && o.Left < r.Right && r.Top < o.Bottom && o.Top < r.Bottom) return;
+            foreach (var m in mine)
+            {
+                var r = new Rect(cx + m.Left, cy + m.Top, cx + m.Right, cy + m.Bottom);
+                foreach (var o in others)
+                    if (r.Left < o.Right && o.Left < r.Right && r.Top < o.Bottom && o.Top < r.Bottom) return;
+            }
             long dx = cx - x, dy = cy - y;
             var d = dx * dx + dy * dy;
             if (d < bestDist) { bestDist = d; best = (cx, cy); }
@@ -183,6 +231,7 @@ public static class LayoutSnap
 
     private static int Align(int pos, int size, int start, int end, int align)
     {
+        if (align <= 0) return pos;
         if (Math.Abs(pos - start) <= align) return start;
         if (Math.Abs(pos + size - end) <= align) return end - size;
         return pos;
@@ -196,6 +245,7 @@ public sealed class LayoutManager
     private readonly Guid _self;
     private readonly string _selfName;
     private (int W, int H)? _selfSize;
+    private List<LayoutMonitor>? _selfMonitors;
     private Layout _current;
 
     /// <summary>Il layout è cambiato: va salvato e inviato agli altri.</summary>
@@ -253,10 +303,18 @@ public sealed class LayoutManager
                 _current.Entries.Add(new LayoutEntry { Id = id, Name = name, X = last?.Right ?? 0, Y = last?.Y ?? 0, Width = w, Height = h });
                 changed = true;
             }
-            if (_selfSize is { } size && _current.Find(_self) is { } me && (me.Width != size.W || me.Height != size.H))
+            if (_selfSize is { } size && _current.Find(_self) is { } me)
             {
-                _current.Resize(me, size.W, size.H);
-                changed = true;
+                if (me.Width != size.W || me.Height != size.H)
+                {
+                    _current.Resize(me, size.W, size.H);
+                    changed = true;
+                }
+                if (_selfMonitors is { } mons && !me.Monitors.SequenceEqual(mons))
+                {
+                    me.Monitors = mons.ToList();
+                    changed = true;
+                }
             }
             if (changed) Bump();
         }
@@ -264,14 +322,25 @@ public sealed class LayoutManager
         return changed;
     }
 
-    /// <summary>Dimensione attuale del desktop di questo PC (tutti i monitor). Se è cambiata il layout viene aggiornato e propagato.</summary>
-    public void SetSelfSize(int width, int height)
+    /// <summary>Dimensione attuale del desktop di questo PC, con un solo monitor.</summary>
+    public void SetSelfSize(int width, int height) => SetSelfMonitors([new Rect(0, 0, width, height)]);
+
+    /// <summary>
+    /// Monitor attuali di questo PC (coordinate di Windows). Se sono cambiati (risoluzione, monitor collegato o spostato
+    /// in Impostazioni → Schermo) il layout viene aggiornato e propagato.
+    /// </summary>
+    public void SetSelfMonitors(IReadOnlyList<Rect> monitors)
     {
-        if (width <= 0 || height <= 0) return;
+        if (monitors.Count == 0) return;
+        var b = ScreenGeometry.Bounds(monitors);
+        if (b.Width <= 0 || b.Height <= 0) return;
+        // Un solo monitor coincide con il rettangolo: lista vuota, come la scrivono le versioni precedenti (niente versioni in più).
+        var rel = monitors.Count == 1 ? [] : LayoutMonitor.From(monitors);
         lock (_gate)
         {
-            if (_selfSize == (width, height)) return;
-            _selfSize = (width, height);
+            if (_selfSize == (b.Width, b.Height) && _selfMonitors is { } cur && cur.SequenceEqual(rel)) return;
+            _selfSize = (b.Width, b.Height);
+            _selfMonitors = rel;
         }
         EnsureMembers([]);
     }
