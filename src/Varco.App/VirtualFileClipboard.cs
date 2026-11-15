@@ -89,6 +89,21 @@ internal sealed class VirtualFileClipboard : IDisposable
         });
     }
 
+    /// <summary>Esegue sul thread STA dei file virtuali (OLE pronto, ciclo di messaggi proprio).</summary>
+    internal void Post(Action action)
+    {
+        if (_invoker is not { IsHandleCreated: true } inv) return;
+        try
+        {
+            inv.BeginInvoke(() =>
+            {
+                try { action(); }
+                catch (Exception ex) { Log.Error("Thread dei file virtuali", ex); }
+            });
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+    }
+
     public void Dispose()
     {
         _cts.Cancel();
@@ -131,21 +146,34 @@ public sealed class VirtualFilesDataObject : ComTypes.IDataObject
     private static readonly short CfDropEffect = (short)DataFormats.GetFormat("Preferred DropEffect").Id;
 
     private readonly FilesOfferDto _offer;
-    /// <summary>Indice nel descrittore → indice nell'offerta (i nomi troppo lunghi per Esplora risorse restano fuori).</summary>
+    /// <summary>Indice nel descrittore → indice nell'offerta (resta fuori solo ciò che non si riesce ad accorciare).</summary>
     private readonly int[] _map;
+    /// <summary>Percorso da scrivere nel descrittore per ogni elemento di <see cref="_map"/> (vedi <see cref="Core.Files.VirtualPaths"/>).</summary>
+    private readonly string[] _names;
 
     internal int Count => _map.Length;
 
     internal VirtualFilesDataObject(FilesOfferDto offer)
     {
         _offer = offer;
+        var fit = Core.Files.VirtualPaths.Fit(offer.Entries.Select(e => e.Path).ToList(), offer.Entries.Select(e => e.IsDirectory).ToList());
         var map = new List<int>();
+        var names = new List<string>();
+        var shortened = 0;
         for (var i = 0; i < offer.Entries.Count; i++)
         {
-            if (offer.Entries[i].Path.Length < 260) map.Add(i);
-            else Log.Warn($"Nome troppo lungo per incollarlo, saltato: {offer.Entries[i].Path}");
+            if (fit[i] is not { } name)
+            {
+                Log.Warn($"Percorso troppo lungo anche accorciando le cartelle, saltato: {offer.Entries[i].Path}");
+                continue;
+            }
+            if (name != offer.Entries[i].Path) shortened++;
+            map.Add(i);
+            names.Add(name);
         }
+        if (shortened > 0) Log.Info($"{shortened} percorsi oltre 259 caratteri: cartelle con il nome accorciato");
         _map = map.ToArray();
+        _names = names.ToArray();
     }
 
     private static ComTypes.FORMATETC Format(short cf, ComTypes.TYMED tymed) => new()
@@ -253,7 +281,7 @@ public sealed class VirtualFilesDataObject : ComTypes.IDataObject
             BitConverter.TryWriteBytes(d[56..], e.LastWriteUtc.Ticks > new DateTime(1601, 1, 2).Ticks ? e.LastWriteUtc.ToFileTimeUtc() : 0L);
             BitConverter.TryWriteBytes(d[64..], (uint)(e.Size >> 32));
             BitConverter.TryWriteBytes(d[68..], (uint)(e.Size & 0xFFFFFFFF));
-            Encoding.Unicode.GetBytes(e.Path, d[72..]);
+            Encoding.Unicode.GetBytes(_names[i], d[72..]);
         }
         return buf;
     }

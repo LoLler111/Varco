@@ -371,6 +371,18 @@ public sealed class LayoutManager
         Raise();
     }
 
+    /// <summary>Toglie dalla disposizione i PC indicati (mai questo), lasciando gli altri dove sono.</summary>
+    public void Remove(IReadOnlyCollection<Guid> ids)
+    {
+        lock (_gate)
+        {
+            if (_current.Entries.RemoveAll(e => e.Id != _self && ids.Contains(e.Id)) == 0) return;
+            _current.ToOrigin();
+            Bump();
+        }
+        Raise();
+    }
+
     /// <summary>PC in fila da sinistra a destra, allineati in alto.</summary>
     public void SetRow(IReadOnlyList<(Guid Id, string Name)> order)
     {

@@ -87,11 +87,22 @@ public sealed class FrameCipher : IDisposable
 
 public sealed record LocalIdentity(Guid Id, string Name, int ListenPort, byte[] GroupKey)
 {
-    public byte[] GroupTag { get; } = Config.GroupKey.Tag(GroupKey);
+    /// <summary>Calcolata ogni volta: con <c>with { GroupKey = … }</c> deve seguire la chiave.</summary>
+    public byte[] GroupTag => Config.GroupKey.Tag(GroupKey);
+
+    /// <summary>
+    /// Chiave di gruppo sostituita da accettare ancora da un certo PC (etichetta del suo Hello, suo id), o null.
+    /// Vedi <see cref="Config.RetiredGroupKey"/>.
+    /// </summary>
+    public Func<byte[], Guid, byte[]?>? RetiredKeyFor { get; init; }
 }
 
 /// <param name="SessionId">Hash del transcript: identico sui due lati, serve a risolvere in modo deterministico le connessioni doppie.</param>
-public sealed record HandshakeResult(Guid PeerId, string PeerName, int PeerListenPort, FrameCipher Cipher, byte[] SessionId);
+public sealed record HandshakeResult(Guid PeerId, string PeerName, int PeerListenPort, FrameCipher Cipher, byte[] SessionId)
+{
+    /// <summary>Chiave di gruppo usata davvero (può essere una chiave sostituita, vedi <see cref="LocalIdentity.RetiredKeyFor"/>).</summary>
+    public byte[] GroupKey { get; init; } = [];
+}
 
 public sealed class HandshakeException(string message) : Exception(message);
 
@@ -139,10 +150,18 @@ public static class Handshake
             serverRaw = myHello;
         }
 
-        if (!CryptographicOperations.FixedTimeEquals(peer.Tag, me.GroupTag))
-            throw new HandshakeException("il PC remoto appartiene a un altro gruppo");
         if (peer.Id == me.Id)
             throw new HandshakeException("connessione verso me stesso");
+        var groupKey = me.GroupKey;
+        if (!CryptographicOperations.FixedTimeEquals(peer.Tag, me.GroupTag))
+        {
+            // Un PC del gruppo rimasto spento durante un cambio di chiave: si presenta con quella vecchia.
+            if (isClient || me.RetiredKeyFor?.Invoke(peer.Tag, peer.Id) is not { } retired)
+                throw new HandshakeException("il PC remoto appartiene a un altro gruppo");
+            groupKey = retired;
+            myHello = BuildHello(me with { GroupKey = retired }, ecdh.PublicKey.ExportSubjectPublicKeyInfo());
+            serverRaw = myHello;
+        }
 
         byte[] secret;
         using (var peerKey = ECDiffieHellman.Create())
@@ -152,7 +171,7 @@ public static class Handshake
         }
 
         var transcript = SHA256.HashData([.. clientRaw, .. serverRaw]);
-        var prk = HKDF.Extract(HashAlgorithmName.SHA256, secret, me.GroupKey);
+        var prk = HKDF.Extract(HashAlgorithmName.SHA256, secret, groupKey);
         var okm = HKDF.Expand(HashAlgorithmName.SHA256, prk, 128, [.. "varco v1 keys"u8, .. transcript]);
         CryptographicOperations.ZeroMemory(secret);
 
@@ -167,7 +186,7 @@ public static class Handshake
             if (!CryptographicOperations.FixedTimeEquals(got, serverFin))
                 throw new HandshakeException("chiave di gruppo errata (verifica server fallita)");
             await Framing.WriteFrameAsync(s, clientFin, ct).ConfigureAwait(false);
-            return new HandshakeResult(peer.Id, peer.Name, peer.Port, new FrameCipher(c2s, s2c), transcript);
+            return new HandshakeResult(peer.Id, peer.Name, peer.Port, new FrameCipher(c2s, s2c), transcript) { GroupKey = groupKey };
         }
         else
         {
@@ -176,7 +195,7 @@ public static class Handshake
             var got = await Framing.ReadFrameAsync(s, ct).ConfigureAwait(false);
             if (!CryptographicOperations.FixedTimeEquals(got, clientFin))
                 throw new HandshakeException("chiave di gruppo errata (verifica client fallita)");
-            return new HandshakeResult(peer.Id, peer.Name, peer.Port, new FrameCipher(s2c, c2s), transcript);
+            return new HandshakeResult(peer.Id, peer.Name, peer.Port, new FrameCipher(s2c, c2s), transcript) { GroupKey = groupKey };
         }
     }
 

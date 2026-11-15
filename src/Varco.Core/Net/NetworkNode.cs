@@ -27,6 +27,11 @@ public sealed class NodeOptions
     public int RaceWindowMs { get; init; } = 2000;
     public IReadOnlyList<string> ManualAddresses { get; init; } = [];
     public IReadOnlyList<(Guid Id, string Name, IReadOnlyList<string> Addresses)> KnownPeers { get; init; } = [];
+    /// <summary>
+    /// Chiavi di gruppo sostituite che un certo PC può ancora usare (vedi <see cref="Config.RetiredGroupKey"/>).
+    /// Letta a ogni connessione: segue la configurazione senza ricreare il nodo.
+    /// </summary>
+    public Func<Guid, IReadOnlyList<byte[]>>? RetiredKeysFor { get; init; }
 }
 
 /// <summary>
@@ -94,7 +99,11 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         _listener.Bind(new IPEndPoint(IPAddress.IPv6Any, options.TcpPort));
         _listener.Listen(16);
         ListenPort = ((IPEndPoint)_listener.LocalEndPoint!).Port;
-        Me = new LocalIdentity(id, name, ListenPort, groupKey);
+        Me = new LocalIdentity(id, name, ListenPort, groupKey)
+        {
+            RetiredKeyFor = (tag, peer) => RetiredKeysFor(peer).FirstOrDefault(k =>
+                System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(Config.GroupKey.Tag(k), tag)),
+        };
 
         foreach (var kp in options.KnownPeers)
         {
@@ -124,6 +133,12 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         }
     }
 
+    private IReadOnlyList<byte[]> RetiredKeysFor(Guid peer)
+    {
+        try { return _opt.RetiredKeysFor?.Invoke(peer) ?? []; }
+        catch (Exception ex) { Log.Error("Chiavi sostituite", ex); return []; }
+    }
+
     private int ListenPortFor(string _) => _opt.TcpPort == 0 ? 47800 : _opt.TcpPort;
 
     public void Start()
@@ -146,6 +161,12 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     public bool IsConnected(Guid id)
     {
         lock (_gate) return _conns.ContainsKey(id);
+    }
+
+    /// <summary>Chiave di gruppo con cui è nata la connessione attuale verso quel PC (null se non è collegato).</summary>
+    public byte[]? GroupKeyOf(Guid id)
+    {
+        lock (_gate) return _conns.TryGetValue(id, out var c) ? c.GroupKey : null;
     }
 
     public IReadOnlyList<Guid> ConnectedPeers
@@ -533,6 +554,25 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
 
     private async Task<PeerConnection?> ConnectOne(PeerSlot slot, IPEndPoint ep, CancellationToken ct)
     {
+        var (conn, rejected) = await ConnectOne(slot, ep, Me, ct).ConfigureAwait(false);
+        if (conn is not null || !rejected || slot.Id is not Guid id) return conn;
+        // Il PC risponde ma non accetta la nostra chiave: forse era spento quando la chiave è cambiata e ha ancora quella vecchia.
+        // Ci si presenta con la vecchia; appena collegato riceve la nuova (vedi VarcoHost.GroupKeys).
+        foreach (var old in RetiredKeysFor(id))
+        {
+            (conn, _) = await ConnectOne(slot, ep, Me with { GroupKey = old }, ct).ConfigureAwait(false);
+            if (conn is not null)
+            {
+                Log.Info($"{slot.Name} ha ancora la chiave di gruppo precedente: collegato con quella");
+                return conn;
+            }
+        }
+        return null;
+    }
+
+    /// <returns>La connessione, oppure null e se il PC ha risposto ma ha rifiutato l'handshake.</returns>
+    private async Task<(PeerConnection?, bool Rejected)> ConnectOne(PeerSlot slot, IPEndPoint ep, LocalIdentity me, CancellationToken ct)
+    {
         var s = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         ConfigureSocket(s);
         NetworkStream? stream = null;
@@ -546,8 +586,8 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
             stream = new NetworkStream(s, ownsSocket: true);
             using var h = CancellationTokenSource.CreateLinkedTokenSource(ct);
             h.CancelAfter(_opt.HandshakeTimeoutMs);
-            var hs = await Handshake.RunClientAsync(stream, Me, h.Token).ConfigureAwait(false);
-            return new PeerConnection(s, stream, hs, initiatorId: Me.Id, _opt.HeartbeatIntervalMs, _opt.HeartbeatTimeoutMs);
+            var hs = await Handshake.RunClientAsync(stream, me, h.Token).ConfigureAwait(false);
+            return (new PeerConnection(s, stream, hs, initiatorId: Me.Id, _opt.HeartbeatIntervalMs, _opt.HeartbeatTimeoutMs), false);
         }
         catch (Exception ex)
         {
@@ -558,14 +598,16 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
                 OperationCanceledException => ct.IsCancellationRequested ? null : "timeout",
                 _ => ex.Message,
             };
-            if (msg is not null && msg != slot.LastError)
+            if (msg is not null && msg != slot.LastError && ReferenceEquals(me, Me))
             {
                 slot.LastError = msg;
                 Log.Info($"Connessione a {slot.Name} ({ep}) fallita: {msg}");
             }
+            // Connesso ma chiuso durante l'handshake (chiave diversa: l'altro chiude senza rispondere).
+            var rejected = stream is not null && !ct.IsCancellationRequested && ex is not OperationCanceledException;
             if (stream is not null) await stream.DisposeAsync().ConfigureAwait(false);
             else s.Dispose();
-            return null;
+            return (null, rejected);
         }
     }
 

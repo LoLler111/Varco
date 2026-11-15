@@ -44,7 +44,11 @@ public static class AgentMain
         IInputPlatform platform = noInput ? new NullInput() : new WindowsInput();
         using var clipboard = noInput ? null : new WindowsClipboard();
         await using var host = new VarcoHost(store, platform, port, discoveryPort, clipboard, clipboard is null ? null : new UserFileAccess());
-        if (platform is WindowsInput wi) wi.Coordinator = host.Coordinator;
+        if (platform is WindowsInput wi)
+        {
+            wi.Coordinator = host.Coordinator;
+            host.EnableFileDrag(); // serve anche l'icona: è lei che vede i file trascinati e li lascia cadere
+        }
 
         using var responsiveness = new Responsiveness();
         if (!noInput)

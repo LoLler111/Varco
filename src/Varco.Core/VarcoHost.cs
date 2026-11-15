@@ -119,6 +119,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 HeartbeatTimeoutMs = cfg.HeartbeatTimeoutMs,
                 ManualAddresses = cfg.ManualAddresses.ToList(),
                 KnownPeers = cfg.KnownPeers.Select(p => (p.Id, p.Name, (IReadOnlyList<string>)p.LastAddresses.ToList())).ToList(),
+                RetiredKeysFor = RetiredKeysFor,
             };
 
             NetworkNode node;
@@ -135,6 +136,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
             node.PeerConnected += c =>
             {
+                CheckGroupKey(c);
                 Coordinator.OnPeerConnected(c.PeerId, c.PeerName);
                 Clipboard?.OnPeerConnected(c.PeerId);
             };
@@ -146,6 +148,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             node.MessageReceived += (id, m) =>
             {
                 if (m is InstallUpdate iu) { OnInstallUpdateRequested(id, iu.Version); return; }
+                if (m is GroupKeyChange gk) { OnGroupKeyChange(id, gk); return; }
                 if (Clipboard?.OnMessage(id, m) == true) return;
                 Coordinator.OnMessage(id, m, ConnectedPeers);
             };
@@ -263,6 +266,15 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 case "localFiles":
                     return OfferLocalFiles(req.Paths);
 
+                case "dragEvents":
+                    return new ControlResponse { DragEvent = await WaitDragEventAsync(req.Seq).ConfigureAwait(false) };
+
+                case "dragFiles":
+                    return OnDraggedFiles(req.Seq, req.Paths);
+
+                case "dragReady":
+                    return OnDragSourceReady(req.Seq);
+
                 case "setClipboard":
                     _store.Update(c => c.ShareClipboard = req.Enabled != false, immediate: true);
                     Log.Info($"Appunti condivisi {(req.Enabled != false ? "attivati" : "disattivati")}");
@@ -364,6 +376,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
         _store.Update(c =>
         {
             c.GroupKey = key;
+            ResetGroupHistory(c);
             c.KnownPeers.Clear();
         }, immediate: true);
         Layout.Reset();

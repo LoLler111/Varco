@@ -80,6 +80,9 @@ public static class ServiceMain
         catch { }
     }
 
+    /// <summary>Disinstallazione: rimette com'era il criterio di Windows che permette di simulare Ctrl+Alt+Canc.</summary>
+    public static void RestoreSasPolicy() => SecureAttention.RestorePolicy();
+
     /// <summary>Chiede a qualsiasi agent in esecuzione di chiudersi (usato anche dal setup).</summary>
     public static void SignalAgentStop()
     {
@@ -98,6 +101,7 @@ public static class ServiceMain
 internal sealed class VarcoService : ServiceBase
 {
     private readonly AgentLauncher _launcher = new();
+    private SecureAttention? _sas;
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
@@ -111,6 +115,15 @@ internal sealed class VarcoService : ServiceBase
     protected override void OnStart(string[] args)
     {
         Log.Info("Servizio Varco avviato");
+        try
+        {
+            SecureAttention.EnsurePolicy();
+            _sas = new SecureAttention();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Ctrl+Alt+Canc dagli altri PC non disponibile", ex);
+        }
         _cts = new CancellationTokenSource();
         _loop = _launcher.RunAsync(_cts.Token);
     }
@@ -121,6 +134,7 @@ internal sealed class VarcoService : ServiceBase
         _cts?.Cancel();
         try { _loop?.Wait(3000); } catch { }
         _launcher.Dispose();
+        _sas?.Dispose();
     }
 
     protected override void OnShutdown() => OnStop();

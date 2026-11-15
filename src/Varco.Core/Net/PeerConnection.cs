@@ -58,6 +58,8 @@ public sealed class PeerConnection : IAsyncDisposable
     public Guid InitiatorId { get; }
     public long EstablishedAt { get; } = Environment.TickCount64;
     public byte[] SessionId { get; }
+    /// <summary>Chiave di gruppo con cui è nata la connessione: può essere una chiave sostituita (PC rimasto spento a un cambio).</summary>
+    public byte[] GroupKey { get; }
     public double RttMs { get; private set; } = -1;
 
     /// <summary>Messaggi applicativi ricevuti (Ping/Pong sono gestiti internamente).</summary>
@@ -76,6 +78,7 @@ public sealed class PeerConnection : IAsyncDisposable
         PeerListenPort = hs.PeerListenPort;
         InitiatorId = initiatorId;
         SessionId = hs.SessionId;
+        GroupKey = hs.GroupKey;
         RemoteEndPoint = (IPEndPoint)socket.RemoteEndPoint!;
         _intervalMs = intervalMs;
         _timeoutMs = timeoutMs;

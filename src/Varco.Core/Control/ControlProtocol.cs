@@ -16,6 +16,9 @@ public static class ControlProtocol
     /// </summary>
     public const string FilesPipeName = "Varco.Files";
 
+    /// <summary>Evento con cui l'agent chiede al servizio di eseguire Ctrl+Alt+Canc (SendSAS). Solo SYSTEM.</summary>
+    public const string SasEventName = @"Global\Varco.SAS";
+
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 }
 
@@ -25,7 +28,9 @@ public sealed class ControlRequest
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
     /// checkUpdate | installUpdateNow (anche sugli altri PC collegati) | setAutoUpdate (Enabled) | setClipboard (Enabled) | setPaused (Enabled = true disattiva la connessione) |
-    /// filesOffer (Seq, attesa lunga) | localFiles (Paths: file copiati su questo PC, letti dall'icona)
+    /// filesOffer (Seq, attesa lunga) | localFiles (Paths: file copiati su questo PC, letti dall'icona) |
+    /// dragEvents (Seq, attesa lunga) | dragFiles (Seq, Paths: file trascinati contro il bordo, vuoto = nessuno) |
+    /// dragReady (Seq: finestrella da cui parte il trascinamento pronta sotto il cursore)
     /// </summary>
     public string Cmd { get; set; } = "status";
     public string? Key { get; set; }
@@ -39,7 +44,7 @@ public sealed class ControlRequest
     public bool? Enabled { get; set; }
     /// <summary>filesOffer: ultimo numero di offerta già visto dall'icona (null = dimmi solo a che punto siamo).</summary>
     public long? Seq { get; set; }
-    /// <summary>localFiles: percorsi dei file e delle cartelle appena copiati in Esplora risorse.</summary>
+    /// <summary>localFiles: percorsi dei file e delle cartelle appena copiati in Esplora risorse. dragFiles: quelli trascinati.</summary>
     public List<string>? Paths { get; set; }
 }
 
@@ -50,6 +55,23 @@ public sealed class ControlResponse
     public string? Key { get; set; }
     public StatusDto? Status { get; set; }
     public FilesOfferDto? FilesOffer { get; set; }
+    public DragEventDto? DragEvent { get; set; }
+}
+
+/// <summary>
+/// Trascinamento di file fra i PC, dall'agent all'icona:
+///  • Probe: pulsante premuto contro il bordo; l'icona mette sotto il cursore una finestrella invisibile e, se Esplora
+///    risorse ci passa sopra dei file, ne manda i percorsi con dragFiles.
+///  • Source: un altro PC trascina dei file qui; l'icona mette sotto il cursore la finestrella da cui far partire il
+///    trascinamento (con <see cref="Offer"/>) e risponde dragReady.
+///  • End: finita la prova o annullato il trascinamento: via le finestrelle.
+/// </summary>
+public sealed class DragEventDto
+{
+    public long Seq { get; set; }
+    /// <summary>None | Probe | Source | End</summary>
+    public string Kind { get; set; } = "None";
+    public FilesOfferDto? Offer { get; set; }
 }
 
 public sealed class StatusDto

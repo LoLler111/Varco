@@ -260,6 +260,7 @@ internal static class Installer
         Run("netsh.exe", $"advfirewall firewall delete rule name=\"{FirewallRule}\"", check: false);
         using (var run = Registry.LocalMachine.OpenSubKey(RunKey, writable: true)) run?.DeleteValue("Varco", throwOnMissingValue: false);
         Registry.LocalMachine.DeleteSubKeyTree(UninstallKey, throwOnMissingSubKey: false);
+        ServiceMain.RestoreSasPolicy();
         try { File.Delete(StartMenuShortcut); } catch { }
         try { Directory.Delete(ConfigStore.DefaultDirectory, recursive: true); } catch { }
 

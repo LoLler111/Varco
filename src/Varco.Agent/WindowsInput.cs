@@ -12,8 +12,9 @@ namespace Varco.Agent;
 ///
 /// Gli hook low-level e SendInput funzionano solo sul desktop a cui è agganciato il thread.
 /// Per controllare anche schermata di blocco, UAC e Ctrl+Alt+Canc (desktop "Winlogon") l'agent gira come SYSTEM
-/// nella sessione dell'utente e un watcher, ogni 250 ms, controlla quale desktop riceve l'input: se cambia,
-/// il thread di input viene ricreato e agganciato al nuovo desktop.
+/// nella sessione dell'utente e un watcher, ogni 100 ms, controlla quale desktop riceve l'input: se cambia,
+/// il thread di input viene ricreato e agganciato al nuovo desktop. Se un'iniezione fallisce (il desktop è appena
+/// cambiato) il controllo parte subito, senza aspettare il giro successivo.
 /// </summary>
 internal sealed class WindowsInput : IInputPlatform, IDisposable
 {
@@ -26,7 +27,11 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     private InputThread? _thread;
     private volatile IReadOnlyList<Rect> _monitors = [];
     private int _ticks;
+    private int _watching;
     private bool _disposed;
+
+    private const int WatchIntervalMs = 100;
+    private const int ERROR_ACCESS_DENIED = 5;
     private volatile bool _controlling;
     private InputCoordinator? _coordinator;
 
@@ -52,13 +57,22 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     {
         _controlling = mode == InputMode.Controlling;
         if (_controlling) _thread?.BringKeyboardHookToFront();
+        _thread?.SetCursorHidden(_controlling); // vedi CursorHider
     }
+
+    /// <summary>
+    /// Trascinamento di file passato a un altro PC: quello partito qui (in Esplora risorse) va annullato senza lasciar
+    /// cadere niente. Prima Esc, che annulla il trascinamento; poi il rilascio del pulsante, che per Windows è ancora
+    /// premuto (il rilascio vero va all'altro PC). Il rilascio cade sulla finestra che nasconde il cursore, non su
+    /// quella che c'è al centro dello schermo.
+    /// </summary>
+    public void CancelLocalDrag() => _thread?.CancelLocalDrag();
 
     public WindowsInput()
     {
         RefreshMonitors();
         EnsureThread();
-        _watcher = new Timer(_ => Watch(), null, 250, 250);
+        _watcher = new Timer(_ => Watch(), null, WatchIntervalMs, WatchIntervalMs);
     }
 
     // ───────────── IInputPlatform ─────────────
@@ -71,9 +85,17 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
 
     public IReadOnlyList<Rect> GetMonitors() => _monitors;
 
-    public (int X, int Y) GetCursorPos() => Native.GetCursorPos(out var p) ? (p.X, p.Y) : (0, 0);
+    public (int X, int Y) GetCursorPos()
+    {
+        if (Native.GetCursorPos(out var p)) return (p.X, p.Y);
+        InjectionFailed("GetCursorPos");
+        return (0, 0);
+    }
 
-    public void SetCursorPos(int x, int y) => Native.SetCursorPos(x, y);
+    public void SetCursorPos(int x, int y)
+    {
+        if (!Native.SetCursorPos(x, y)) InjectionFailed("SetCursorPos");
+    }
 
     public void InjectMoveTo(int x, int y)
     {
@@ -114,8 +136,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             type = INPUT_KEYBOARD,
             U = new InputUnion { ki = new KEYBDINPUT { wVk = scan != 0 ? (ushort)0 : vk, wScan = scan, dwFlags = f, dwExtraInfo = Marker } },
         };
-        if (SendInput(1, [input], Marshal.SizeOf<INPUT>()) == 0)
-            Log.Debug($"SendInput tastiera fallito: {Marshal.GetLastWin32Error()}");
+        if (SendInput(1, [input], Marshal.SizeOf<INPUT>()) == 0) InjectionFailed("SendInput tastiera");
     }
 
     /// <summary>Tasti di blocco: VK, scancode e se va iniettato come "esteso" (Bloc Num sì, come nell'esempio di Microsoft).</summary>
@@ -156,19 +177,46 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         }
         if (inputs.Count == 0) return;
         Log.Info($"Tasti di blocco: {now} → {wanted}");
-        if (SendInput((uint)inputs.Count, [.. inputs], Marshal.SizeOf<INPUT>()) == 0)
-            Log.Debug($"SendInput tasti di blocco fallito: {Marshal.GetLastWin32Error()}");
+        if (SendInput((uint)inputs.Count, [.. inputs], Marshal.SizeOf<INPUT>()) == 0) InjectionFailed("SendInput tasti di blocco");
     }
 
-    private static void SendMouse(int dx, int dy, uint data, uint flags)
+    /// <summary>Ctrl+Alt+Canc: lo esegue il servizio (SendSAS funziona solo da un servizio), vedi Varco.Service.SecureAttention.</summary>
+    public void SendSecureAttention()
+    {
+        try
+        {
+            if (EventWaitHandle.TryOpenExisting(Varco.Core.Control.ControlProtocol.SasEventName, out var ev))
+                using (ev) ev.Set();
+            else
+                Log.Warn("Ctrl+Alt+Canc non disponibile: il servizio Varco non è attivo (agent avviato a mano?)");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Ctrl+Alt+Canc non inviato: {ex.Message}");
+        }
+    }
+
+    private void SendMouse(int dx, int dy, uint data, uint flags)
     {
         var input = new INPUT
         {
             type = INPUT_MOUSE,
             U = new InputUnion { mi = new MOUSEINPUT { dx = dx, dy = dy, mouseData = data, dwFlags = flags, dwExtraInfo = Marker } },
         };
-        if (SendInput(1, [input], Marshal.SizeOf<INPUT>()) == 0)
-            Log.Debug($"SendInput mouse fallito: {Marshal.GetLastWin32Error()}");
+        if (SendInput(1, [input], Marshal.SizeOf<INPUT>()) == 0) InjectionFailed("SendInput mouse");
+    }
+
+    /// <summary>
+    /// SendInput, GetCursorPos e SetCursorPos rispondono "accesso negato" quando il thread non è più sul desktop di input:
+    /// è appena comparsa (o sparita) la schermata di blocco o una richiesta UAC. Controllo subito il desktop invece di
+    /// aspettare il watcher, così si perde al massimo questo evento.
+    /// </summary>
+    private void InjectionFailed(string what)
+    {
+        var error = Marshal.GetLastWin32Error();
+        Log.Debug($"{what} fallito: {error}");
+        if (error == ERROR_ACCESS_DENIED && !_disposed)
+            try { _watcher?.Change(0, WatchIntervalMs); } catch (ObjectDisposedException) { }
     }
 
     // ───────────── gestione desktop / thread ─────────────
@@ -176,12 +224,18 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     private void Watch()
     {
         if (_disposed) return;
+        // I giri del timer possono sovrapporsi (e InjectionFailed lo fa partire subito): uno alla volta.
+        if (Interlocked.Exchange(ref _watching, 1) == 1) return;
         try
         {
-            if (++_ticks % 4 == 0)
+            if (++_ticks % (1000 / WatchIntervalMs) == 0)
             {
                 RefreshMonitors();
-                if (_controlling) _thread?.BringKeyboardHookToFront();
+                if (_controlling)
+                {
+                    _thread?.BringKeyboardHookToFront();
+                    _thread?.SetCursorHidden(true); // di nuovo in primo piano, se un'altra finestra le è passata sopra
+                }
             }
             var current = InputDesktopName();
             var t = _thread;
@@ -195,6 +249,10 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         {
             Log.Error("Watcher desktop", ex);
         }
+        finally
+        {
+            Volatile.Write(ref _watching, 0);
+        }
     }
 
     private void EnsureThread(bool restart = false)
@@ -203,8 +261,9 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         {
             if (_disposed) return;
             if (_thread is { IsAlive: true } && !restart) return;
+            var replacing = _thread is not null;
             _thread?.Stop();
-            _thread = new InputThread(this);
+            _thread = new InputThread(this, replacing);
             _thread.Start();
         }
     }
@@ -268,15 +327,17 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         private readonly AutoResetEvent _workReady = new(false);
         private readonly HookProc _mouseProc;
         private readonly HookProc _keyProc;
+        private readonly bool _replacing;
         private uint _threadId;
         private volatile bool _alive = true;
 
         public string? DesktopName { get; private set; }
         public bool IsAlive => _alive && _thread.IsAlive && _injector.IsAlive;
 
-        public InputThread(WindowsInput owner)
+        public InputThread(WindowsInput owner, bool replacing)
         {
             _owner = owner;
+            _replacing = replacing;
             _mouseProc = MouseHook;
             _keyProc = KeyHook;
             _thread = new Thread(Run) { IsBackground = true, Name = "Varco hook", Priority = ThreadPriority.Highest };
@@ -293,6 +354,19 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         public void Wake() => _workReady.Set();
 
         private const int WM_REHOOK_KEYBOARD = WM_APP + 1;
+        private const int WM_HIDE_CURSOR = WM_APP + 2; // wParam: 1 nascondi, 0 mostra
+        private const int WM_CANCEL_DRAG = WM_APP + 3;
+        private CursorHider? _hider;
+
+        public void SetCursorHidden(bool hidden)
+        {
+            if (_threadId != 0) PostThreadMessage(_threadId, WM_HIDE_CURSOR, hidden ? 1 : 0, IntPtr.Zero);
+        }
+
+        public void CancelLocalDrag()
+        {
+            if (_threadId != 0) PostThreadMessage(_threadId, WM_CANCEL_DRAG, IntPtr.Zero, IntPtr.Zero);
+        }
 
         /// <summary>Reinstalla l'hook di tastiera (sul suo thread), che torna così il primo a ricevere i tasti.</summary>
         public void BringKeyboardHookToFront()
@@ -357,14 +431,46 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 if (mouseHook == IntPtr.Zero || keyHook == IntPtr.Zero)
                     Log.Error($"Installazione hook fallita ({Marshal.GetLastWin32Error()})");
 
+                try { _hider = new CursorHider(); }
+                catch (Exception ex) { Log.Warn($"Finestra per nascondere il cursore non creata: {ex.Message}"); }
+
                 PeekMessage(out _, IntPtr.Zero, 0, 0, 0); // crea la coda messaggi
                 _threadId = GetCurrentThreadId();
                 _ready.Set();
                 Log.Info($"Thread di input attivo sul desktop \"{DesktopName ?? "corrente"}\"");
+                // Da qui SetCursorPos agisce sul nuovo desktop: il coordinatore rimette a posto il cursore.
+                if (_replacing)
+                    try { _owner.Coordinator?.OnInputDesktopChanged(); }
+                    catch (Exception ex) { Log.Error("Cambio desktop", ex); }
+                if (_owner._controlling) _hider?.Show(); // dopo il riparcheggio: la finestra va dove sta il cursore
 
                 // Solo messaggi: gli hook vengono chiamati da qui dentro. Niente lavoro lungo su questo thread.
                 while (_alive && GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
                 {
+                    if (msg.hwnd != IntPtr.Zero)
+                    {
+                        DispatchMessage(ref msg); // messaggi della finestra che nasconde il cursore
+                        continue;
+                    }
+                    if (msg.message == WM_HIDE_CURSOR)
+                    {
+                        if (msg.wParam != 0 && _owner._controlling) _hider?.Show();
+                        else if (msg.wParam == 0) _hider?.Hide();
+                        continue;
+                    }
+                    if (msg.message == WM_CANCEL_DRAG)
+                    {
+                        if (_owner._controlling) _hider?.Show();
+                        // Le iniezioni mai da questo thread (vedi sopra): le fa il thread di iniezione.
+                        _owner.Post(() =>
+                        {
+                            _owner.InjectKey(0x1B, 0x01, KeyFlags.None);
+                            _owner.InjectKey(0x1B, 0x01, KeyFlags.Up);
+                            _owner.InjectButton(MouseButton.Left, false);
+                            Log.Info("Trascinamento passato all'altro PC: annullato qui");
+                        });
+                        continue;
+                    }
                     if (msg.message != WM_REHOOK_KEYBOARD) continue;
                     // Prima il nuovo (finisce in cima alla catena), poi via il vecchio: nessun istante senza hook.
                     var fresh = SetWindowsHookEx(WH_KEYBOARD_LL, _keyProc, hMod, 0);
@@ -381,6 +487,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             {
                 _alive = false;
                 _ready.Set();
+                _hider?.Dispose();
                 if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
                 if (keyHook != IntPtr.Zero) UnhookWindowsHookEx(keyHook);
                 if (desk != IntPtr.Zero) CloseDesktop(desk);

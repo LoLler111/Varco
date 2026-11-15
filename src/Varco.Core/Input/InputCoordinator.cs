@@ -24,9 +24,34 @@ public interface IInputPlatform
     LockKeys? GetLockKeys() => null;
     /// <summary>Porta Bloc Maiusc/Num/Scorr allo stato indicato, premendo solo i tasti che sono diversi.</summary>
     void SetLockKeys(LockKeys state) { }
+    /// <summary>Esegue Ctrl+Alt+Canc su questo PC (chiesto dal PC che lo comanda).</summary>
+    void SendSecureAttention() { }
+    /// <summary>Annulla il trascinamento partito su questo PC (è passato a un altro PC), senza lasciar cadere niente.</summary>
+    void CancelLocalDrag() { }
 }
 
 public enum InputMode { Local, Controlling, Controlled }
+
+/// <summary>
+/// Trascinamento di file da un PC all'altro (implementato dall'host, con l'aiuto dell'icona che gira con l'utente).
+/// I metodi vengono chiamati con il lock del coordinatore, anche dal thread degli hook: non devono bloccare.
+/// </summary>
+public interface IFileDrag
+{
+    /// <summary>Si possono trascinare file verso quel PC (versione, appunti condivisi attivi su tutti e due)?</summary>
+    bool CanDragTo(Guid target);
+    /// <summary>
+    /// Pulsante sinistro premuto contro il bordo verso <paramref name="target"/>: scopri se si stanno trascinando dei file.
+    /// La risposta arriva con <see cref="InputCoordinator.OnDragProbeResult"/>.
+    /// </summary>
+    void Probe(Guid target);
+    /// <summary>Fine della prova (pulsante rilasciato o trascinamento passato all'altro PC).</summary>
+    void EndProbe();
+    /// <summary>Lato target: parte un trascinamento dal PC che comanda. Quando è pronto si chiama <see cref="InputCoordinator.OnDragSourceReady"/>.</summary>
+    void Incoming(Guid from, byte[] offer);
+    /// <summary>Lato target: trascinamento annullato (pulsante rilasciato prima di partire, controllo passato altrove).</summary>
+    void CancelIncoming();
+}
 
 /// <summary>
 /// Macchina a stati dell'input:
@@ -38,6 +63,7 @@ public enum InputMode { Local, Controlling, Controlled }
 public sealed class InputCoordinator
 {
     private const ushort VK_F12 = 0x7B;
+    private const ushort VK_END = 0x23;
     private static readonly ushort[] CtrlKeys = [0x11, 0xA2, 0xA3];
     private static readonly ushort[] AltKeys = [0x12, 0xA4, 0xA5];
 
@@ -58,6 +84,8 @@ public sealed class InputCoordinator
     private int _localButtons;
     private readonly HashSet<ushort> _localDownKeys = new();
     private readonly HashSet<ushort> _remoteDownKeys = new();
+    /// <summary>Tasti usati come scorciatoia (Ctrl+Alt+Fine): il rilascio non va inviato a nessuno.</summary>
+    private readonly HashSet<ushort> _swallowUp = new();
     // Movimenti raggruppati: un mouse da 1000 Hz farebbe 1000 pacchetti al secondo, che sul Wi-Fi arrivano a raffiche.
     private int _pendDx, _pendDy;
     private long _lastMoveSent = long.MinValue / 2;
@@ -126,6 +154,23 @@ public sealed class InputCoordinator
 
     public event Action<InputMode, Guid?>? ModeChanged;
 
+    /// <summary>Trascinamento di file fra i PC; null = non disponibile.</summary>
+    public IFileDrag? FileDrag { get; set; }
+
+    // Trascinamento, lato di chi trascina: PC su cui si sta provando, risultato pronto, prova già fallita con questo clic.
+    private Guid? _dragProbing;
+    private (Guid Target, byte[] Offer)? _dragReady;
+    private bool _dragProbeDone;
+    // Lato target: in attesa che l'icona prepari il trascinamento (i movimenti si accumulano), e trascinamento in corso.
+    private bool _dragHold;
+    private long _dragHoldSince;
+    private int _heldDx, _heldDy;
+    private bool _dragActive;
+    /// <summary>Il trascinamento in corso è stato interrotto da un cambio di modalità: vedi <see cref="ReleaseInjected"/>.</summary>
+    private bool _dragInterrupted;
+    private const int DragHoldMaxMs = 3000;
+    private const int LeftBit = 1 << (int)MouseButton.Left;
+
     private void SetMode(InputMode mode, Guid peer)
     {
         _mode = mode;
@@ -133,6 +178,12 @@ public sealed class InputCoordinator
         _homing = null;
         _pendDx = _pendDy = 0; // spostamenti e rotella non inviati: appartenevano al target precedente
         _pendWheelV = _pendWheelH = 0;
+        if (_dragHold || _dragActive)
+        {
+            _dragInterrupted = _dragActive;
+            _dragHold = _dragActive = false;
+            try { FileDrag?.CancelIncoming(); } catch (Exception ex) { Log.Error("Trascinamento", ex); }
+        }
         var p = mode == InputMode.Local ? (Guid?)null : peer;
         Log.Info($"Modalità input: {mode}{(p is null ? "" : $" ({p})")}");
         try { ModeChanged?.Invoke(mode, p); } catch { }
@@ -160,7 +211,8 @@ public sealed class InputCoordinator
                             return true;
                         }
                     }
-                    if (_localButtons != 0) return false; // niente passaggio durante un trascinamento
+                    // Durante un trascinamento non si passa, a meno che si stiano trascinando dei file (vedi DragAcross).
+                    if (_localButtons != 0) return _localButtons == LeftBit && DragAcross(x, y);
                     var monitors = _platform.GetMonitors();
                     if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) return false;
                     // Chi c'è oltre il bordo proprio in questo punto? (disposizione 2D: dipende anche dall'altezza)
@@ -192,6 +244,7 @@ public sealed class InputCoordinator
             {
                 case InputMode.Local:
                     if (down) _localButtons |= 1 << (int)button; else _localButtons &= ~(1 << (int)button);
+                    if (button == MouseButton.Left && !down) EndDragProbe();
                     return false;
                 case InputMode.Controlling:
                     FlushPending(); // il clic deve arrivare dopo lo spostamento (e lo scorrimento) che lo precede
@@ -244,6 +297,18 @@ public sealed class InputCoordinator
                         if (!up) return true;
                         _localDownKeys.Remove(vk);
                         return false;
+                    }
+                    if (up && _swallowUp.Remove(vk)) return true;
+                    // Ctrl+Alt+Fine = Ctrl+Alt+Canc sul PC comandato (come in Desktop remoto): quello vero agisce sempre qui.
+                    if (!up && vk == VK_END && CtrlKeys.Any(_remoteDownKeys.Contains) && AltKeys.Any(_remoteDownKeys.Contains))
+                    {
+                        if (_swallowUp.Add(vk)) // le ripetizioni del tasto tenuto premuto non contano
+                        {
+                            Log.Info("Ctrl+Alt+Fine: chiedo Ctrl+Alt+Canc al PC comandato");
+                            FlushPending();
+                            _net.Send(_peer, new SecureAttention());
+                        }
+                        return true;
                     }
                     // Via di fuga: Ctrl+Alt+F12 riporta sempre il controllo qui.
                     if (!up && vk == VK_F12 && CtrlKeys.Any(_remoteDownKeys.Contains) && AltKeys.Any(_remoteDownKeys.Contains))
@@ -317,10 +382,36 @@ public sealed class InputCoordinator
                     ReturnLocal(_returnX, _returnY);
                     break;
 
-                case MouseMove m when IsControlledBy(from): InjectMove(m.Dx, m.Dy); break;
+                case MouseMove m when IsControlledBy(from):
+                    if (_dragHold && !DragHoldExpired())
+                    {
+                        _heldDx += m.Dx;
+                        _heldDy += m.Dy;
+                        break;
+                    }
+                    InjectMove(m.Dx, m.Dy);
+                    break;
                 case MouseButtonMsg b when IsControlledBy(from):
+                    if (b.Button == MouseButton.Left && !b.Down && _dragHold)
+                    {
+                        // Rilasciato prima che il trascinamento partisse: qui il pulsante non è mai stato premuto.
+                        Log.Info("Pulsante rilasciato prima dell'inizio del trascinamento: annullato");
+                        _dragHold = false;
+                        FileDrag?.CancelIncoming();
+                        FlushHeldMoves();
+                        break;
+                    }
+                    if (b.Button == MouseButton.Left && !b.Down) _dragActive = false; // il rilascio lascia cadere i file
                     if (b.Down) _injectedButtons |= 1 << (int)b.Button; else _injectedButtons &= ~(1 << (int)b.Button);
                     PostInput(() => _platform.InjectButton(b.Button, b.Down));
+                    break;
+                case DragFiles d when IsControlledBy(from):
+                    if (FileDrag is null || _injectedButtons != 0) break;
+                    Log.Info("Il PC che comanda sta trascinando dei file qui");
+                    _dragHold = true;
+                    _dragHoldSince = Stopwatch.GetTimestamp();
+                    _heldDx = _heldDy = 0;
+                    FileDrag.Incoming(from, d.Offer);
                     break;
                 case MouseWheel w when IsControlledBy(from): InjectWheel(w.Delta, w.Horizontal); break;
                 case KeyMsg k when IsControlledBy(from):
@@ -329,6 +420,11 @@ public sealed class InputCoordinator
                     break;
                 case LockKeysMsg l when IsControlledBy(from):
                     PostInput(() => _platform.SetLockKeys(l.State));
+                    break;
+                case SecureAttention when IsControlledBy(from):
+                    // Solo dal PC che ci sta comandando: non basta essere collegati per aprire la schermata di sicurezza.
+                    Log.Info("Il PC che comanda chiede Ctrl+Alt+Canc");
+                    _platform.SendSecureAttention();
                     break;
             }
         }
@@ -410,6 +506,22 @@ public sealed class InputCoordinator
         });
     }
 
+    /// <summary>
+    /// Il desktop che riceve l'input è cambiato (schermata di blocco, richiesta UAC, Ctrl+Alt+Canc e ritorno).
+    /// Va chiamato dal thread degli hook appena agganciato al nuovo desktop.
+    ///
+    /// Gli hook valgono per un solo desktop: nel breve intervallo in cui passano al nuovo, il mouse fisico muove davvero
+    /// il cursore locale. Se si stava comandando un altro PC il cursore non è più nel punto di parcheggio e ogni movimento
+    /// successivo verrebbe misurato da lì: il cursore sull'altro PC andrebbe alla deriva da solo. Lo riparcheggio.
+    /// Sul PC comandato invece rileggo la posizione vera del cursore alla prossima iniezione.
+    /// </summary>
+    public void OnInputDesktopChanged()
+    {
+        lock (_gate)
+            if (_mode == InputMode.Controlling) _platform.SetCursorPos(_parkX, _parkY);
+        _platform.Post(() => _vValid = false);
+    }
+
     private void StartControlling(Guid target, Edge edge, float ratio, int x, int y, IReadOnlyList<Rect> monitors)
     {
         _returnX = x;
@@ -417,6 +529,7 @@ public sealed class InputCoordinator
         (_parkX, _parkY) = monitors.Count > 0 ? monitors[0].Center : (x, y);
         _platform.SetCursorPos(_parkX, _parkY); // siamo già sul thread di input
         _remoteDownKeys.Clear();
+        _swallowUp.Clear();
         SetMode(InputMode.Controlling, target);
         _net.Send(target, new Enter(ScreenGeometry.Opposite(edge), ratio));
         SendLockKeys(target);
@@ -544,16 +657,113 @@ public sealed class InputCoordinator
         ReleaseInjected();
     }
 
+    // ═══════════════════════ trascinamento di file ═══════════════════════
+
+    /// <summary>
+    /// Lato di chi trascina, con il solo pulsante sinistro premuto. Al primo contatto col bordo verso un PC collegato si
+    /// chiede all'host se si stanno trascinando dei file (lo scopre l'icona con una finestrella invisibile sotto il
+    /// cursore, su cui Esplora risorse "passa" i file). Se sì, al movimento successivo contro il bordo si passa all'altro
+    /// PC come sempre, ma con il pulsante ancora premuto e i file al seguito; qui il trascinamento viene annullato.
+    /// </summary>
+    private bool DragAcross(int x, int y)
+    {
+        if (FileDrag is not { } drag) return false;
+        var monitors = _platform.GetMonitors();
+        if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) return false;
+        if (_layout.Cross(_net.SelfId, edge, ScreenGeometry.Ratio(monitors, edge, x, y)) is not { } hop
+            || hop.Id == _net.SelfId || !_net.IsConnected(hop.Id)) return false;
+
+        if (_dragReady is { } ready && ready.Target == hop.Id)
+        {
+            Log.Info("Trascinamento di file verso l'altro PC");
+            _dragReady = null;
+            _dragProbing = null;
+            _localButtons = 0; // il rilascio del pulsante ora va all'altro PC
+            StartControlling(hop.Id, edge, hop.Ratio, x, y, monitors);
+            _net.Send(hop.Id, new DragFiles(ready.Offer));
+            _platform.CancelLocalDrag();
+            drag.EndProbe();
+            return true;
+        }
+        if (_dragProbing is null && _dragReady is null && !_dragProbeDone && drag.CanDragTo(hop.Id))
+        {
+            _dragProbing = hop.Id;
+            drag.Probe(hop.Id);
+        }
+        return false;
+    }
+
+    /// <summary>Risposta alla prova: i file trascinati (offerta serializzata), oppure null se non si trascinano file.</summary>
+    public void OnDragProbeResult(Guid target, byte[]? offer)
+    {
+        lock (_gate)
+        {
+            if (_dragProbing != target || _mode != InputMode.Local || _localButtons != LeftBit) return;
+            _dragProbing = null;
+            if (offer is null) _dragProbeDone = true; // non si riprova fino al prossimo clic
+            else _dragReady = (target, offer);
+        }
+    }
+
+    private void EndDragProbe()
+    {
+        var had = _dragProbing is not null || _dragReady is not null;
+        _dragProbing = null;
+        _dragReady = null;
+        _dragProbeDone = false;
+        if (had) FileDrag?.EndProbe();
+    }
+
+    /// <summary>
+    /// Lato target: l'icona ha messo sotto il cursore la finestrella da cui parte il trascinamento. Premo il pulsante
+    /// (cade su di lei e il trascinamento parte), poi applico i movimenti arrivati nel frattempo.
+    /// </summary>
+    public void OnDragSourceReady()
+    {
+        lock (_gate)
+        {
+            if (!_dragHold || _mode != InputMode.Controlled) return;
+            _dragHold = false;
+            _dragActive = true;
+            _injectedButtons |= LeftBit;
+            PostInput(() => _platform.InjectButton(MouseButton.Left, true));
+            FlushHeldMoves();
+        }
+    }
+
+    private bool DragHoldExpired()
+    {
+        if (ElapsedMs(_dragHoldSince) < DragHoldMaxMs) return false;
+        Log.Warn("Il trascinamento dei file non è partito in tempo: annullato");
+        _dragHold = false;
+        FileDrag?.CancelIncoming();
+        FlushHeldMoves();
+        return true;
+    }
+
+    private void FlushHeldMoves()
+    {
+        if (_heldDx == 0 && _heldDy == 0) return;
+        var (dx, dy) = (_heldDx, _heldDy);
+        _heldDx = _heldDy = 0;
+        InjectMove(dx, dy);
+    }
+
     private void ReleaseInjected()
     {
         var keys = _injectedKeys.Values.ToList();
         var buttons = _injectedButtons;
+        // Trascinamento di file in corso: SetMode l'ha già fatto annullare all'icona. Il pulsante si rilascia un attimo
+        // dopo, così i file non cadono dove si trova il cursore in quel momento.
+        var dragging = _dragInterrupted;
+        _dragInterrupted = false;
         _injectedKeys.Clear();
         _injectedButtons = 0;
         _latchedEdge = null;
         PostInput(() =>
         {
             _vValid = false;
+            if (dragging && (buttons & LeftBit) != 0) Thread.Sleep(200);
             foreach (var k in keys) _platform.InjectKey(k.Vk, k.Scan, k.Flags | KeyFlags.Up);
             for (int b = 0; b <= (int)MouseButton.X2; b++)
                 if ((buttons & (1 << b)) != 0) _platform.InjectButton((MouseButton)b, false);

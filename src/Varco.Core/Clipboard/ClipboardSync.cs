@@ -74,7 +74,18 @@ public sealed class ClipboardSync
         _platform.LocalChanged += c => _ = Task.Run(() => OnLocalChanged(c));
     }
 
-    private PeerCaps MyCaps => !_enabled() ? PeerCaps.None : _files is null ? PeerCaps.Clipboard : PeerCaps.Clipboard | PeerCaps.Files;
+    private PeerCaps MyCaps => !_enabled() ? PeerCaps.None
+        : _files is null ? PeerCaps.Clipboard
+        : PeerCaps.Clipboard | PeerCaps.Files | (DragSupported ? PeerCaps.DragFiles : PeerCaps.None);
+
+    /// <summary>Questo PC sa ricevere file trascinati da un altro (l'agent con mouse e tastiera veri).</summary>
+    public bool DragSupported { get; set; }
+
+    /// <summary>Funzioni annunciate dal PC indicato (nessuna se non ha mandato <see cref="Capabilities"/>).</summary>
+    public PeerCaps CapsOf(Guid id)
+    {
+        lock (_gate) return _caps.GetValueOrDefault(id);
+    }
 
     public void OnPeerConnected(Guid id) => _net.Send(id, new Capabilities(MyCaps));
 

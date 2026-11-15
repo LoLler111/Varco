@@ -307,6 +307,19 @@ public class CoordinatorTests
         public void InjectButton(MouseButton b, bool down) => Log.Add($"btn {b} {down}");
         public void InjectWheel(int d, bool h) => Log.Add($"wheel {d}");
         public void InjectKey(ushort vk, ushort scan, KeyFlags f) => Log.Add($"key {vk:X2} {f}");
+        public void SendSecureAttention() => Log.Add("sas");
+        public void CancelLocalDrag() => Log.Add("cancel drag");
+    }
+
+    private sealed class FakeDrag : IFileDrag
+    {
+        public readonly List<string> Log = [];
+        public bool Can = true;
+        public bool CanDragTo(Guid target) => Can;
+        public void Probe(Guid target) => Log.Add("probe");
+        public void EndProbe() => Log.Add("end");
+        public void Incoming(Guid from, byte[] offer) => Log.Add($"incoming {offer.Length}");
+        public void CancelIncoming() => Log.Add("cancel");
     }
 
     private static (InputCoordinator c, FakeNet net, FakePlatform p, Guid other) Setup(bool otherOnRight = true, int moveIntervalMs = 4)
@@ -335,6 +348,34 @@ public class CoordinatorTests
         Assert.Contains(net.Sent, s => s.Msg is MouseMove { Dx: 5, Dy: -2 });
         Assert.True(c.OnLocalKey(0x41, 0x1E, KeyFlags.None));
         Assert.Contains(net.Sent, s => s.Msg is KeyMsg { Vk: 0x41 });
+    }
+
+    [Fact]
+    public void Desktop_switch_while_controlling_reparks_the_cursor()
+    {
+        var (c, net, p, _) = Setup(moveIntervalMs: 0);
+        c.OnLocalMouseMove(1919, 540);
+        Assert.Equal(InputMode.Controlling, c.Mode);
+
+        // Durante il passaggio a Winlogon (UAC) gli hook non c'erano: il mouse fisico ha spostato davvero il cursore.
+        p.Cursor = (1200, 700);
+        c.OnInputDesktopChanged();
+        Assert.Equal((960, 540), p.Cursor);
+
+        net.Sent.Clear();
+        c.OnLocalMouseMove(963, 541);
+        Assert.Contains(net.Sent, s => s.Msg is MouseMove { Dx: 3, Dy: 1 });
+    }
+
+    [Fact]
+    public void Desktop_switch_on_the_target_rereads_the_real_cursor()
+    {
+        var (c, _, p, other) = Setup();
+        c.OnMessage(other, new Enter(Edge.Left, 0.5f), () => []);
+        p.Cursor = (500, 400); // il cursore vero non è dove pensava l'agent (iniezioni perse durante il cambio di desktop)
+        c.OnInputDesktopChanged();
+        c.OnMessage(other, new MouseMove(10, 0), () => []);
+        Assert.Equal((510, 400), p.Cursor);
     }
 
     [Fact]
@@ -614,6 +655,121 @@ public class CoordinatorTests
         Assert.Contains(net.Sent, s => s.To == other && s.Msg is Leave);
         // i rilasci di Ctrl/Alt non arrivano al PC locale, che non li aveva visti premere
         Assert.True(c.OnLocalKey(0xA2, 0x1D, KeyFlags.Up));
+    }
+
+    [Fact]
+    public void Ctrl_Alt_End_sends_ctrl_alt_del_once_and_only_the_controller_can_ask()
+    {
+        var (c, net, _, other) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnLocalKey(0xA2, 0x1D, KeyFlags.None);
+        c.OnLocalKey(0xA4, 0x38, KeyFlags.None);
+        net.Sent.Clear();
+        Assert.True(c.OnLocalKey(0x23, 0x4F, KeyFlags.Extended));
+        Assert.True(c.OnLocalKey(0x23, 0x4F, KeyFlags.Extended)); // ripetizione del tasto tenuto premuto
+        Assert.True(c.OnLocalKey(0x23, 0x4F, KeyFlags.Extended | KeyFlags.Up));
+        Assert.Single(net.Sent, s => s.To == other && s.Msg is SecureAttention);
+        Assert.DoesNotContain(net.Sent, s => s.Msg is KeyMsg { Vk: 0x23 }); // Fine non arriva all'altro PC
+        Assert.Equal(InputMode.Controlling, c.Mode);
+
+        // Lato target: eseguito solo se arriva dal PC che sta comandando.
+        var (t, _, p, controller) = Setup();
+        t.OnMessage(controller, new SecureAttention(), () => []);
+        Assert.DoesNotContain("sas", p.Log);
+        t.OnMessage(controller, new Enter(Edge.Left, 0.5f), () => []);
+        t.OnMessage(Guid.NewGuid(), new SecureAttention(), () => []);
+        Assert.DoesNotContain("sas", p.Log);
+        t.OnMessage(controller, new SecureAttention(), () => []);
+        Assert.Contains("sas", p.Log);
+    }
+
+    [Fact]
+    public void Dragging_files_against_the_edge_carries_them_to_the_other_pc()
+    {
+        var (c, net, p, other) = Setup(moveIntervalMs: 0);
+        var drag = new FakeDrag();
+        c.FileDrag = drag;
+        Assert.False(c.OnLocalButton(MouseButton.Left, true));
+        Assert.False(c.OnLocalMouseMove(1919, 540)); // contro il bordo col pulsante premuto: si prova, non si passa ancora
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Equal(["probe"], drag.Log);
+        Assert.False(c.OnLocalMouseMove(1919, 540)); // una prova sola
+        Assert.Equal(["probe"], drag.Log);
+
+        c.OnDragProbeResult(other, [1, 2, 3]);
+        Assert.True(c.OnLocalMouseMove(1919, 541));
+        Assert.Equal(InputMode.Controlling, c.Mode);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is Enter);
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is DragFiles { Offer.Length: 3 });
+        Assert.Contains("cancel drag", p.Log); // qui il trascinamento viene annullato
+        Assert.Contains("end", drag.Log);
+
+        // Il rilascio del pulsante ora va all'altro PC (lascia cadere i file lì).
+        net.Sent.Clear();
+        Assert.True(c.OnLocalButton(MouseButton.Left, false));
+        Assert.Contains(net.Sent, s => s.Msg is MouseButtonMsg { Button: MouseButton.Left, Down: false });
+    }
+
+    [Fact]
+    public void Dragging_something_that_is_not_files_stays_on_this_pc()
+    {
+        var (c, _, _, other) = Setup();
+        var drag = new FakeDrag();
+        c.FileDrag = drag;
+        c.OnLocalButton(MouseButton.Left, true);
+        c.OnLocalMouseMove(1919, 540);
+        c.OnDragProbeResult(other, null);
+        Assert.False(c.OnLocalMouseMove(1919, 540));
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.Equal(["probe"], drag.Log); // niente nuova prova finché il pulsante resta premuto
+
+        c.OnLocalButton(MouseButton.Left, false);
+        c.OnLocalButton(MouseButton.Left, true);
+        c.OnLocalMouseMove(1919, 540);
+        Assert.Equal(["probe", "probe"], drag.Log); // nuovo clic, nuova prova
+
+        drag.Can = false; // l'altro PC non sa ricevere file trascinati
+        c.OnLocalButton(MouseButton.Left, false);
+        c.OnLocalButton(MouseButton.Left, true);
+        c.OnLocalMouseMove(1919, 540);
+        Assert.Equal(2, drag.Log.Count(l => l == "probe"));
+    }
+
+    [Fact]
+    public void Target_starts_the_drag_only_when_the_tray_is_ready_and_keeps_the_moves()
+    {
+        var (c, net, p, controller) = Setup();
+        var drag = new FakeDrag();
+        c.FileDrag = drag;
+        c.OnMessage(controller, new Enter(Edge.Left, 0.5f), () => []);
+        c.OnMessage(controller, new DragFiles([9, 9]), () => []);
+        Assert.Contains("incoming 2", drag.Log);
+        p.Log.Clear();
+        c.OnMessage(controller, new MouseMove(5, 0), () => []);
+        c.OnMessage(controller, new MouseMove(5, 0), () => []);
+        Assert.Empty(p.Log); // la finestrella dell'icona non è ancora sotto il cursore: niente movimenti
+
+        c.OnDragSourceReady();
+        Assert.Equal("btn Left True", p.Log[0]); // prima il pulsante, sopra la finestrella
+        Assert.Contains(p.Log, l => l.StartsWith("move "));
+        c.OnMessage(controller, new MouseButtonMsg(MouseButton.Left, false), () => []);
+        Assert.Equal("btn Left False", p.Log[^1]); // il rilascio lascia cadere i file
+        Assert.DoesNotContain("cancel", drag.Log);
+    }
+
+    [Fact]
+    public void Target_release_before_the_drag_starts_cancels_without_clicking()
+    {
+        var (c, _, p, controller) = Setup();
+        var drag = new FakeDrag();
+        c.FileDrag = drag;
+        c.OnMessage(controller, new Enter(Edge.Left, 0.5f), () => []);
+        c.OnMessage(controller, new DragFiles([1]), () => []);
+        p.Log.Clear();
+        c.OnMessage(controller, new MouseButtonMsg(MouseButton.Left, false), () => []);
+        Assert.Contains("cancel", drag.Log);
+        c.OnDragSourceReady(); // arriva tardi: ignorato
+        Assert.DoesNotContain(p.Log, l => l.StartsWith("btn"));
     }
 
     /// <summary>Questo PC 1920×1080; l'altro (1366×768) a destra, più in basso di 156 pixel.</summary>

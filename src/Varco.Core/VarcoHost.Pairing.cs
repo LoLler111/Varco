@@ -47,6 +47,9 @@ public sealed partial class VarcoHost
             _seen[id] = new Seen(name, ep, Environment.TickCount64, sameGroup);
         }
         if (isNew) Log.Info($"Visto {name} su {ep.Address}{(sameGroup ? " (già collegato)" : "")}");
+        // Un PC del gruppo rimasto spento durante un cambio di chiave: i suoi beacon firmati con la chiave vecchia qui non
+        // valgono, ma l'annuncio pubblico basta a sapere dove si trova. Il nodo si collega con la chiave vecchia e gli passa la nuova.
+        if (!sameGroup && RetiredKeysFor(id).Count > 0) _node?.AddPeerHint(id, name, ep);
     }
 
     private PairOffer MyOffer() =>
@@ -443,6 +446,7 @@ public sealed partial class VarcoHost
         _store.Update(c =>
         {
             c.GroupKey = GroupKey.Format(key);
+            ResetGroupHistory(c);
             c.KnownPeers.Clear();
             c.KnownPeers.Add(new KnownPeer { Id = peer.Id, Name = peer.Name, LastAddresses = [ep.ToString()], LastSeenUtc = DateTime.UtcNow });
         }, immediate: true);
@@ -467,16 +471,8 @@ public sealed partial class VarcoHost
             kp.LastAddresses.Remove(ep.ToString());
             kp.LastAddresses.Insert(0, ep.ToString());
             kp.LastSeenUtc = DateTime.UtcNow;
+            c.RemovedPeers.Remove(peer.Id); // rimosso in passato e ora ricollegato
         }, immediate: true);
         _node?.AddPeerHint(peer.Id, peer.Name, ep);
-    }
-
-    /// <summary>Dimentica un PC (es. dismesso): esce dai PC noti e dalla disposizione.</summary>
-    private async Task ForgetAsync(Guid id)
-    {
-        _store.Update(c => c.KnownPeers.RemoveAll(p => p.Id == id), immediate: true);
-        var remaining = Layout.Current.Entries.Where(e => e.Id != id).OrderBy(e => e.Y).ThenBy(e => e.X).Select(e => (e.Id, e.Name)).ToList();
-        Layout.SetRow(remaining);
-        await RestartNetworkAsync().ConfigureAwait(false);
     }
 }

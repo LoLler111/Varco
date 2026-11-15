@@ -15,11 +15,29 @@ public sealed class KnownPeer
     public DateTime LastSeenUtc { get; set; }
 }
 
+/// <summary>
+/// Chiave di gruppo sostituita (dopo aver rimosso un PC). La si accetta ancora, ma solo dai PC del gruppo che erano
+/// spenti al momento del cambio (<see cref="Pending"/>): appena si collegano ricevono la chiave nuova.
+/// Il PC rimosso non è in elenco, quindi con la chiave vecchia non entra più.
+/// </summary>
+public sealed class RetiredGroupKey
+{
+    public string Key { get; set; } = "";
+    public List<Guid> Pending { get; set; } = [];
+    public DateTime RetiredUtc { get; set; }
+}
+
 public sealed class VarcoConfig
 {
     public Guid MachineId { get; set; } = Guid.NewGuid();
     public string MachineName { get; set; } = Environment.MachineName;
     public string? GroupKey { get; set; }
+    /// <summary>Quando è stata creata la chiave attuale con un cambio (serve a scegliere fra due cambi fatti in parallelo).</summary>
+    public DateTime GroupKeyChangedUtc { get; set; }
+    /// <summary>Chiavi sostituite, ancora valide per i PC che non hanno ricevuto quella nuova (la più recente per prima).</summary>
+    public List<RetiredGroupKey> RetiredKeys { get; set; } = [];
+    /// <summary>PC rimossi dal gruppo: chi riceve la chiave nuova li toglie anche dai propri PC noti.</summary>
+    public List<Guid> RemovedPeers { get; set; } = [];
 
     public int TcpPort { get; set; } = 47800;
     public int DiscoveryPort { get; set; } = 47801;

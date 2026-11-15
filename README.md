@@ -15,9 +15,13 @@ Ci riesce dopo uno standby, un cambio di rete, un riavvio o un cavo staccato, se
 5. Se i PC sulla scrivania sono in ordine diverso, trascina gli schermi nella finestra di Varco.
 
 - **Ctrl+Alt+F12** riporta sempre mouse e tastiera sul PC fisico (via di fuga).
+- **Ctrl+Alt+Fine** (come in Desktop remoto) fa Ctrl+Alt+Canc sul PC che stai comandando: schermata di sicurezza, accesso dalla schermata di blocco, Gestione attività. Il Ctrl+Alt+Canc vero agisce sempre sul PC fisico. Serve Varco 0.6 sul PC comandato.
+- Mentre comandi un altro PC, il cursore del tuo **sparisce**: resta fermo al centro dello schermo, invisibile, e ricompare quando torni.
 - Se tocchi il mouse o la tastiera del PC comandato, il controllo passa a quel PC.
 - **Bloc Maiusc, Bloc Num e Bloc Scorr** seguono la tastiera che stai usando: quando passi a un altro PC, lui prende lo stato del tuo, e se li premi mentre lo comandi cambiano su tutti e due. Così le spie della tastiera sono sempre giuste. Serve Varco 0.5.2 su tutti e due i PC.
 - **Appunti condivisi:** copi su un PC e incolli su un altro. Passano testo, testo formattato (HTML, RTF), immagini e **file e cartelle** copiati in Esplora risorse. I file passano solo quando li incolli, con la barra di avanzamento di Windows, e non hanno limiti di dimensione. Restano fuori i contenuti che i gestori di password segnano come privati. Testo e immagini richiedono Varco 0.5 su tutti e due i PC, i file Varco 0.5.1. Si può spegnere tutto in *Avanzate*.
+- **Trascinare file da uno schermo all'altro:** prendi file o cartelle in Esplora risorse e portali oltre il bordo, verso l'altro PC, tenendo premuto il pulsante. Il cursore passa con i file al seguito; rilasciali sopra una cartella o sul desktop e Windows li copia, con la sua barra di avanzamento. I file sul PC di partenza non si toccano mai (è sempre una copia). Serve Varco 0.6 su tutti e due i PC e gli appunti condivisi attivi.
+- **Rimuovi** (per un PC spento) cambia la chiave del gruppo: il PC rimosso, se si riaccende, non si ricollega più. Gli altri PC ricevono la chiave nuova, anche quelli spenti in quel momento, appena si riaccendono. Un PC rimosso si ricollega con **Collega**, come la prima volta.
 - **Aggiornamenti automatici:** Varco controlla le [release su GitHub](https://github.com/LoLler111/Varco/releases) qualche minuto dopo l'avvio e poi ogni 6 ore circa. Le nuove versioni si installano da sole, senza conferme, appena nessun PC sta usando mouse e tastiera di un altro. Se non vuoi aspettare, **Aggiorna subito** installa la nuova versione su tutti i PC collegati. Si possono spegnere, o forzare un controllo, in *Avanzate*.
 - Per aggiornare a mano: apri il nuovo `Varco.exe` e premi **Aggiorna**. I PC già collegati restano collegati.
 - Per disinstallare: *Impostazioni → App → App installate → Varco → Disinstalla*.
@@ -36,6 +40,14 @@ Ogni PC nasce con una propria chiave di gruppo. Quando ne colleghi due:
 2. Entrambi mostrano lo stesso codice di 6 cifre, derivato da tutto lo scambio.
 3. Il PC che riceve la richiesta deve premere **Accetta**: nessuno può controllare il tuo PC senza il tuo consenso.
 4. Sul canale cifrato, il gruppo con più PC passa la sua chiave all'altro. Da quel momento si riconnettono da soli per sempre.
+
+### Rimuovere un PC
+Chi conosce la chiave di gruppo fa parte del gruppo, quindi «Rimuovi» cambia la chiave:
+1. Il PC dove premi «Rimuovi» crea una chiave nuova e la manda (`GroupKeyChange`, sul canale cifrato) ai PC collegati, che la adottano e dimenticano il PC rimosso.
+2. La chiave vecchia resta valida, ma solo per i PC del gruppo che in quel momento erano spenti (elenco *in attesa*, in `RetiredKeys` nella configurazione). Quando uno di loro si riaccende si presenta con la chiave vecchia: l'altro lato la accetta perché il suo ID è in elenco, gli passa quella nuova e lo toglie dall'elenco.
+3. Il PC rimosso non è in nessun elenco: con la chiave vecchia non passa più.
+
+Un PC del gruppo che non si accende per più di un anno va ricollegato con «Collega». Le versioni precedenti alla 0.6 ignorano il messaggio: restano collegate con la chiave vecchia (sono *in attesa*) e ricevono quella nuova appena si aggiornano. Se due PC scollegati fra loro rimuovono ciascuno un PC diverso, quando si ritrovano vince il cambio più recente.
 
 ## Architettura
 
@@ -96,6 +108,7 @@ Varco.exe --uninstall  → disinstallazione
 
 ### File
 Funzionano come in Desktop remoto: si copiano in Esplora risorse su un PC e si incollano con Ctrl+V su un altro.
+Oppure si trascinano oltre il bordo dello schermo (vedi sotto).
 
 1. Il PC A legge `CF_HDROP` e crea un'**offerta**: nomi relativi, dimensioni e date, anche delle cartelle (al massimo 20.000 elementi). L'offerta viaggia negli appunti come formato `Varco.Files`. Nessun dato viene ancora trasferito.
 2. L'agent del PC B passa l'offerta all'icona con un'attesa lunga sulla pipe di controllo (`filesOffer`). L'icona mette negli appunti un `IDataObject` con `FileGroupDescriptorW`, `FileContents` e `Preferred DropEffect` = copia. Deve farlo l'icona perché Esplora risorse, che gira come utente, deve poter chiamare l'oggetto COM, e l'agent è SYSTEM. L'oggetto vive su un thread STA dedicato.
@@ -108,6 +121,16 @@ Dettagli:
 - **Sicurezza:** chi riceve può chiedere solo gli elementi di un'offerta esistente, mai un percorso. I nomi in arrivo vengono rifiutati se sono assoluti, contengono `..` o caratteri vietati. Se un file cambia durante la copia, l'incolla fallisce invece di lasciare un file troncato.
 - **Compatibilità:** i PC con i file annunciano la capacità `Files`. A un PC con la 0.5 arrivano solo gli eventuali altri formati, così non si svuotano i suoi appunti.
 - Chiudendo l'icona gli appunti si svuotano. Non si usa mai `OleFlushClipboard`, che scaricherebbe tutti i file.
+- **Percorsi lunghi:** nei file virtuali il percorso relativo può avere al massimo 259 caratteri (limite di `FILEDESCRIPTORW`). Per gli elementi più profondi si accorciano i nomi delle cartelle che li contengono, a partire dalla più lunga: *Documentazione tecnica del progetto* diventa *Documentazio~3F2A* (inizio del nome e impronta del percorso completo). Tutto ciò che stava in quella cartella resta insieme, nella cartella accorciata. Resta fuori solo ciò che non ci sta nemmeno così.
+
+#### Trascinamento fra schermi
+Esplora risorse gira come utente e non può trascinare file su una finestra di SYSTEM, né riceverli da lei: per questo le due finestre che servono sono dell'icona.
+1. Sul PC A il pulsante sinistro è premuto e il cursore spinge contro il bordo verso B. L'agent chiede all'icona (attesa lunga `dragEvents`) di mettere sotto il cursore una finestrella invisibile. Se Esplora risorse sta trascinando dei file, ci passa sopra e l'icona ne legge i percorsi (`dragFiles`). La finestrella non accetta mai il rilascio.
+2. L'agent di A crea un'offerta, come per una copia, e al movimento successivo contro il bordo passa a B come sempre, ma con il pulsante ancora premuto. Manda a B `DragFiles` con l'offerta. Su A il trascinamento viene annullato con Esc, poi il pulsante viene rilasciato sopra la finestra che nasconde il cursore: lì non cade niente.
+3. L'agent di B passa l'offerta alla sua icona, che mette sotto il cursore un'altra finestrella invisibile e risponde `dragReady`. Nel frattempo i movimenti in arrivo da A si accumulano. Poi l'agent preme il pulsante sopra la finestrella, da cui parte un trascinamento OLE con gli stessi file virtuali dell'incolla, e applica i movimenti accumulati.
+4. Il rilascio del pulsante su A arriva a B e lascia cadere i file: Esplora risorse li copia chiedendo i dati ad A, come per l'incolla.
+
+Se il pulsante viene rilasciato prima che il trascinamento parta, o se la connessione cade, il trascinamento si annulla. L'offerta compressa deve stare sotto i 900 KB (decine di migliaia di nomi): oltre, si usa copia e incolla. I PC con la 0.6 annunciano la capacità `DragFiles`; verso i PC più vecchi non si prova nemmeno.
 
 ### Sicurezza
 - **Chiave di gruppo:** 160 bit casuali, creata automaticamente e mai mostrata all'utente.
@@ -123,6 +146,12 @@ Dettagli:
 3. L'icona nella tray si accorge che l'agent è più nuovo, avvia la nuova versione e si chiude. Compare la notifica *Varco aggiornato*.
 
 I PC del gruppo si aggiornano ognuno per conto proprio, quindi per qualche ora possono avere versioni diverse: il protocollo di rete deve restare compatibile tra una versione e la successiva.
+
+### Ctrl+Alt+Canc
+Il vero Ctrl+Alt+Canc non arriva mai agli hook: Windows lo gestisce da sé, sul PC fisico. Mentre si comanda un altro PC, **Ctrl+Alt+Fine** manda `SecureAttention`, che il PC comandato accetta solo da chi lo sta comandando. Un programma può simulare Ctrl+Alt+Canc solo con `SendSAS`, e solo se è un servizio e il criterio *SoftwareSASGeneration* lo permette. Per questo lo esegue il servizio Varco: l'agent segnala l'evento `Global\Varco.SAS`, accessibile solo a SYSTEM. All'avvio il servizio aggiunge al criterio il permesso per i servizi (valore 1, lasciando il resto com'era) e la disinstallazione lo toglie. Se un criterio di gruppo aziendale lo vieta, Windows lo rimette e Ctrl+Alt+Fine non fa nulla.
+
+### Cursore nascosto
+Mentre si comanda un altro PC, sul PC fisico il cursore resta parcheggiato al centro. Per nasconderlo l'agent mette sotto il cursore una finestrella trasparente (alfa 1/255), sempre in primo piano, che risponde a `WM_SETCURSOR` con «nessun cursore». I cursori di sistema non si toccano: se Varco si chiudesse male, la finestra sparirebbe e il cursore tornerebbe visibile da solo. La finestra vive sul thread degli hook, quindi segue anche la schermata di blocco e l'UAC, e ogni secondo torna in primo piano.
 
 ### Porte
 - TCP 47800: connessioni
@@ -172,8 +201,6 @@ dotnet run --project tools/Varco.IconGen
 ```
 
 ## Limiti noti e prossimi passi
-- **Ctrl+Alt+Canc** non si può intercettare: agisce sempre sul PC fisico. Inviarlo al remoto richiede `SendSAS` con la policy *SoftwareSASGeneration*.
-- Sul PC che comanda il cursore resta parcheggiato al centro dello schermo. Si potrebbe nasconderlo.
-- File: si incollano con Ctrl+V (o *Incolla*) in Esplora risorse e nei programmi che accettano file virtuali. Il trascinamento diretto da uno schermo all'altro non è ancora supportato. Nomi con percorso relativo oltre 259 caratteri vengono saltati.
+- **Ctrl+Alt+Canc** vero agisce sempre sul PC fisico: sul PC comandato si usa Ctrl+Alt+Fine.
+- File: si incollano o si trascinano in Esplora risorse e nei programmi che accettano file virtuali. Il trascinamento va da Esplora risorse (o da un programma che trascina file veri) verso l'altro PC; non passano testo o immagini trascinati da un browser.
 - Wake-on-LAN.
-- Un PC rimosso con *Rimuovi* conosce ancora la vecchia chiave: se torna acceso, si ricollega. Per escluderlo del tutto, su quel PC usa *Avanzate → Scollega questo PC da tutti* oppure disinstalla Varco.

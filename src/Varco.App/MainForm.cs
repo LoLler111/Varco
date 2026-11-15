@@ -309,7 +309,9 @@ internal sealed class MainForm : Form
         {
             right = Ui.Link("Rimuovi", async () =>
             {
-                if (MessageBox.Show(this, $"Rimuovere {p.Name} dai tuoi PC?\nPotrai ricollegarlo in qualsiasi momento.", "Varco",
+                if (MessageBox.Show(this, $"Rimuovere {p.Name} dai tuoi PC?\n\nVarco cambia la chiave del gruppo: anche se {p.Name} si riaccende, " +
+                        "non si ricollega più da solo. Gli altri PC ricevono la chiave nuova, anche quelli spenti, appena si riaccendono.\n\n" +
+                        $"Potrai ricollegare {p.Name} in qualsiasi momento con «Collega».", "Varco",
                         MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
                     await Send(new ControlRequest { Cmd = "forget", Id = id });
             });

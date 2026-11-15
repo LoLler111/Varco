@@ -23,6 +23,7 @@ internal sealed class TrayContext : ApplicationContext
     private MainForm? _main;
     private readonly VirtualFileClipboard _files;
     private readonly CopiedFilesWatcher _copied;
+    private readonly FileDragBridge _drag;
     private PairRequestForm? _request;
     private StatusDto? _last;
     private bool _polling;
@@ -48,6 +49,7 @@ internal sealed class TrayContext : ApplicationContext
         _timer.Start();
         _files = new VirtualFileClipboard();
         _copied = new CopiedFilesWatcher();
+        _drag = new FileDragBridge(_files);
         _ = Poll();
     }
 
@@ -216,6 +218,7 @@ internal sealed class TrayContext : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _drag.Dispose();
         _files.Dispose();
         _copied.Dispose();
         _icon.Visible = false;

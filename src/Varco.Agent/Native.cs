@@ -121,6 +121,8 @@ internal static class Native
     public static extern bool PeekMessage(out MSG msg, IntPtr hWnd, uint min, uint max, uint remove);
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool PostThreadMessage(uint threadId, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern IntPtr DispatchMessage(ref MSG msg);
     [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]

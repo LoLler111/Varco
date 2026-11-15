@@ -21,6 +21,9 @@ public enum MsgType : byte
     Leave = 22,
     TakeOver = 23,
     LockKeys = 24,
+    SecureAttention = 25,
+    GroupKeyChange = 26,
+    DragFiles = 27,
     ClipChunk = 30,
 }
 
@@ -61,7 +64,7 @@ public enum LockKeys : byte { None = 0, Caps = 1, Num = 2, Scroll = 4 }
 
 /// <summary>Funzioni che un PC sa gestire, annunciate appena connesso (le versioni senza questo messaggio non ne hanno).</summary>
 [Flags]
-public enum PeerCaps : uint { None = 0, Clipboard = 1, Files = 2 }
+public enum PeerCaps : uint { None = 0, Clipboard = 1, Files = 2, DragFiles = 4 }
 
 public abstract record Message;
 
@@ -119,6 +122,27 @@ public sealed record TakeOver() : Message;
 /// </summary>
 public sealed record LockKeysMsg(LockKeys State) : Message;
 
+/// <summary>
+/// Controller → target: "premi Ctrl+Alt+Canc". Il vero Ctrl+Alt+Canc non si può intercettare (agisce sempre sul PC
+/// fisico): sul PC che comanda si usa Ctrl+Alt+Fine, come in Desktop remoto, e il target lo esegue con SendSAS.
+/// Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record SecureAttention() : Message;
+
+/// <summary>
+/// Nuova chiave di gruppo (dopo aver rimosso un PC). Mandata a tutti i PC collegati, e a chi si collega più tardi con
+/// una chiave sostituita. <paramref name="ChangedUtcTicks"/> decide fra due cambi fatti in parallelo; <paramref name="Removed"/>
+/// sono i PC rimossi, che chi riceve toglie dai propri PC noti. Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record GroupKeyChange(byte[] Key, long ChangedUtcTicks, Guid[] Removed) : Message;
+
+/// <summary>
+/// Controller → target, subito dopo <see cref="Enter"/>: l'utente sta trascinando dei file da questo PC e ha appena
+/// attraversato il bordo con il pulsante premuto. <paramref name="Offer"/> è un <see cref="Files.FileOffer"/> serializzato:
+/// il target fa partire il trascinamento lì, e i dati arrivano quando l'utente rilascia sopra una cartella.
+/// </summary>
+public sealed record DragFiles(byte[] Offer) : Message;
+
 public static class MessageCodec
 {
     private static readonly JsonSerializerOptions Json = new();
@@ -151,6 +175,13 @@ public static class MessageCodec
             case Leave: w.Write((byte)MsgType.Leave); break;
             case TakeOver: w.Write((byte)MsgType.TakeOver); break;
             case LockKeysMsg l: w.Write((byte)MsgType.LockKeys); w.Write((byte)l.State); break;
+            case SecureAttention: w.Write((byte)MsgType.SecureAttention); break;
+            case GroupKeyChange g:
+                w.Write((byte)MsgType.GroupKeyChange); w.Write((byte)g.Key.Length); w.Write(g.Key); w.Write(g.ChangedUtcTicks);
+                w.Write((ushort)g.Removed.Length);
+                foreach (var id in g.Removed) w.Write(id.ToByteArray());
+                break;
+            case DragFiles d: w.Write((byte)MsgType.DragFiles); w.Write(d.Offer.Length); w.Write(d.Offer); break;
             default: throw new ArgumentException($"Messaggio non supportato: {m.GetType().Name}");
         }
         w.Flush();
@@ -180,8 +211,27 @@ public static class MessageCodec
             MsgType.Leave => new Leave(),
             MsgType.TakeOver => new TakeOver(),
             MsgType.LockKeys => new LockKeysMsg((LockKeys)r.ReadByte()),
+            MsgType.SecureAttention => new SecureAttention(),
+            MsgType.GroupKeyChange => ReadGroupKeyChange(r),
+            MsgType.DragFiles => new DragFiles(ReadBlob(r)),
             _ => null,
         };
+    }
+
+    private static GroupKeyChange ReadGroupKeyChange(BinaryReader r)
+    {
+        var key = r.ReadBytes(r.ReadByte());
+        var ticks = r.ReadInt64();
+        var removed = new Guid[r.ReadUInt16()];
+        for (var i = 0; i < removed.Length; i++) removed[i] = new Guid(r.ReadBytes(16));
+        return new GroupKeyChange(key, ticks, removed);
+    }
+
+    private static byte[] ReadBlob(BinaryReader r)
+    {
+        var len = r.ReadInt32();
+        if (len < 0 || len > r.BaseStream.Length - r.BaseStream.Position) throw new InvalidDataException("Messaggio troncato");
+        return r.ReadBytes(len);
     }
 
     private static ClipChunk ReadClipChunk(BinaryReader r)

@@ -19,25 +19,11 @@ public sealed partial class VarcoHost
 
     private void OnFilesOffered(Guid from, FileOffer offer)
     {
-        var name = Layout.Current.Entries.FirstOrDefault(e => e.Id == from)?.Name ?? _store.Current.KnownPeers.FirstOrDefault(p => p.Id == from)?.Name ?? "";
         TaskCompletionSource fire;
         lock (_filesGate)
         {
-            _lastOffer = new FilesOfferDto
-            {
-                Seq = ++_offerSeq,
-                PeerId = from,
-                PeerName = name,
-                OfferId = offer.Id,
-                Entries = offer.Entries.Select(e => new FileEntryDto
-                {
-                    Path = e.Path,
-                    Size = e.Size,
-                    Attributes = (uint)e.Attributes,
-                    LastWriteUtc = e.LastWriteUtc,
-                    IsDirectory = e.IsDirectory,
-                }).ToList(),
-            };
+            _lastOffer = ToDto(from, offer);
+            _lastOffer.Seq = ++_offerSeq;
             fire = _offerChanged;
             _offerChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
