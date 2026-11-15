@@ -16,7 +16,7 @@ Ci riesce dopo uno standby, un cambio di rete, un riavvio o un cavo staccato, se
 
 - **Ctrl+Alt+F12** riporta sempre mouse e tastiera sul PC fisico (via di fuga).
 - **Ctrl+Alt+Fine** (come in Desktop remoto) fa Ctrl+Alt+Canc sul PC che stai comandando: schermata di sicurezza, accesso dalla schermata di blocco, Gestione attività. Il Ctrl+Alt+Canc vero agisce sempre sul PC fisico. Serve Varco 0.6 sul PC comandato.
-- Mentre comandi un altro PC, il cursore del tuo **sparisce**: resta fermo al centro dello schermo, invisibile, e ricompare quando torni.
+- Mentre comandi un altro PC, il cursore del tuo **sparisce**: resta fermo al centro dello schermo, invisibile, e ricompare quando torni. Quando torni (o passi a un terzo PC) sparisce anche il cursore rimasto sul PC che comandavi, e ricompare appena qualcuno muove il suo mouse o torni a comandarlo. Per questo secondo caso serve Varco 0.6.1 sul PC comandato.
 - Se tocchi il mouse o la tastiera del PC comandato, il controllo passa a quel PC.
 - **Bloc Maiusc, Bloc Num e Bloc Scorr** seguono la tastiera che stai usando: quando passi a un altro PC, lui prende lo stato del tuo, e se li premi mentre lo comandi cambiano su tutti e due. Così le spie della tastiera sono sempre giuste. Serve Varco 0.5.2 su tutti e due i PC.
 - **Appunti condivisi:** copi su un PC e incolli su un altro. Passano testo, testo formattato (HTML, RTF), immagini e **file e cartelle** copiati in Esplora risorse. I file passano solo quando li incolli, con la barra di avanzamento di Windows, e non hanno limiti di dimensione. Restano fuori i contenuti che i gestori di password segnano come privati. Testo e immagini richiedono Varco 0.5 su tutti e due i PC, i file Varco 0.5.1. Si può spegnere tutto in *Avanzate*.
@@ -152,6 +152,10 @@ Il vero Ctrl+Alt+Canc non arriva mai agli hook: Windows lo gestisce da sé, sul 
 
 ### Cursore nascosto
 Mentre si comanda un altro PC, sul PC fisico il cursore resta parcheggiato al centro. Per nasconderlo l'agent mette sotto il cursore una finestrella trasparente (alfa 1/255), sempre in primo piano, che risponde a `WM_SETCURSOR` con «nessun cursore». I cursori di sistema non si toccano: se Varco si chiudesse male, la finestra sparirebbe e il cursore tornerebbe visibile da solo. La finestra vive sul thread degli hook, quindi segue anche la schermata di blocco e l'UAC, e ogni secondo torna in primo piano.
+
+La stessa finestra nasconde il cursore del PC comandato quando il controllo passa altrove (`Leave`, o il PC che comandava si scollega): lì il cursore resterebbe fermo sul bordo. Si mette dopo le iniezioni ancora in coda, dove il cursore si è fermato davvero, e sparisce al primo evento del mouse fisico di quel PC, prima di un eventuale clic, oppure quando un altro PC torna a comandarlo.
+
+Se l'agent si chiude o va in crash, Windows distrugge le sue finestre e il cursore ricompare da solo (e il servizio riavvia l'agent). Se si bloccasse senza chiudersi, Windows dopo poco smette di aspettare i suoi hook e il mouse torna a muoversi: basta spostarlo di qualche centimetro per uscire dalla finestrella (64 pixel) e rivedere il cursore.
 
 ### Porte
 - TCP 47800: connessioni

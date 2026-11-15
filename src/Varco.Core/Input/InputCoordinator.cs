@@ -28,6 +28,11 @@ public interface IInputPlatform
     void SendSecureAttention() { }
     /// <summary>Annulla il trascinamento partito su questo PC (è passato a un altro PC), senza lasciar cadere niente.</summary>
     void CancelLocalDrag() { }
+    /// <summary>
+    /// Il PC che ci comandava è passato altrove: il cursore qui resta fermo dove l'ha lasciato. Lo nasconde finché
+    /// qualcuno non muove il mouse di questo PC (o un altro PC torna a comandarlo).
+    /// </summary>
+    void HideIdleCursor() { }
 }
 
 public enum InputMode { Local, Controlling, Controlled }
@@ -356,6 +361,7 @@ public sealed class InputCoordinator
                 Log.Info("Il PC che mi controllava si è disconnesso: rilascio i tasti");
                 SetMode(InputMode.Local, Guid.Empty);
                 ReleaseInjected();
+                HideIdleCursor();
             }
         }
     }
@@ -376,6 +382,7 @@ public sealed class InputCoordinator
                 case Leave when _mode == InputMode.Controlled && _peer == from:
                     SetMode(InputMode.Local, Guid.Empty);
                     ReleaseInjected();
+                    HideIdleCursor();
                     break;
                 case EdgeHit h when _mode == InputMode.Controlling && _peer == from: HandleEdgeHit(from, h); break;
                 case TakeOver when _mode == InputMode.Controlling && _peer == from:
@@ -747,6 +754,19 @@ public sealed class InputCoordinator
         var (dx, dy) = (_heldDx, _heldDy);
         _heldDx = _heldDy = 0;
         InjectMove(dx, dy);
+    }
+
+    /// <summary>
+    /// Dopo le iniezioni ancora in coda (il cursore deve essere arrivato dove resterà), e solo se nel frattempo nessuno
+    /// è tornato a comandare questo PC o l'ha usato fisicamente.
+    /// </summary>
+    private void HideIdleCursor()
+    {
+        PostInput(() =>
+        {
+            lock (_gate) if (_mode != InputMode.Local) return;
+            _platform.HideIdleCursor();
+        });
     }
 
     private void ReleaseInjected()

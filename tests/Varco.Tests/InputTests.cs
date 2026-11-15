@@ -309,6 +309,7 @@ public class CoordinatorTests
         public void InjectKey(ushort vk, ushort scan, KeyFlags f) => Log.Add($"key {vk:X2} {f}");
         public void SendSecureAttention() => Log.Add("sas");
         public void CancelLocalDrag() => Log.Add("cancel drag");
+        public void HideIdleCursor() => Log.Add("idle hidden");
     }
 
     private sealed class FakeDrag : IFileDrag
@@ -681,6 +682,29 @@ public class CoordinatorTests
         Assert.DoesNotContain("sas", p.Log);
         t.OnMessage(controller, new SecureAttention(), () => []);
         Assert.Contains("sas", p.Log);
+    }
+
+    [Fact]
+    public void Cursor_left_on_the_target_is_hidden_when_control_goes_elsewhere()
+    {
+        var (c, _, p, controller) = Setup();
+        c.OnMessage(controller, new Enter(Edge.Left, 0.5f), () => []);
+        c.OnMessage(controller, new MouseMove(10, 0), () => []);
+        c.OnMessage(controller, new Leave(), () => []);
+        Assert.Equal("idle hidden", p.Log[^1]); // dopo l'ultimo movimento: la finestra va dove il cursore è rimasto
+
+        // Il PC che comandava si scollega: stessa cosa.
+        p.Log.Clear();
+        c.OnMessage(controller, new Enter(Edge.Left, 0.5f), () => []);
+        c.OnPeerDisconnected(controller);
+        Assert.Contains("idle hidden", p.Log);
+
+        // Qualcuno usa questo PC mentre è comandato: il cursore serve, non si nasconde.
+        p.Log.Clear();
+        c.OnMessage(controller, new Enter(Edge.Left, 0.5f), () => []);
+        c.OnLocalMouseMove(500, 500);
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.DoesNotContain("idle hidden", p.Log);
     }
 
     [Fact]

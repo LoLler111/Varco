@@ -33,6 +33,9 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     private const int WatchIntervalMs = 100;
     private const int ERROR_ACCESS_DENIED = 5;
     private volatile bool _controlling;
+    /// <summary>Cursore nascosto perché questo PC era comandato e il controllo è passato altrove (vedi HideIdleCursor).</summary>
+    private volatile bool _idleHidden;
+    private bool CursorShouldHide => _controlling || _idleHidden;
     private InputCoordinator? _coordinator;
 
     public InputCoordinator? Coordinator
@@ -56,6 +59,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     private void OnModeChanged(InputMode mode, Guid? _)
     {
         _controlling = mode == InputMode.Controlling;
+        _idleHidden = false; // se serve, HideIdleCursor arriva subito dopo
         if (_controlling) _thread?.BringKeyboardHookToFront();
         _thread?.SetCursorHidden(_controlling); // vedi CursorHider
     }
@@ -67,6 +71,25 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     /// quella che c'è al centro dello schermo.
     /// </summary>
     public void CancelLocalDrag() => _thread?.CancelLocalDrag();
+
+    /// <summary>
+    /// Il PC che comandava questo è passato altrove: il cursore resta fermo dove l'ha lasciato, di solito sul bordo.
+    /// Lo nasconde con la stessa finestra di CursorHider, finché il mouse di questo PC non si muove (vedi MouseHook).
+    /// Chiamato dal thread di iniezione, dopo le iniezioni in coda: la finestra va dove il cursore è arrivato davvero.
+    /// </summary>
+    public void HideIdleCursor()
+    {
+        _idleHidden = true;
+        _thread?.SetCursorHidden(true);
+    }
+
+    /// <summary>Primo evento del mouse fisico con il cursore nascosto da HideIdleCursor: via la finestra, prima del clic.</summary>
+    private void OnPhysicalMouse()
+    {
+        if (!_idleHidden) return;
+        _idleHidden = false;
+        _thread?.SetCursorHidden(false);
+    }
 
     public WindowsInput()
     {
@@ -231,11 +254,8 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             if (++_ticks % (1000 / WatchIntervalMs) == 0)
             {
                 RefreshMonitors();
-                if (_controlling)
-                {
-                    _thread?.BringKeyboardHookToFront();
-                    _thread?.SetCursorHidden(true); // di nuovo in primo piano, se un'altra finestra le è passata sopra
-                }
+                if (_controlling) _thread?.BringKeyboardHookToFront();
+                if (CursorShouldHide) _thread?.SetCursorHidden(true); // di nuovo in primo piano, se un'altra finestra le è passata sopra
             }
             var current = InputDesktopName();
             var t = _thread;
@@ -442,7 +462,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 if (_replacing)
                     try { _owner.Coordinator?.OnInputDesktopChanged(); }
                     catch (Exception ex) { Log.Error("Cambio desktop", ex); }
-                if (_owner._controlling) _hider?.Show(); // dopo il riparcheggio: la finestra va dove sta il cursore
+                if (_owner.CursorShouldHide) _hider?.Show(); // dopo il riparcheggio: la finestra va dove sta il cursore
 
                 // Solo messaggi: gli hook vengono chiamati da qui dentro. Niente lavoro lungo su questo thread.
                 while (_alive && GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -454,7 +474,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                     }
                     if (msg.message == WM_HIDE_CURSOR)
                     {
-                        if (msg.wParam != 0 && _owner._controlling) _hider?.Show();
+                        if (msg.wParam != 0 && _owner.CursorShouldHide) _hider?.Show();
                         else if (msg.wParam == 0) _hider?.Hide();
                         continue;
                     }
@@ -503,6 +523,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                     var s = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                     if (s.dwExtraInfo != Marker)
                     {
+                        _owner.OnPhysicalMouse();
                         var swallow = (int)wParam switch
                         {
                             WM_MOUSEMOVE => c.OnLocalMouseMove(s.pt.X, s.pt.Y),
