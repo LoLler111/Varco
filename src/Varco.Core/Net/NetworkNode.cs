@@ -189,13 +189,85 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     }
 
     /// <summary>Scarica l'elemento <paramref name="index"/> di un'offerta di file del PC <paramref name="peer"/> (deve essere connesso).</summary>
-    public Task<FileTransfer.RemoteFile> OpenFileAsync(Guid peer, Guid offerId, int index, long offset, CancellationToken ct)
+    /// <remarks>
+    /// Prima prova a collegarsi direttamente. Se non ci riesce (il firewall dell'altro PC blocca le connessioni in ingresso,
+    /// anche se quella di mouse e tastiera l'ha aperta lui) gli chiede di collegarsi lui: vedi <see cref="FileDialBack"/>.
+    /// </remarks>
+    public async Task<FileTransfer.RemoteFile> OpenFileAsync(Guid peer, Guid offerId, int index, long offset, CancellationToken ct)
     {
         PeerConnection? c;
         lock (_gate) _conns.TryGetValue(peer, out c);
         if (c is null) throw new IOException("il PC che ha copiato i file non è collegato");
+        if (!c.FilesNeedDialBack)
+        {
+            var ep = new IPEndPoint(Normalize(c.RemoteEndPoint.Address), c.PeerListenPort);
+            try
+            {
+                if (TestFirewallOnPeers) throw new FileTransfer.PeerUnreachableException("impossibile raggiungere l'altro PC (test)");
+                var direct = await FileTransfer.ConnectAsync(ep, _opt.ConnectTimeoutMs, ct).ConfigureAwait(false);
+                return await FileTransfer.RequestAsync(direct, sendMagic: true, Me, peer, offerId, index, offset, _opt.HandshakeTimeoutMs, ct).ConfigureAwait(false);
+            }
+            catch (FileTransfer.PeerUnreachableException ex)
+            {
+                Log.Info($"File da {c.PeerName}: {ex.Message}, gli chiedo di collegarsi lui");
+                c.FilesNeedDialBack = true;
+            }
+        }
+        var back = await AwaitFileDialBackAsync(c, ct).ConfigureAwait(false);
+        return await FileTransfer.RequestAsync(back, sendMagic: false, Me, peer, offerId, index, offset, _opt.HandshakeTimeoutMs, ct).ConfigureAwait(false);
+    }
+
+    private readonly Dictionary<Guid, TaskCompletionSource<Stream>> _fileDialBacks = new();
+
+    /// <summary>Solo test: le connessioni dirette per i file verso gli altri PC "non passano", come col loro firewall.</summary>
+    internal bool TestFirewallOnPeers { get; set; }
+
+    /// <summary>Manda <see cref="FileDialBack"/> e aspetta che l'altro PC apra la connessione per i file verso di noi.</summary>
+    private async Task<Stream> AwaitFileDialBackAsync(PeerConnection c, CancellationToken ct)
+    {
+        var token = new Guid(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+        var arrived = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_gate) _fileDialBacks[token] = arrived;
+        try
+        {
+            c.Send(new FileDialBack(token));
+            using var t = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            t.CancelAfter(_opt.ConnectTimeoutMs + _opt.HandshakeTimeoutMs);
+            using (t.Token.Register(() => arrived.TrySetCanceled()))
+            {
+                try { return await arrived.Task.ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    c.FilesNeedDialBack = false; // la prossima volta si riprova anche la via diretta
+                    throw new IOException($"{c.PeerName} non è raggiungibile per i file né può collegarsi lui a questo PC: " +
+                                          "controlla che abbia la stessa versione di Varco e che il firewall non la blocchi");
+                }
+            }
+        }
+        finally
+        {
+            lock (_gate) _fileDialBacks.Remove(token);
+        }
+    }
+
+    /// <summary>Un PC che incolla i nostri file non riesce a collegarsi: ci colleghiamo noi a lui.</summary>
+    private void OnFileDialBack(PeerConnection c, Guid token)
+    {
         var ep = new IPEndPoint(Normalize(c.RemoteEndPoint.Address), c.PeerListenPort);
-        return FileTransfer.OpenAsync(ep, Me, peer, offerId, index, offset, _opt.ConnectTimeoutMs, _opt.HandshakeTimeoutMs, ct);
+        Log.Info($"{c.PeerName} non riesce a collegarsi per i file: mi collego io a {ep}");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await FileTransfer.DialBackAsync(ep, token, Me, c.PeerId, FileProvider, ThrottleMs, _opt.ConnectTimeoutMs,
+                    _opt.HandshakeTimeoutMs, _cts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or InvalidDataException
+                                           or HandshakeException or System.Security.Cryptography.CryptographicException)
+            {
+                Log.Info($"File per {c.PeerName} (richiamata) non inviato: {ex.Message}");
+            }
+        });
     }
 
     /// <summary>
@@ -288,6 +360,14 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
                 var remoteEp = (IPEndPoint)s.RemoteEndPoint!;
                 if (handler is null) { await stream.DisposeAsync().ConfigureAwait(false); return; }
                 await handler(stream, first, new IPEndPoint(Normalize(remoteEp.Address), remoteEp.Port)).ConfigureAwait(false);
+                return;
+            }
+            if (FileTransfer.TryReadDialBack(first, out var token))
+            {
+                // L'altro PC risponde alla nostra richiesta di richiamata: lo stream va a chi sta aspettando il file.
+                TaskCompletionSource<Stream>? waiting;
+                lock (_gate) _fileDialBacks.Remove(token, out waiting);
+                if (waiting is null || !waiting.TrySetResult(stream)) await stream.DisposeAsync().ConfigureAwait(false);
                 return;
             }
             if (FileTransfer.IsFileFrame(first))
@@ -526,7 +606,9 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
 
         conn.MessageReceived += (c, m) =>
         {
-            if (IsCurrent(c)) MessageReceived?.Invoke(c.PeerId, m);
+            if (!IsCurrent(c)) return;
+            if (m is FileDialBack fd) { if (FileProvider is not null) OnFileDialBack(c, fd.Token); return; }
+            MessageReceived?.Invoke(c.PeerId, m);
         };
         _ = conn.Closed.ContinueWith(t => OnConnectionClosed(conn, t.Result), TaskScheduler.Default);
 

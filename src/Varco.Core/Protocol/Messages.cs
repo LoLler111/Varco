@@ -11,6 +11,7 @@ public enum MsgType : byte
     Layout = 4,
     Capabilities = 5,
     InstallUpdate = 6,
+    FileDialBack = 7,
     MouseMove = 10,
     MouseButton = 11,
     MouseWheel = 12,
@@ -82,6 +83,13 @@ public sealed record Capabilities(PeerCaps Caps) : Message;
 public sealed record InstallUpdate(string Version) : Message;
 
 /// <summary>
+/// Chi incolla → chi ha copiato i file: "non riesco a collegarmi a te, collegati tu" (vedi <see cref="Files.FileTransfer"/>).
+/// Chi lo riceve apre una connessione per i file verso chi lo manda, presentandosi con <paramref name="Token"/>.
+/// Le versioni vecchie lo ignorano (e chi incolla, dopo poco, segnala che non è raggiungibile).
+/// </summary>
+public sealed record FileDialBack(Guid Token) : Message;
+
+/// <summary>
 /// Un pezzo degli appunti compressi (<paramref name="Total"/> byte in tutto), in ordine di <paramref name="Offset"/>.
 /// Viaggia in coda a bassa priorità: mouse e tastiera passano davanti.
 /// </summary>
@@ -129,6 +137,7 @@ public static class MessageCodec
                 break;
             case Capabilities c: w.Write((byte)MsgType.Capabilities); w.Write((uint)c.Caps); break;
             case InstallUpdate u: w.Write((byte)MsgType.InstallUpdate); w.Write(u.Version); break;
+            case FileDialBack f: w.Write((byte)MsgType.FileDialBack); w.Write(f.Token.ToByteArray()); break;
             case ClipChunk c:
                 w.Write((byte)MsgType.ClipChunk); w.Write(c.ClipId); w.Write(c.Total); w.Write(c.Offset);
                 w.Write(c.Data.Length); w.Write(c.Data);
@@ -160,6 +169,7 @@ public static class MessageCodec
             MsgType.Layout => new LayoutMsg(JsonSerializer.Deserialize<Layout>(r.ReadString(), Json) ?? new Layout()),
             MsgType.Capabilities => new Capabilities((PeerCaps)r.ReadUInt32()),
             MsgType.InstallUpdate => new InstallUpdate(r.ReadString()),
+            MsgType.FileDialBack => new FileDialBack(new Guid(r.ReadBytes(16))),
             MsgType.ClipChunk => ReadClipChunk(r),
             MsgType.MouseMove => new MouseMove(r.ReadInt32(), r.ReadInt32()),
             MsgType.MouseButton => new MouseButtonMsg((MouseButton)r.ReadByte(), r.ReadBoolean()),

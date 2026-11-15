@@ -137,6 +137,46 @@ public sealed class FileTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Files_from_a_pc_behind_a_firewall_arrive_with_the_dial_back()
+    {
+        var (a, b) = Pair();
+        var offers = new FileOffers(DirectFileAccess.Instance);
+        var path = MakeFile("dal-portatile.bin", 700_000, seed: 3);
+        var offer = offers.Create([path])!;
+        a.FileProvider = (peer, id, index, offset) => offers.Open(id, index, offset);
+        b.TestFirewallOnPeers = true; // B non riesce a collegarsi ad A: deve collegarsi A a B
+        await Connected(a, b);
+
+        for (var i = 0; i < 2; i++) // il secondo file va subito con la richiamata
+        {
+            await using var remote = await b.OpenFileAsync(a.Me.Id, offer.Id, 0, 100, CancellationToken.None);
+            var ms = new MemoryStream();
+            await remote.CopyToAsync(ms);
+            Assert.Equal(File.ReadAllBytes(path)[100..], ms.ToArray());
+        }
+        Assert.True(a.IsConnected(b.Me.Id) && b.IsConnected(a.Me.Id));
+    }
+
+    [Fact]
+    public async Task Dial_back_errors_reach_the_pc_that_pastes()
+    {
+        var (a, b) = Pair();
+        var offers = new FileOffers(DirectFileAccess.Instance);
+        a.FileProvider = (peer, id, index, offset) => offers.Open(id, index, offset);
+        b.TestFirewallOnPeers = true;
+        await Connected(a, b);
+        var ex = await Assert.ThrowsAsync<IOException>(() => b.OpenFileAsync(a.Me.Id, Guid.NewGuid(), 0, 0, CancellationToken.None));
+        Assert.Contains("non sono più disponibili", ex.Message);
+    }
+
+    [Fact]
+    public void Dial_back_message_roundtrips()
+    {
+        var token = Guid.NewGuid();
+        Assert.Equal(new FileDialBack(token), MessageCodec.Decode(MessageCodec.Encode(new FileDialBack(token))));
+    }
+
+    [Fact]
     public async Task Unknown_offer_or_disabled_sharing_gives_a_clear_error()
     {
         var (a, b) = Pair();

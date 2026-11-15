@@ -47,6 +47,12 @@ public sealed class PeerConnection : IAsyncDisposable
     public Guid PeerId { get; }
     public string PeerName { get; }
     public int PeerListenPort { get; }
+
+    /// <summary>
+    /// I file da questo PC li chiediamo con la richiamata: la connessione diretta verso di lui non è riuscita
+    /// (firewall), inutile riprovarla a ogni file. Vale finché dura questa connessione.
+    /// </summary>
+    internal bool FilesNeedDialBack { get; set; }
     public IPEndPoint RemoteEndPoint { get; }
     /// <summary>Id del PC che ha aperto la connessione (serve a risolvere connessioni doppie in modo deterministico).</summary>
     public Guid InitiatorId { get; }

@@ -20,10 +20,16 @@ public delegate (Stream? Data, long Length, string? Error) FileOpener(Guid peer,
 ///   server → client : 0 + dati … poi 1 (fine) oppure 2 + messaggio (errore a metà)
 ///
 /// Le versioni senza file (fino alla 0.5) non ricevono offerte, quindi non vengono mai contattate così.
+///
+/// Richiamata: se chi incolla non riesce a collegarsi (tipico: il portatile sul Wi-Fi "Pubblico" blocca le connessioni
+/// in ingresso, ma la connessione di mouse e tastiera l'ha aperta lui), chiede sulla connessione normale
+/// (<see cref="Protocol.FileDialBack"/>) che sia chi offre a collegarsi. Questo apre la TCP e manda "VRCD" 1 + token;
+/// da lì il protocollo è identico, con chi incolla che fa sempre da client dell'handshake.
 /// </summary>
 public static class FileTransfer
 {
     private static readonly byte[] Magic = [.. "VRCF"u8, 1];
+    private static readonly byte[] DialBackMagic = [.. "VRCD"u8, 1];
     private const int ChunkSize = 64 * 1024;
     private const byte Data = 0, End = 1, Failed = 2;
 
@@ -32,11 +38,36 @@ public static class FileTransfer
 
     public static bool IsFileFrame(byte[] frame) => frame.AsSpan().SequenceEqual(Magic);
 
+    /// <summary>Primo frame di una richiamata per i file: restituisce il token che chi incolla aveva chiesto.</summary>
+    public static bool TryReadDialBack(byte[] frame, out Guid token)
+    {
+        token = default;
+        if (frame.Length != DialBackMagic.Length + 16 || !frame.AsSpan(0, DialBackMagic.Length).SequenceEqual(DialBackMagic)) return false;
+        token = new Guid(frame.AsSpan(DialBackMagic.Length));
+        return true;
+    }
+
     // ───────────────────────────── lato di chi offre ─────────────────────────────
+
+    /// <summary>
+    /// Richiamata: si collega a chi incolla (<paramref name="ep"/>), si presenta con <paramref name="token"/> e poi serve
+    /// il file come se la connessione l'avesse aperta lui. Solo per <paramref name="expectedPeer"/>.
+    /// </summary>
+    internal static async Task DialBackAsync(IPEndPoint ep, Guid token, LocalIdentity me, Guid expectedPeer, FileOpener? open,
+        Func<Guid, int> throttleMs, int connectTimeoutMs, int handshakeTimeoutMs, CancellationToken ct)
+    {
+        await using var s = await ConnectAsync(ep, connectTimeoutMs, ct).ConfigureAwait(false);
+        using (var t = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        {
+            t.CancelAfter(handshakeTimeoutMs);
+            await Framing.WriteFrameAsync(s, [.. DialBackMagic, .. token.ToByteArray()], t.Token).ConfigureAwait(false);
+        }
+        await ServeAsync(s, me, open, throttleMs, handshakeTimeoutMs, ct, expectedPeer).ConfigureAwait(false);
+    }
 
     /// <param name="throttleMs">Pausa dopo ogni pezzo, in base a quanto il mouse verso quel PC ne risente.</param>
     internal static async Task ServeAsync(Stream s, LocalIdentity me, FileOpener? open, Func<Guid, int> throttleMs,
-        int handshakeTimeoutMs, CancellationToken ct)
+        int handshakeTimeoutMs, CancellationToken ct, Guid? expectedPeer = null)
     {
         HandshakeResult hs;
         using (var h = CancellationTokenSource.CreateLinkedTokenSource(ct))
@@ -45,6 +76,7 @@ public static class FileTransfer
             hs = await Handshake.RunServerAsync(s, me, h.Token).ConfigureAwait(false);
         }
         using var cipher = hs.Cipher;
+        if (expectedPeer is { } peer && hs.PeerId != peer) throw new IOException("alla richiamata risponde un altro PC");
 
         var req = cipher.Open(await ReadFrame(s, ct).ConfigureAwait(false));
         if (req.Length != 16 + 4 + 8) throw new InvalidDataException("Richiesta file non valida");
@@ -103,6 +135,13 @@ public static class FileTransfer
     internal static async Task<RemoteFile> OpenAsync(IPEndPoint ep, LocalIdentity me, Guid expectedPeer, Guid offerId, int index, long offset,
         int connectTimeoutMs, int handshakeTimeoutMs, CancellationToken ct)
     {
+        var stream = await ConnectAsync(ep, connectTimeoutMs, ct).ConfigureAwait(false);
+        return await RequestAsync(stream, sendMagic: true, me, expectedPeer, offerId, index, offset, handshakeTimeoutMs, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Connessione TCP verso l'altro PC. Lancia <see cref="PeerUnreachableException"/> se non risponde (es. firewall).</summary>
+    internal static async Task<NetworkStream> ConnectAsync(IPEndPoint ep, int connectTimeoutMs, CancellationToken ct)
+    {
         var socket = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
         try
         {
@@ -113,16 +152,29 @@ public static class FileTransfer
         catch (Exception ex)
         {
             socket.Dispose();
-            throw new IOException($"impossibile raggiungere l'altro PC ({(ex is SocketException se ? se.SocketErrorCode.ToString() : "timeout")})", ex);
+            ct.ThrowIfCancellationRequested();
+            throw new PeerUnreachableException($"impossibile raggiungere l'altro PC ({(ex is SocketException se ? se.SocketErrorCode.ToString() : "timeout")})", ex);
         }
-        var stream = new NetworkStream(socket, ownsSocket: true);
+        return new NetworkStream(socket, ownsSocket: true);
+    }
+
+    /// <summary>L'altro PC non accetta la connessione: si può provare a farsi richiamare.</summary>
+    public sealed class PeerUnreachableException(string message, Exception? inner = null) : IOException(message, inner);
+
+    /// <summary>
+    /// Chiede l'elemento <paramref name="index"/> dell'offerta su una connessione già aperta (da noi, o dall'altro PC
+    /// con una richiamata: in quel caso il "VRCF" non serve). Lo stream passa al <see cref="RemoteFile"/>.
+    /// </summary>
+    internal static async Task<RemoteFile> RequestAsync(Stream stream, bool sendMagic, LocalIdentity me, Guid expectedPeer, Guid offerId,
+        int index, long offset, int handshakeTimeoutMs, CancellationToken ct)
+    {
         try
         {
             HandshakeResult hs;
             using (var t = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 t.CancelAfter(handshakeTimeoutMs);
-                await Framing.WriteFrameAsync(stream, Magic, t.Token).ConfigureAwait(false);
+                if (sendMagic) await Framing.WriteFrameAsync(stream, Magic, t.Token).ConfigureAwait(false);
                 hs = await Handshake.RunClientAsync(stream, me, t.Token).ConfigureAwait(false);
             }
             if (hs.PeerId != expectedPeer)
@@ -159,7 +211,7 @@ public static class FileTransfer
     /// <summary>Il file in arrivo, da leggere in sequenza. <see cref="Length"/> = byte attesi dalla posizione richiesta.</summary>
     public sealed class RemoteFile : Stream
     {
-        private readonly NetworkStream _net;
+        private readonly Stream _net;
         private readonly BufferedStream _in;
         private readonly FrameCipher _cipher;
         private byte[] _chunk = [];
@@ -167,7 +219,7 @@ public static class FileTransfer
         private long _received;
         private bool _ended;
 
-        internal RemoteFile(NetworkStream net, FrameCipher cipher, long length)
+        internal RemoteFile(Stream net, FrameCipher cipher, long length)
         {
             _net = net;
             _in = new BufferedStream(net, 128 * 1024);
