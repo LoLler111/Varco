@@ -115,6 +115,11 @@ public sealed class InputCoordinator
     private readonly HashSet<ushort> _swallowUp = new();
     // Ctrl+Alt (senza Win) premuti sul PC che comanda: fino a quando. long.MaxValue = ancora premuti.
     private long _ctrlAltUntil = long.MinValue / 2;
+    private long _ctrlAltSince;
+    // Ctrl premuti davvero (non il Ctrl finto che Windows aggiunge ad AltGr) e quel Ctrl finto, per non scambiare AltGr
+    // (@, #, [ ] sulla tastiera italiana) per Ctrl+Alt.
+    private readonly HashSet<ushort> _realCtrlDown = new();
+    private bool _altGrCtrlDown;
     private long _lastLocalSecureAttention = long.MinValue / 2;
     /// <summary>Scancode e flag con cui sono stati premuti Ctrl e Alt: servono per rilasciarli sul PC comandato.</summary>
     private readonly Dictionary<ushort, (ushort Scan, KeyFlags Flags)> _modifierScan = new();
@@ -365,7 +370,7 @@ public sealed class InputCoordinator
                     if (KeyCodes.LockKeyOf(vk) is not null) return false;
                     if (up) _remoteDownKeys.Remove(vk); else _remoteDownKeys.Add(vk);
                     if (CtrlKeys.Contains(vk) || AltKeys.Contains(vk)) _modifierScan[vk] = (scan, flags & ~KeyFlags.Up);
-                    TrackCtrlAlt();
+                    TrackCtrlAlt(vk, scan, up);
                     return true;
 
                 default:
@@ -575,9 +580,22 @@ public sealed class InputCoordinator
         _platform.Post(() => _vValid = false);
     }
 
-    private void TrackCtrlAlt()
+    /// <summary>
+    /// Ctrl+Alt (senza Win) premuti? AltGr non conta: con i layout che lo hanno Windows lo manda come Ctrl sinistro finto
+    /// (scancode 0x21D) più Alt destro. Finché quel Ctrl finto è giù, l'Alt destro è AltGr e non un Alt.
+    /// </summary>
+    private void TrackCtrlAlt(ushort vk, ushort scan, bool up)
     {
-        var held = CtrlKeys.Any(_remoteDownKeys.Contains) && AltKeys.Any(_remoteDownKeys.Contains) && !WinKeys.Any(_remoteDownKeys.Contains);
+        if (CtrlKeys.Contains(vk))
+        {
+            if (KeyCodes.IsAltGrFakeCtrl(vk, scan)) _altGrCtrlDown = !up;
+            else if (up) _realCtrlDown.Remove(vk);
+            else _realCtrlDown.Add(vk);
+        }
+        var ctrl = _realCtrlDown.Count > 0;
+        var alt = _remoteDownKeys.Contains(0x12) || _remoteDownKeys.Contains(0xA4) || (_remoteDownKeys.Contains(0xA5) && !_altGrCtrlDown);
+        var held = ctrl && alt && !WinKeys.Any(_remoteDownKeys.Contains);
+        if (held && _ctrlAltUntil != long.MaxValue) _ctrlAltSince = Environment.TickCount64;
         if (held) _ctrlAltUntil = long.MaxValue;
         else if (_ctrlAltUntil == long.MaxValue) _ctrlAltUntil = Environment.TickCount64;
     }
@@ -599,7 +617,8 @@ public sealed class InputCoordinator
     private void ForwardLocalSecureAttention()
     {
         _lastLocalSecureAttention = Environment.TickCount64;
-        Log.Info("Ctrl+Alt+Canc premuto mentre si comanda un altro PC: lo mando a quel PC e chiudo la schermata qui");
+        Log.Info("Ctrl+Alt+Canc premuto mentre si comanda un altro PC: lo mando a quel PC e chiudo la schermata qui " +
+                 $"(schermata vista {Environment.TickCount64 - _ctrlAltSince} ms dopo aver premuto Ctrl+Alt)");
         FlushPending();
         // Ctrl e Alt si rilasciano subito sul PC comandato: i rilasci fisici forse non li vedremo (cambio di desktop).
         // Se arrivano lo stesso, un rilascio in più non fa nulla.
@@ -610,6 +629,8 @@ public sealed class InputCoordinator
             _remoteDownKeys.Remove(vk);
         }
         _ctrlAltUntil = long.MinValue / 2;
+        _realCtrlDown.Clear();
+        _altGrCtrlDown = false;
         _net.Send(_peer, new SecureAttention());
         _platform.CancelLocalSecureScreen();
     }
@@ -637,6 +658,8 @@ public sealed class InputCoordinator
         _remoteDownKeys.Clear();
         _swallowUp.Clear();
         _ctrlAltUntil = long.MinValue / 2;
+        _realCtrlDown.Clear();
+        _altGrCtrlDown = false;
         SetMode(InputMode.Controlling, target);
         _net.Send(target, new Enter(ScreenGeometry.Opposite(edge), ratio));
         SendLockKeys(target);

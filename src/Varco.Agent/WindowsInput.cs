@@ -26,7 +26,13 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     private readonly object _threadGate = new();
     private InputThread? _thread;
     private volatile IReadOnlyList<Rect> _monitors = [];
-    private int _ticks;
+    private long _lastSecondTick;
+    // Ctrl e Alt fisici premuti (visti dall'hook): mentre si comanda un altro PC il desktop si controlla ogni 10 ms,
+    // così il Ctrl+Alt+Canc vero (che nessun hook vede) si riconosce subito e la sua schermata qui dura il meno possibile.
+    private volatile bool _ctrlHeld, _altHeld, _altGrHeld;
+    private long _fastWatchUntil;
+    private const int FastWatchMs = 10;
+    private const int FastWatchMaxMs = 5000;
     private int _watching;
     private bool _disposed;
 
@@ -269,29 +275,43 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
 
     /// <summary>
     /// Chiude la schermata di Ctrl+Alt+Canc aperta su questo PC con un Esc iniettato sul desktop Winlogon (l'agent è
-    /// SYSTEM, quindi può). Si riprova qualche volta: la schermata ci mette un attimo a comparire, e un Esc mentre
-    /// Ctrl e Alt sono ancora tenuti premuti diventa Ctrl+Alt+Esc. Se il desktop è già tornato quello normale, basta.
+    /// SYSTEM, quindi può). Prima dell'Esc rilascia Ctrl e Alt, che l'utente forse tiene ancora premuti: altrimenti
+    /// diventerebbe Ctrl+Alt+Esc. La schermata ci mette un attimo a essere pronta, quindi si riprova a intervalli brevi
+    /// finché il desktop non torna quello normale. Un Esc che parte quando il desktop è già tornato normale non arriva a
+    /// nessuno: il thread di iniezione è ancora agganciato a Winlogon e SendInput fallisce.
     /// </summary>
     public void CancelLocalSecureScreen()
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         _ = Task.Run(async () =>
         {
             try
             {
-                foreach (var delay in new[] { 400, 700, 1000, 1500 })
+                var presses = 0;
+                await Task.Delay(40);
+                while (sw.ElapsedMilliseconds < 3000)
                 {
-                    await Task.Delay(delay);
-                    if (!IsSecureDesktop(InputDesktopName())) return;
-                    Log.Info("Schermata di Ctrl+Alt+Canc aperta su questo PC: premo Esc");
+                    if (!IsSecureDesktop(InputDesktopName()))
+                    {
+                        Log.Info($"Schermata di Ctrl+Alt+Canc chiusa {sw.ElapsedMilliseconds} ms dopo averla vista (Esc premuti: {presses})");
+                        return;
+                    }
+                    presses++;
+                    var at = sw.ElapsedMilliseconds;
                     Post(() =>
                     {
+                        InjectKey(0xA2, 0x1D, KeyFlags.Up);
+                        InjectKey(0xA3, 0x1D, KeyFlags.Extended | KeyFlags.Up);
+                        InjectKey(0xA4, 0x38, KeyFlags.Up);
+                        InjectKey(0xA5, 0x38, KeyFlags.Extended | KeyFlags.Up);
                         InjectKey(0x1B, 0x01, KeyFlags.None);
                         InjectKey(0x1B, 0x01, KeyFlags.Up);
                     });
+                    Log.Debug($"Esc {presses} sulla schermata di Ctrl+Alt+Canc dopo {at} ms");
+                    await Task.Delay(presses < 4 ? 60 : 200);
                 }
-                await Task.Delay(1000);
-                if (IsSecureDesktop(InputDesktopName()))
-                    Log.Warn("La schermata di Ctrl+Alt+Canc su questo PC non si è chiusa (Ctrl+Alt+F12 riporta qui mouse e tastiera)");
+                Log.Warn($"La schermata di Ctrl+Alt+Canc su questo PC non si è chiusa in {sw.ElapsedMilliseconds} ms " +
+                         "(Ctrl+Alt+F12 riporta qui mouse e tastiera)");
             }
             catch (Exception ex)
             {
@@ -340,6 +360,23 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             try { _watcher?.Change(0, WatchIntervalMs); } catch (ObjectDisposedException) { }
     }
 
+    /// <summary>Tasto fisico visto dall'hook: tiene il conto di Ctrl e Alt per il controllo rapido del desktop.</summary>
+    private void TrackModifier(ushort vk, uint scan, bool up)
+    {
+        switch (vk)
+        {
+            // AltGr non è Ctrl+Alt: Windows lo manda come Ctrl sinistro finto (scancode 0x21D) più Alt destro.
+            case KeyCodes.VK_LCONTROL when KeyCodes.IsAltGrFakeCtrl(vk, scan): _altGrHeld = !up; return;
+            case 0xA5 when _altGrHeld: return;
+            case 0x11 or 0xA2 or 0xA3: _ctrlHeld = !up; break;
+            case 0x12 or 0xA4 or 0xA5: _altHeld = !up; break;
+            default: return;
+        }
+        if (!_controlling || !_ctrlHeld || !_altHeld || Interlocked.Read(ref _fastWatchUntil) != 0 || _disposed) return;
+        Interlocked.Exchange(ref _fastWatchUntil, Environment.TickCount64 + FastWatchMaxMs);
+        try { _watcher.Change(0, FastWatchMs); } catch (ObjectDisposedException) { }
+    }
+
     // ───────────── gestione desktop / thread ─────────────
 
     private void Watch()
@@ -349,8 +386,16 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         if (Interlocked.Exchange(ref _watching, 1) == 1) return;
         try
         {
-            if (++_ticks % (1000 / WatchIntervalMs) == 0)
+            var now = Environment.TickCount64;
+            var fastUntil = Interlocked.Read(ref _fastWatchUntil);
+            if (fastUntil != 0 && (now > fastUntil || !(_controlling && _ctrlHeld && _altHeld)))
             {
+                Interlocked.Exchange(ref _fastWatchUntil, 0);
+                _watcher.Change(WatchIntervalMs, WatchIntervalMs);
+            }
+            if (now - _lastSecondTick >= 1000)
+            {
+                _lastSecondTick = now;
                 RefreshMonitors();
                 if (_controlling) _thread?.BringKeyboardHookToFront();
                 if (CursorShouldHide) _thread?.SetCursorHidden(true); // di nuovo in primo piano, se un'altra finestra le è passata sopra
@@ -710,6 +755,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                         || ((s.flags & LLKHF_INJECTED) != 0 && KeyCodes.IsAltGrFakeCtrl((ushort)s.vkCode, s.scanCode));
                     if (!ours)
                     {
+                        _owner.TrackModifier((ushort)s.vkCode, s.scanCode, (s.flags & LLKHF_UP) != 0);
                         var flags = KeyFlags.None;
                         if ((s.flags & LLKHF_UP) != 0) flags |= KeyFlags.Up;
                         if ((s.flags & LLKHF_EXTENDED) != 0) flags |= KeyFlags.Extended;

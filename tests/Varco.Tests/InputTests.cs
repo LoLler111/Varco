@@ -799,6 +799,40 @@ public class CoordinatorTests
     }
 
     [Fact]
+    public void AltGr_is_not_ctrl_alt()
+    {
+        // AltGr (tastiera italiana): Windows lo manda come Ctrl sinistro finto (scancode 0x21D) più Alt destro.
+        var (c, net, p, _) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnLocalKey(0xA2, 0x21D, KeyFlags.None);
+        c.OnLocalKey(0xA5, 0x38, KeyFlags.Extended);
+        c.OnInputDesktopChanged("Default", "Winlogon"); // per esempio una richiesta UAC mentre si scrive @
+        Assert.DoesNotContain(net.Sent, s => s.Msg is SecureAttention);
+        Assert.DoesNotContain("cancel secure screen", p.Log);
+
+        // Su un layout senza AltGr l'Alt destro è un Alt: Ctrl+Alt destro vale.
+        var (c2, net2, p2, _) = Setup();
+        c2.OnLocalMouseMove(1919, 540);
+        c2.OnLocalKey(0xA2, 0x1D, KeyFlags.None);
+        c2.OnLocalKey(0xA5, 0x38, KeyFlags.Extended);
+        c2.OnInputDesktopChanged("Default", "Winlogon");
+        Assert.Single(net2.Sent, s => s.Msg is SecureAttention);
+        Assert.Contains("cancel secure screen", p2.Log);
+
+        // Ctrl vero più Alt sinistro mentre AltGr è appena stato rilasciato: vale.
+        var (c3, net3, _, _) = Setup();
+        c3.OnLocalMouseMove(1919, 540);
+        c3.OnLocalKey(0xA2, 0x21D, KeyFlags.None);
+        c3.OnLocalKey(0xA5, 0x38, KeyFlags.Extended);
+        c3.OnLocalKey(0xA5, 0x38, KeyFlags.Extended | KeyFlags.Up);
+        c3.OnLocalKey(0xA2, 0x21D, KeyFlags.Up);
+        c3.OnLocalKey(0xA3, 0x1D, KeyFlags.Extended);
+        c3.OnLocalKey(0xA4, 0x38, KeyFlags.None);
+        c3.OnInputDesktopChanged("Default", "Winlogon");
+        Assert.Single(net3.Sent, s => s.Msg is SecureAttention);
+    }
+
+    [Fact]
     public void Ctrl_alt_del_on_the_local_pc_is_left_alone_when_not_controlling()
     {
         var (c, net, p, _) = Setup();
