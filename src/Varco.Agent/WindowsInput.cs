@@ -120,6 +120,20 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         if (!Native.SetCursorPos(x, y)) InjectionFailed("SetCursorPos");
     }
 
+    /// <summary>
+    /// Il cursore va al centro mentre si inizia a comandare un altro PC. Spostarlo subito lo farebbe vedere per un attimo
+    /// al centro: Windows lo nasconde solo qualche millisecondo dopo che è arrivato sopra la finestra di CursorHider.
+    /// Quindi la finestra copre sia il punto dove sta (sul bordo) sia il centro; il cursore resta fermo dov'è e, appena
+    /// è sparito, il coordinatore lo sposta al centro (CompletePark): lì è ancora sopra la finestra, quindi invisibile.
+    /// Chiamato dal thread degli hook; senza finestra il cursore va subito al centro.
+    /// </summary>
+    public (int X, int Y) ParkCursor(int x, int y)
+    {
+        if (InputThread.Current?.BeginPark(x, y) is { } now) return now;
+        SetCursorPos(x, y);
+        return (x, y);
+    }
+
     public void InjectMoveTo(int x, int y)
     {
         int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -349,6 +363,13 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         private readonly HookProc _keyProc;
         private readonly bool _replacing;
         private uint _threadId;
+        /// <summary>Il thread degli hook che sta eseguendo questo codice, se lo è.</summary>
+        [ThreadStatic] public static InputThread? Current;
+        private const int WM_TIMER = 0x0113;
+        /// <summary>Parcheggio in attesa che il cursore sparisca (vedi ParkCursor); solo dal thread degli hook.</summary>
+        private IntPtr _parkTimer;
+        private long _parkSince;
+        private const int ParkTimeoutMs = 150;
         private volatile bool _alive = true;
 
         public string? DesktopName { get; private set; }
@@ -381,6 +402,36 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         public void SetCursorHidden(bool hidden)
         {
             if (_threadId != 0) PostThreadMessage(_threadId, WM_HIDE_CURSOR, hidden ? 1 : 0, IntPtr.Zero);
+        }
+
+        /// <summary>Copre con la finestra il cursore e il punto di parcheggio; null se non c'è la finestra.</summary>
+        public (int X, int Y)? BeginPark(int x, int y)
+        {
+            if (_hider is null || !Native.GetCursorPos(out var p)) return null;
+            if (p.X == x && p.Y == y) return null;
+            _hider.Cover(p.X, p.Y, x, y);
+            _parkSince = Environment.TickCount64;
+            _parkTimer = SetTimer(IntPtr.Zero, _parkTimer, 5, IntPtr.Zero);
+            if (_parkTimer == IntPtr.Zero) return null;
+            return (p.X, p.Y);
+        }
+
+        private void OnParkTimer()
+        {
+            if (!CursorHider.CursorGone() && Environment.TickCount64 - _parkSince < ParkTimeoutMs) return;
+            KillTimer(IntPtr.Zero, _parkTimer);
+            _parkTimer = IntPtr.Zero;
+            try { _owner.Coordinator?.CompletePark(); }
+            catch (Exception ex) { Log.Error("Parcheggio del cursore", ex); }
+            ShowHider(); // di nuovo piccola, attorno al cursore
+        }
+
+        /// <summary>Finestra sotto il cursore, se va nascosto; non durante un parcheggio (deve coprire anche il centro).</summary>
+        private void ShowHider()
+        {
+            if (_parkTimer != IntPtr.Zero) return;
+            if (_owner.CursorShouldHide) _hider?.Show();
+            else _hider?.Hide();
         }
 
         public void CancelLocalDrag()
@@ -451,6 +502,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 if (mouseHook == IntPtr.Zero || keyHook == IntPtr.Zero)
                     Log.Error($"Installazione hook fallita ({Marshal.GetLastWin32Error()})");
 
+                Current = this;
                 try { _hider = new CursorHider(); }
                 catch (Exception ex) { Log.Warn($"Finestra per nascondere il cursore non creata: {ex.Message}"); }
 
@@ -462,7 +514,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 if (_replacing)
                     try { _owner.Coordinator?.OnInputDesktopChanged(); }
                     catch (Exception ex) { Log.Error("Cambio desktop", ex); }
-                if (_owner.CursorShouldHide) _hider?.Show(); // dopo il riparcheggio: la finestra va dove sta il cursore
+                if (_owner.CursorShouldHide) ShowHider(); // dopo il riparcheggio: la finestra va dove sta il cursore
 
                 // Solo messaggi: gli hook vengono chiamati da qui dentro. Niente lavoro lungo su questo thread.
                 while (_alive && GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -472,15 +524,20 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                         DispatchMessage(ref msg); // messaggi della finestra che nasconde il cursore
                         continue;
                     }
+                    if (msg.message == WM_TIMER && _parkTimer != IntPtr.Zero && msg.wParam == _parkTimer)
+                    {
+                        OnParkTimer();
+                        continue;
+                    }
                     if (msg.message == WM_HIDE_CURSOR)
                     {
-                        if (msg.wParam != 0 && _owner.CursorShouldHide) _hider?.Show();
-                        else if (msg.wParam == 0) _hider?.Hide();
+                        if (msg.wParam != 0) { if (_owner.CursorShouldHide) ShowHider(); }
+                        else if (_parkTimer == IntPtr.Zero) _hider?.Hide(); // durante il parcheggio ci pensa OnParkTimer
                         continue;
                     }
                     if (msg.message == WM_CANCEL_DRAG)
                     {
-                        if (_owner._controlling) _hider?.Show();
+                        if (_owner._controlling) ShowHider();
                         // Le iniezioni mai da questo thread (vedi sopra): le fa il thread di iniezione.
                         _owner.Post(() =>
                         {
@@ -507,7 +564,9 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             {
                 _alive = false;
                 _ready.Set();
+                if (_parkTimer != IntPtr.Zero) KillTimer(IntPtr.Zero, _parkTimer);
                 _hider?.Dispose();
+                Current = null;
                 if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
                 if (keyHook != IntPtr.Zero) UnhookWindowsHookEx(keyHook);
                 if (desk != IntPtr.Zero) CloseDesktop(desk);
@@ -557,7 +616,12 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 try
                 {
                     var s = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                    if (s.dwExtraInfo != Marker)
+                    // Il Ctrl che Windows aggiunge ad AltGr iniettato non porta il marcatore: è comunque nostro. Senza
+                    // questo controllo, sul PC comandato AltGr (es. AltGr+ò = @) sembrava input fisico e il controllo
+                    // tornava al PC locale.
+                    var ours = s.dwExtraInfo == Marker
+                        || ((s.flags & LLKHF_INJECTED) != 0 && KeyCodes.IsAltGrFakeCtrl((ushort)s.vkCode, s.scanCode));
+                    if (!ours)
                     {
                         var flags = KeyFlags.None;
                         if ((s.flags & LLKHF_UP) != 0) flags |= KeyFlags.Up;

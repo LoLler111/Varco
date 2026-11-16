@@ -16,6 +16,16 @@ public interface IInputPlatform
     IReadOnlyList<Rect> GetMonitors();
     (int X, int Y) GetCursorPos();
     void SetCursorPos(int x, int y);
+    /// <summary>
+    /// Inizio del controllo di un altro PC: il cursore va parcheggiato in (x, y). Restituisce dove sta adesso.
+    /// Se non è (x, y), il cursore resta lì finché la piattaforma non chiama <see cref="InputCoordinator.CompletePark"/>
+    /// (Windows: prima lo nasconde dove si trova, vedi WindowsInput.ParkCursor).
+    /// </summary>
+    (int X, int Y) ParkCursor(int x, int y)
+    {
+        SetCursorPos(x, y);
+        return (x, y);
+    }
     void InjectMoveTo(int x, int y);
     void InjectButton(MouseButton button, bool down);
     void InjectWheel(int delta, bool horizontal);
@@ -82,6 +92,8 @@ public sealed class InputCoordinator
 
     // lato controller
     private int _parkX, _parkY;
+    /// <summary>Dove sta davvero il cursore mentre si comanda: i movimenti si misurano da qui (vedi ParkCursor).</summary>
+    private int _refX, _refY;
     private int _returnX, _returnY;
     // Ritorno al PC locale in corso: dove deve finire il cursore e quando è stato deciso (vedi ReturnLocal).
     private (int X, int Y)? _homing;
@@ -227,8 +239,8 @@ public sealed class InputCoordinator
                     return true;
 
                 case InputMode.Controlling:
-                    _pendDx += x - _parkX;
-                    _pendDy += y - _parkY;
+                    _pendDx += x - _refX;
+                    _pendDy += y - _refY;
                     var waited = ElapsedMs(_lastMoveSent);
                     if (waited >= MoveIntervalMs) FlushMoves();
                     else ScheduleFlush(MoveIntervalMs - waited); // invia la coda se il mouse si ferma
@@ -525,8 +537,22 @@ public sealed class InputCoordinator
     public void OnInputDesktopChanged()
     {
         lock (_gate)
-            if (_mode == InputMode.Controlling) _platform.SetCursorPos(_parkX, _parkY);
+            if (_mode == InputMode.Controlling) (_refX, _refY) = _platform.ParkCursor(_parkX, _parkY);
         _platform.Post(() => _vValid = false);
+    }
+
+    /// <summary>
+    /// Il cursore non è ancora nel punto di parcheggio (vedi <see cref="IInputPlatform.ParkCursor"/>): ce lo porta ora.
+    /// Va chiamato dal thread degli hook, così nessun movimento può essere misurato dal punto sbagliato.
+    /// </summary>
+    public void CompletePark()
+    {
+        lock (_gate)
+        {
+            if (_mode != InputMode.Controlling || (_refX == _parkX && _refY == _parkY)) return;
+            _platform.SetCursorPos(_parkX, _parkY);
+            (_refX, _refY) = (_parkX, _parkY);
+        }
     }
 
     private void StartControlling(Guid target, Edge edge, float ratio, int x, int y, IReadOnlyList<Rect> monitors)
@@ -534,7 +560,7 @@ public sealed class InputCoordinator
         _returnX = x;
         _returnY = y;
         (_parkX, _parkY) = monitors.Count > 0 ? monitors[0].Center : (x, y);
-        _platform.SetCursorPos(_parkX, _parkY); // siamo già sul thread di input
+        (_refX, _refY) = _platform.ParkCursor(_parkX, _parkY); // siamo già sul thread degli hook
         _remoteDownKeys.Clear();
         _swallowUp.Clear();
         SetMode(InputMode.Controlling, target);

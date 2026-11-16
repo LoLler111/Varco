@@ -13,6 +13,7 @@ internal sealed class AdvancedForm : Form
     private readonly ListBox _manual = new() { IntegralHeight = false, BorderStyle = BorderStyle.None, BackColor = Ui.Well, ForeColor = Ui.Text, DrawMode = DrawMode.OwnerDrawFixed, Margin = Padding.Empty };
     private readonly Toggle _autoUpdate = new("Aggiorna Varco automaticamente (consigliato)");
     private readonly Toggle _clipboard = new("Condividi gli appunti tra i PC");
+    private readonly Toggle _standby = new("Spegni i monitor di questo PC mentre usi un altro PC");
     private readonly Label _updateText;
     private readonly VButton _installNow = new("Aggiorna subito tutti i PC", primary: true);
     private StatusDto? _status;
@@ -78,6 +79,18 @@ internal sealed class AdvancedForm : Form
             "Non passa ciò che i gestori di password segnano come privato. " +
             "Testo e immagini richiedono Varco 0.5 su tutti e due i PC, i file Varco 0.5.1.", Ui.Small, Ui.Muted, clip.InnerWidth, Ui.P(0, 8, 0, 0)));
         root.Controls.Add(clip);
+
+        // monitor
+        var screens = new Card(W, "Monitor");
+        _standby.Checked = status?.MonitorStandby ?? true;
+        _standby.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setMonitorStandby", Enabled = _standby.Checked });
+        screens.Body.Controls.Add(_standby);
+        screens.Body.Controls.Add(Ui.Label("Mentre comandi un altro PC, Windows crede che tu stia usando questo e non ne spegne mai lo schermo. " +
+            "Varco mette in standby i monitor dopo il tempo impostato in Windows (Impostazioni › Sistema › Alimentazione) " +
+            "e li riaccende quando torni qui, salvo che un video o una presentazione li tenga accesi. " +
+            "Funziona con i monitor esterni che supportano DDC/CI (di solito si attiva dal menu del monitor); " +
+            "lo schermo dei portatili resta acceso.", Ui.Small, Ui.Muted, screens.InnerWidth, Ui.P(0, 8, 0, 0)));
+        root.Controls.Add(screens);
 
         // problemi
         var problems = new Card(W, "Problemi");

@@ -27,7 +27,7 @@ public sealed class ControlRequest
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
-    /// checkUpdate | installUpdateNow (anche sugli altri PC collegati) | setAutoUpdate (Enabled) | setClipboard (Enabled) | setPaused (Enabled = true disattiva la connessione) |
+    /// checkUpdate | installUpdateNow (anche sugli altri PC collegati) | setAutoUpdate (Enabled) | setClipboard (Enabled) | setMonitorStandby (Enabled) | setPaused (Enabled = true disattiva la connessione) |
     /// filesOffer (Seq, attesa lunga) | localFiles (Paths: file copiati su questo PC, letti dall'icona) |
     /// dragEvents (Seq, attesa lunga) | dragFiles (Seq, Paths: file trascinati contro il bordo, vuoto = nessuno) |
     /// dragReady (Seq: finestrella da cui parte il trascinamento pronta sotto il cursore)
@@ -97,6 +97,7 @@ public sealed class StatusDto
     public string Version { get; set; } = "";
     public bool AutoUpdate { get; set; } = true;
     public bool ShareClipboard { get; set; } = true;
+    public bool MonitorStandby { get; set; } = true;
     /// <summary>Null se gli aggiornamenti non sono attivi (agent avviato a mano per sviluppo).</summary>
     public UpdateStatusDto? Update { get; set; }
 }

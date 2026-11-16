@@ -57,6 +57,10 @@ public static class AgentMain
             host.Coordinator.ModeChanged += responsiveness.OnModeChanged;
         }
 
+        using var standby = noInput ? null
+            : new MonitorStandby(() => store.Current.MonitorStandby, Path.Combine(configDir, "monitor-standby.txt"));
+        if (standby is not null) host.Coordinator.ModeChanged += standby.OnModeChanged;
+
         using var power = new PowerNotifier();
         power.Suspending += host.OnSuspend;
         power.Resumed += host.OnResume;

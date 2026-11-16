@@ -281,6 +281,11 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     Clipboard?.AnnounceCaps();
                     return new ControlResponse { Status = GetStatus() };
 
+                case "setMonitorStandby":
+                    _store.Update(c => c.MonitorStandby = req.Enabled != false, immediate: true);
+                    Log.Info($"Standby dei monitor mentre si comanda un altro PC {(req.Enabled != false ? "attivato" : "disattivato")}");
+                    return new ControlResponse { Status = GetStatus() };
+
                 case "setPaused":
                 {
                     var paused = req.Enabled == true;
@@ -418,6 +423,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             Version = CurrentVersion.ToString(3),
             AutoUpdate = cfg.AutoUpdate,
             ShareClipboard = cfg.ShareClipboard,
+            MonitorStandby = cfg.MonitorStandby,
             Update = Updater?.Status,
         };
     }

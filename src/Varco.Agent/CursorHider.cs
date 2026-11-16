@@ -66,8 +66,36 @@ internal sealed class CursorHider : IDisposable
     /// <summary>Mostra la finestra centrata sul cursore (anche per rimetterla in primo piano, se qualcuno le è passato sopra).</summary>
     public void Show()
     {
-        if (_hwnd == IntPtr.Zero || !Native.GetCursorPos(out var p)) return;
-        SetWindowPos(_hwnd, HWND_TOPMOST, p.X - Size / 2, p.Y - Size / 2, Size, Size, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (Native.GetCursorPos(out var p)) ShowAt(p.X, p.Y);
+    }
+
+    private void ShowAt(int x, int y) => ShowRect(x - Size / 2, y - Size / 2, Size, Size);
+
+    /// <summary>
+    /// Mostra la finestra abbastanza grande da coprire tutti e due i punti: il cursore, dopo essere sparito nel primo,
+    /// può andare nel secondo senza uscire dalla finestra (vedi WindowsInput.ParkCursor).
+    /// </summary>
+    public void Cover(int x1, int y1, int x2, int y2)
+    {
+        int left = Math.Min(x1, x2) - Size / 2, top = Math.Min(y1, y2) - Size / 2;
+        ShowRect(left, top, Math.Max(x1, x2) + Size / 2 - left, Math.Max(y1, y2) + Size / 2 - top);
+    }
+
+    /// <summary>
+    /// Il cursore è davvero sparito? Windows applica "nessun cursore" solo quando la nostra finestra gli risponde,
+    /// qualche millisecondo dopo che il cursore le è arrivato sopra. Da lì in poi resta invisibile anche se si sposta,
+    /// purché non esca dalla finestra.
+    /// </summary>
+    public static bool CursorGone()
+    {
+        var ci = new CURSORINFO { cbSize = Marshal.SizeOf<CURSORINFO>() };
+        return GetCursorInfo(ref ci) && (ci.flags == 0 || ci.hCursor == IntPtr.Zero);
+    }
+
+    private void ShowRect(int x, int y, int w, int h)
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        SetWindowPos(_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         if (!Visible) Log.Debug("Cursore nascosto");
         Visible = true;
         // Il cursore è fermo, quindi Windows non chiederebbe subito la forma: la imposto io (vale perché è sopra una nostra finestra).
@@ -134,6 +162,17 @@ internal sealed class CursorHider : IDisposable
     private static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint key, byte alpha, uint flags);
     [DllImport("user32.dll")]
     private static extern IntPtr SetCursor(IntPtr cursor);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CURSORINFO
+    {
+        public int cbSize;
+        public int flags;
+        public IntPtr hCursor;
+        public int x, y;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorInfo(ref CURSORINFO info);
     [DllImport("gdi32.dll")]
     private static extern IntPtr GetStockObject(int index);
 }

@@ -123,6 +123,11 @@ internal static class Native
     public static extern bool PostThreadMessage(uint threadId, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")]
     public static extern IntPtr DispatchMessage(ref MSG msg);
+    /// <summary>Con hwnd nullo è un timer del thread: arriva WM_TIMER con wParam = valore restituito.</summary>
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetTimer(IntPtr hwnd, IntPtr id, uint ms, IntPtr proc);
+    [DllImport("user32.dll")]
+    public static extern bool KillTimer(IntPtr hwnd, IntPtr id);
     [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]

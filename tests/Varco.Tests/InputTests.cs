@@ -52,6 +52,17 @@ public class KeyCodeTests
         Assert.Equal(KeyFlags.Extended | KeyFlags.Up, KeyCodes.ForInjection(0xA5, 0x38, KeyFlags.Extended | KeyFlags.Up));
         Assert.Equal(KeyFlags.Extended, KeyCodes.ForInjection(0x26, 0x48, KeyFlags.Extended));
     }
+
+    [Fact]
+    public void AltGr_fake_ctrl_is_recognized()
+    {
+        // Come lo segnala l'hook (misurato) dopo AltGr iniettato: vk A2, scancode 21D
+        Assert.True(KeyCodes.IsAltGrFakeCtrl(0xA2, 0x21D));
+        // Ctrl sinistro vero, Ctrl destro e AltGr stesso: no
+        Assert.False(KeyCodes.IsAltGrFakeCtrl(0xA2, 0x1D));
+        Assert.False(KeyCodes.IsAltGrFakeCtrl(0xA3, 0x1D));
+        Assert.False(KeyCodes.IsAltGrFakeCtrl(0xA5, 0x38));
+    }
 }
 
 public class LayoutTests
@@ -310,6 +321,14 @@ public class CoordinatorTests
         public void SendSecureAttention() => Log.Add("sas");
         public void CancelLocalDrag() => Log.Add("cancel drag");
         public void HideIdleCursor() => Log.Add("idle hidden");
+        /// <summary>Come Windows con la finestra che nasconde il cursore: il cursore resta dov'è fino a CompletePark.</summary>
+        public bool DeferPark;
+        public (int X, int Y) ParkCursor(int x, int y)
+        {
+            if (!DeferPark) { SetCursorPos(x, y); return (x, y); }
+            Log.Add("park pending");
+            return Cursor;
+        }
     }
 
     private sealed class FakeDrag : IFileDrag
@@ -708,6 +727,30 @@ public class CoordinatorTests
     }
 
     [Fact]
+    public void Deferred_park_measures_moves_from_where_the_cursor_really_is()
+    {
+        var (c, net, p, other) = Setup(moveIntervalMs: 0);
+        p.DeferPark = true;
+        p.Cursor = (1918, 540); // l'hook scarta l'evento sul bordo: il cursore resta dov'era
+        Assert.True(c.OnLocalMouseMove(1919, 540));
+        Assert.Equal(InputMode.Controlling, c.Mode);
+        Assert.Contains("park pending", p.Log);
+        Assert.DoesNotContain("set 960,540", p.Log); // non ancora al centro: prima deve sparire
+
+        Assert.True(c.OnLocalMouseMove(1918, 545));
+        Assert.Equal(new MouseMove(0, 5), net.Sent.Last(s => s.Msg is MouseMove).Msg);
+
+        c.CompletePark();
+        Assert.Equal("set 960,540", p.Log[^1]);
+        Assert.True(c.OnLocalMouseMove(965, 540));
+        Assert.Equal(new MouseMove(5, 0), net.Sent.Last(s => s.Msg is MouseMove).Msg);
+
+        p.Log.Clear();
+        c.CompletePark(); // già fatto: niente
+        Assert.Empty(p.Log);
+    }
+
+    [Fact]
     public void Dragging_files_against_the_edge_carries_them_to_the_other_pc()
     {
         var (c, net, p, other) = Setup(moveIntervalMs: 0);
@@ -853,5 +896,77 @@ public class CoordinatorTests
         var hit = Assert.Single(net.Sent.Select(s => s.Msg).OfType<EdgeHit>());
         Assert.Equal(Edge.Right, hit.Edge);
         Assert.Equal(540, (int)(hit.Ratio * 1080));
+    }
+}
+
+public class MonitorStandbyPolicyTests
+{
+    [Fact]
+    public void Standby_after_the_windows_timeout_while_controlling()
+    {
+        var p = new MonitorStandbyPolicy();
+        p.OnModeChanged(InputMode.Controlling, 1_000);
+        Assert.Equal(StandbyAction.None, p.Decide(1_000 + 299_000, 300, displayRequired: false, enabled: true));
+        Assert.Equal(StandbyAction.Standby, p.Decide(1_000 + 300_000, 300, displayRequired: false, enabled: true));
+        p.Applied(StandbyAction.Standby, anyAsleep: true);
+        Assert.True(p.Asleep);
+        Assert.Equal(StandbyAction.None, p.Decide(1_000 + 400_000, 300, false, true)); // già in standby
+    }
+
+    [Fact]
+    public void Never_without_timeout_or_when_disabled_or_display_required()
+    {
+        var p = new MonitorStandbyPolicy();
+        p.OnModeChanged(InputMode.Controlling, 0);
+        Assert.Equal(StandbyAction.None, p.Decide(10_000_000, 0, false, true)); // "mai" in Windows
+        Assert.Equal(StandbyAction.None, p.Decide(10_000_000, 300, false, enabled: false));
+        Assert.Equal(StandbyAction.None, p.Decide(10_000_000, 300, displayRequired: true, enabled: true)); // video
+        Assert.Equal(StandbyAction.Standby, p.Decide(10_000_000, 300, false, true)); // finito il video
+    }
+
+    [Fact]
+    public void Not_while_local_or_controlled()
+    {
+        var p = new MonitorStandbyPolicy();
+        Assert.Equal(StandbyAction.None, p.Decide(10_000_000, 300, false, true));
+        p.OnModeChanged(InputMode.Controlled, 0); // questo PC è quello usato: ci pensa Windows
+        Assert.Equal(StandbyAction.None, p.Decide(10_000_000, 300, false, true));
+    }
+
+    [Fact]
+    public void Wakes_when_control_comes_back_even_if_it_leaves_again_at_once()
+    {
+        var p = new MonitorStandbyPolicy();
+        p.OnModeChanged(InputMode.Controlling, 0);
+        p.Applied(p.Decide(300_000, 300, false, true), anyAsleep: true);
+        p.OnModeChanged(InputMode.Local, 400_000);
+        p.OnModeChanged(InputMode.Controlling, 400_100); // ripassato all'altro PC prima del controllo
+        Assert.Equal(StandbyAction.Wake, p.Decide(400_200, 300, false, true));
+        p.Applied(StandbyAction.Wake);
+        Assert.False(p.Asleep);
+        // il conto riparte da capo
+        Assert.Equal(StandbyAction.None, p.Decide(400_100 + 299_000, 300, false, true));
+        Assert.Equal(StandbyAction.Standby, p.Decide(400_100 + 300_000, 300, false, true));
+    }
+
+    [Fact]
+    public void Switching_between_controlled_pcs_keeps_counting()
+    {
+        var p = new MonitorStandbyPolicy();
+        p.OnModeChanged(InputMode.Controlling, 0);
+        p.OnModeChanged(InputMode.Controlling, 200_000); // passato a un terzo PC
+        Assert.Equal(StandbyAction.Standby, p.Decide(300_000, 300, false, true));
+    }
+
+    [Fact]
+    public void No_retry_when_no_monitor_supports_ddc()
+    {
+        var p = new MonitorStandbyPolicy();
+        p.OnModeChanged(InputMode.Controlling, 0);
+        p.Applied(p.Decide(300_000, 300, false, true), anyAsleep: false);
+        Assert.False(p.Asleep);
+        Assert.Equal(StandbyAction.None, p.Decide(400_000, 300, false, true));
+        p.OnModeChanged(InputMode.Local, 500_000);
+        Assert.Equal(StandbyAction.None, p.Decide(500_100, 300, false, true)); // niente da riaccendere
     }
 }

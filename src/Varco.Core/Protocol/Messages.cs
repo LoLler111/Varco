@@ -56,6 +56,15 @@ public static class KeyCodes
     /// </summary>
     public static KeyFlags ForInjection(ushort vk, ushort scan, KeyFlags flags) =>
         vk == VK_RSHIFT && scan == 0x36 ? flags & ~KeyFlags.Extended : flags;
+
+    public const ushort VK_LCONTROL = 0xA2;
+
+    /// <summary>
+    /// Il Ctrl sinistro "finto" che Windows aggiunge da sé attorno ad AltGr con i layout che lo hanno (italiano compreso):
+    /// l'hook lo vede con VK_LCONTROL e scancode 0x21D. Se AltGr è stato iniettato da Varco, quel Ctrl arriva senza il
+    /// marcatore di Varco (misurato): non va scambiato per un tasto premuto fisicamente.
+    /// </summary>
+    public static bool IsAltGrFakeCtrl(ushort vk, uint scan) => vk == VK_LCONTROL && (scan & 0x200) != 0;
 }
 
 /// <summary>Stato dei tasti di blocco (le spie della tastiera).</summary>

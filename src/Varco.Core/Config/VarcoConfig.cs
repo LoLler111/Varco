@@ -52,6 +52,12 @@ public sealed class VarcoConfig
     /// <summary>Appunti condivisi fra i PC del gruppo (testo, testo formattato, immagini).</summary>
     public bool ShareClipboard { get; set; } = true;
 
+    /// <summary>
+    /// Monitor di questo PC in standby (DDC/CI) mentre si comanda un altro PC, dopo il tempo di spegnimento dello schermo
+    /// impostato in Windows. Vedi <see cref="Input.MonitorStandbyPolicy"/>.
+    /// </summary>
+    public bool MonitorStandby { get; set; } = true;
+
     /// <summary>Connessione disattivata dall'utente: rete chiusa (niente collegamenti né ricerca) finché non la riattiva.</summary>
     public bool Paused { get; set; }
 
