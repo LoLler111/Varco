@@ -9,7 +9,16 @@ namespace Varco.Core.Net;
 
 public enum PeerState { Disconnected, Connecting, Connected }
 
-public sealed record PeerStatus(Guid? Id, string Name, PeerState State, string? Address, double RttMs, string? LastError);
+public sealed record PeerStatus(Guid? Id, string Name, PeerState State, string? Address, double RttMs, string? LastError)
+{
+    /// <summary>Indirizzo di questo PC usato dalla connessione.</summary>
+    public IPEndPoint? LocalEndPoint { get; init; }
+    public DateTime? ConnectedSinceUtc { get; init; }
+    /// <summary>Connessioni cadute nelle ultime 24 ore (da quando l'agent è partito, se è partito da meno).</summary>
+    public int Drops24h { get; init; }
+    public string? LastDropReason { get; init; }
+    public DateTime? LastDropUtc { get; init; }
+}
 
 public sealed class NodeOptions
 {
@@ -333,10 +342,15 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
             {
                 var id = s.Id!.Value;
                 resolvedIds.Add(id);
-                if (_conns.TryGetValue(id, out var c))
-                    result.Add(new PeerStatus(id, c.PeerName, PeerState.Connected, c.RemoteEndPoint.ToString(), c.RttMs, null));
-                else
-                    result.Add(new PeerStatus(id, s.Name, s.Connecting ? PeerState.Connecting : PeerState.Disconnected, null, -1, s.LastError));
+                var (drops, lastReason, lastAt) = s.DropStats();
+                var status = _conns.TryGetValue(id, out var c)
+                    ? new PeerStatus(id, c.PeerName, PeerState.Connected, c.RemoteEndPoint.ToString(), c.RttMs, null)
+                    {
+                        LocalEndPoint = c.LocalEndPoint,
+                        ConnectedSinceUtc = c.EstablishedUtc,
+                    }
+                    : new PeerStatus(id, s.Name, s.Connecting ? PeerState.Connecting : PeerState.Disconnected, null, -1, s.LastError);
+                result.Add(status with { Drops24h = drops, LastDropReason = lastReason, LastDropUtc = lastAt });
             }
             foreach (var s in _slots.Values.Where(s => s.Id is null && s.ResolvedId is null))
                 result.Add(new PeerStatus(null, s.Name, s.Connecting ? PeerState.Connecting : PeerState.Disconnected, null, -1, s.LastError));
@@ -426,6 +440,35 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         public string? LastError { get; set; }
         public int BackoffMs { get; set; }
         public bool Started { get; set; }
+        private readonly Queue<DateTime> _drops = new();
+        private string? _lastDropReason;
+        private DateTime? _lastDropUtc;
+
+        /// <summary>La connessione con questo PC è caduta (per la diagnostica).</summary>
+        public void RecordDrop(string reason)
+        {
+            lock (_gate)
+            {
+                _drops.Enqueue(DateTime.UtcNow);
+                _lastDropReason = reason;
+                _lastDropUtc = DateTime.UtcNow;
+                Trim();
+            }
+        }
+
+        public (int Count, string? LastReason, DateTime? LastAt) DropStats()
+        {
+            lock (_gate)
+            {
+                Trim();
+                return (_drops.Count, _lastDropReason, _lastDropUtc);
+            }
+        }
+
+        private void Trim()
+        {
+            while (_drops.Count > 0 && DateTime.UtcNow - _drops.Peek() > TimeSpan.FromHours(24)) _drops.Dequeue();
+        }
 
         public void AddEndpoint(IPEndPoint ep, bool front)
         {
@@ -694,7 +737,9 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         SafeInvoke(() => PeerDisconnected?.Invoke(conn.PeerId, reason));
         if (!_cts.IsCancellationRequested)
         {
-            GetOrCreateSlot(conn.PeerId, conn.PeerName).Kick(_opt.BackoffMinMs);
+            var slot = GetOrCreateSlot(conn.PeerId, conn.PeerName);
+            slot.RecordDrop(reason);
+            slot.Kick(_opt.BackoffMinMs);
             _discovery?.Announce();
         }
     }

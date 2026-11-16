@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using Varco.Core.Config;
@@ -138,6 +138,14 @@ public class ReconnectTests : IAsyncLifetime
         var b2 = NewNode("B", bId, port);
         b2.Start();
         await Eventually(() => a.IsConnected(bId) && b2.IsConnected(a.Me.Id), what: "riconnessione automatica");
+        // La diagnostica conta la caduta e ne ricorda il motivo; la connessione nuova ha indirizzo locale e ora di inizio.
+        var st = a.GetStatus().Single(p => p.Id == bId);
+        Assert.Equal(1, st.Drops24h);
+        Assert.False(string.IsNullOrEmpty(st.LastDropReason));
+        Assert.NotNull(st.LastDropUtc);
+        Assert.NotNull(st.LocalEndPoint);
+        Assert.NotNull(st.ConnectedSinceUtc);
+        Assert.Equal(("Stesso PC", "loopback"), Varco.Core.Net.NetworkLinks.Describe(st.LocalEndPoint!.Address));
     }
 
     [Fact]

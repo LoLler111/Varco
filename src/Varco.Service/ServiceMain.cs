@@ -137,7 +137,16 @@ internal sealed class VarcoService : ServiceBase
         _sas?.Dispose();
     }
 
-    protected override void OnShutdown() => OnStop();
+    /// <summary>
+    /// Arresto di Windows: arriva dopo che le app dell'utente sono state chiuse (e dopo l'eventuale schermata
+    /// "Chiusura app in corso"), quindi fino a qui l'agent resta attivo. Lo si chiude con le buone, così gli altri PC
+    /// riprendono subito il controllo invece di aspettare il timeout della connessione.
+    /// </summary>
+    protected override void OnShutdown()
+    {
+        Log.Info("Windows si sta arrestando: chiudo l'agent");
+        OnStop();
+    }
 
     protected override void OnSessionChange(SessionChangeDescription change)
     {

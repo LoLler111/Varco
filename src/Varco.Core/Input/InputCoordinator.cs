@@ -36,6 +36,13 @@ public interface IInputPlatform
     void SetLockKeys(LockKeys state) { }
     /// <summary>Esegue Ctrl+Alt+Canc su questo PC (chiesto dal PC che lo comanda).</summary>
     void SendSecureAttention() { }
+    /// <summary>
+    /// Il Ctrl+Alt+Canc vero premuto qui mentre si comanda un altro PC ha aperto la schermata di sicurezza su questo PC:
+    /// chiudila (Esc), perché è andato al PC comandato.
+    /// </summary>
+    void CancelLocalSecureScreen() { }
+    /// <summary>In primo piano, sul monitor che contiene (x, y), c'è un'app a schermo intero (gioco, presentazione)?</summary>
+    bool IsFullscreenAppAt(int x, int y) => false;
     /// <summary>Annulla il trascinamento partito su questo PC (è passato a un altro PC), senza lasciar cadere niente.</summary>
     void CancelLocalDrag() { }
     /// <summary>
@@ -81,6 +88,9 @@ public sealed class InputCoordinator
     private const ushort VK_END = 0x23;
     private static readonly ushort[] CtrlKeys = [0x11, 0xA2, 0xA3];
     private static readonly ushort[] AltKeys = [0x12, 0xA4, 0xA5];
+    private static readonly ushort[] WinKeys = [0x5B, 0x5C];
+    /// <summary>Ctrl+Alt+Canc vero: il desktop deve passare a Winlogon entro questo tempo dal rilascio di Ctrl+Alt (ms).</summary>
+    private const int SecureAttentionWindowMs = 500;
 
     private readonly object _gate = new();
     private readonly IPeerNetwork _net;
@@ -103,6 +113,11 @@ public sealed class InputCoordinator
     private readonly HashSet<ushort> _remoteDownKeys = new();
     /// <summary>Tasti usati come scorciatoia (Ctrl+Alt+Fine): il rilascio non va inviato a nessuno.</summary>
     private readonly HashSet<ushort> _swallowUp = new();
+    // Ctrl+Alt (senza Win) premuti sul PC che comanda: fino a quando. long.MaxValue = ancora premuti.
+    private long _ctrlAltUntil = long.MinValue / 2;
+    private long _lastLocalSecureAttention = long.MinValue / 2;
+    /// <summary>Scancode e flag con cui sono stati premuti Ctrl e Alt: servono per rilasciarli sul PC comandato.</summary>
+    private readonly Dictionary<ushort, (ushort Scan, KeyFlags Flags)> _modifierScan = new();
     // Movimenti raggruppati: un mouse da 1000 Hz farebbe 1000 pacchetti al secondo, che sul Wi-Fi arrivano a raffiche.
     private int _pendDx, _pendDy;
     private long _lastMoveSent = long.MinValue / 2;
@@ -174,6 +189,11 @@ public sealed class InputCoordinator
     /// <summary>Trascinamento di file fra i PC; null = non disponibile.</summary>
     public IFileDrag? FileDrag { get; set; }
 
+    /// <summary>Regole dei bordi di questo PC (lette a ogni contatto col bordo: cambiano senza riavviare).</summary>
+    public Func<EdgeSettings> EdgeSettings { get; set; } = () => Input.EdgeSettings.Default;
+    // Da quando il cursore è contro il bordo (per la sosta): sul PC che comanda e su quello comandato.
+    private (Edge Edge, long Since)? _edgeDwellLocal, _edgeDwellTarget;
+
     // Trascinamento, lato di chi trascina: PC su cui si sta provando, risultato pronto, prova già fallita con questo clic.
     private Guid? _dragProbing;
     private (Guid Target, byte[] Offer)? _dragReady;
@@ -193,6 +213,7 @@ public sealed class InputCoordinator
         _mode = mode;
         _peer = peer;
         _homing = null;
+        _edgeDwellLocal = _edgeDwellTarget = null;
         _pendDx = _pendDy = 0; // spostamenti e rotella non inviati: appartenevano al target precedente
         _pendWheelV = _pendWheelH = 0;
         if (_dragHold || _dragActive)
@@ -231,10 +252,11 @@ public sealed class InputCoordinator
                     // Durante un trascinamento non si passa, a meno che si stiano trascinando dei file (vedi DragAcross).
                     if (_localButtons != 0) return _localButtons == LeftBit && DragAcross(x, y);
                     var monitors = _platform.GetMonitors();
-                    if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) return false;
+                    if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) { _edgeDwellLocal = null; return false; }
                     // Chi c'è oltre il bordo proprio in questo punto? (disposizione 2D: dipende anche dall'altezza)
                     if (_layout.Cross(_net.SelfId, edge, ScreenGeometry.Ratio(monitors, edge, x, y)) is not { } hop
                         || hop.Id == _net.SelfId || !_net.IsConnected(hop.Id)) return false;
+                    if (!EdgeAllowed(monitors, edge, x, y, ref _edgeDwellLocal)) return false;
                     StartControlling(hop.Id, edge, hop.Ratio, x, y, monitors);
                     return true;
 
@@ -342,6 +364,8 @@ public sealed class InputCoordinator
                     // locale lo vede premere e deve vederlo anche rilasciare, pure se nel frattempo il controllo è tornato qui.
                     if (KeyCodes.LockKeyOf(vk) is not null) return false;
                     if (up) _remoteDownKeys.Remove(vk); else _remoteDownKeys.Add(vk);
+                    if (CtrlKeys.Contains(vk) || AltKeys.Contains(vk)) _modifierScan[vk] = (scan, flags & ~KeyFlags.Up);
+                    TrackCtrlAlt();
                     return true;
 
                 default:
@@ -534,11 +558,60 @@ public sealed class InputCoordinator
     /// successivo verrebbe misurato da lì: il cursore sull'altro PC andrebbe alla deriva da solo. Lo riparcheggio.
     /// Sul PC comandato invece rileggo la posizione vera del cursore alla prossima iniezione.
     /// </summary>
-    public void OnInputDesktopChanged()
+    /// <summary>
+    /// Il desktop di input è cambiato (schermata di blocco, UAC, Ctrl+Alt+Canc). Va chiamato dal nuovo thread di input.
+    /// <paramref name="previous"/> e <paramref name="current"/> sono i nomi dei desktop ("Default", "Winlogon"), se noti.
+    /// </summary>
+    public void OnInputDesktopChanged(string? previous = null, string? current = null)
     {
         lock (_gate)
-            if (_mode == InputMode.Controlling) (_refX, _refY) = _platform.ParkCursor(_parkX, _parkY);
+        {
+            if (_mode == InputMode.Controlling)
+            {
+                (_refX, _refY) = _platform.ParkCursor(_parkX, _parkY);
+                if (IsLocalSecureAttention(previous, current)) ForwardLocalSecureAttention();
+            }
+        }
         _platform.Post(() => _vValid = false);
+    }
+
+    private void TrackCtrlAlt()
+    {
+        var held = CtrlKeys.Any(_remoteDownKeys.Contains) && AltKeys.Any(_remoteDownKeys.Contains) && !WinKeys.Any(_remoteDownKeys.Contains);
+        if (held) _ctrlAltUntil = long.MaxValue;
+        else if (_ctrlAltUntil == long.MaxValue) _ctrlAltUntil = Environment.TickCount64;
+    }
+
+    /// <summary>
+    /// Il Ctrl+Alt+Canc vero non arriva agli hook: Windows apre subito la schermata di sicurezza su questo PC. Lo si
+    /// riconosce così: si comanda un altro PC, Ctrl+Alt sono premuti (o appena rilasciati: i rilasci durante il cambio
+    /// di desktop non li vede nessun hook) e il desktop passa dal normale a Winlogon.
+    /// </summary>
+    private bool IsLocalSecureAttention(string? previous, string? current)
+    {
+        if (!string.Equals(previous, "Default", StringComparison.OrdinalIgnoreCase)) return false;
+        if (!string.Equals(current, "Winlogon", StringComparison.OrdinalIgnoreCase)) return false;
+        var now = Environment.TickCount64;
+        if (now - _ctrlAltUntil > SecureAttentionWindowMs) return false;
+        return now - _lastLocalSecureAttention > 2000; // un solo Ctrl+Alt+Canc per pressione
+    }
+
+    private void ForwardLocalSecureAttention()
+    {
+        _lastLocalSecureAttention = Environment.TickCount64;
+        Log.Info("Ctrl+Alt+Canc premuto mentre si comanda un altro PC: lo mando a quel PC e chiudo la schermata qui");
+        FlushPending();
+        // Ctrl e Alt si rilasciano subito sul PC comandato: i rilasci fisici forse non li vedremo (cambio di desktop).
+        // Se arrivano lo stesso, un rilascio in più non fa nulla.
+        foreach (var vk in _remoteDownKeys.Where(k => CtrlKeys.Contains(k) || AltKeys.Contains(k)).ToList())
+        {
+            var (scan, flags) = _modifierScan.GetValueOrDefault(vk);
+            _net.Send(_peer, new KeyMsg(vk, scan, flags | KeyFlags.Up));
+            _remoteDownKeys.Remove(vk);
+        }
+        _ctrlAltUntil = long.MinValue / 2;
+        _net.Send(_peer, new SecureAttention());
+        _platform.CancelLocalSecureScreen();
     }
 
     /// <summary>
@@ -563,6 +636,7 @@ public sealed class InputCoordinator
         (_refX, _refY) = _platform.ParkCursor(_parkX, _parkY); // siamo già sul thread degli hook
         _remoteDownKeys.Clear();
         _swallowUp.Clear();
+        _ctrlAltUntil = long.MinValue / 2;
         SetMode(InputMode.Controlling, target);
         _net.Send(target, new Enter(ScreenGeometry.Opposite(edge), ratio));
         SendLockKeys(target);
@@ -668,17 +742,41 @@ public sealed class InputCoordinator
             lock (_gate)
             {
                 if (!IsControlledBy(controller)) return;
-                if (hit is not Edge edge) { _latchedEdge = null; return; }
+                if (hit is not Edge edge) { _latchedEdge = null; _edgeDwellTarget = null; return; }
                 // Un solo EdgeHit per "spinta" e mai durante un trascinamento.
                 if (_latchedEdge == edge || _injectedButtons != 0) return;
                 // Se in questo punto del bordo non c'è nessun PC accanto il cursore resta qui; scorrendo lungo
                 // il bordo fino a dove un altro PC lo tocca, l'EdgeHit parte (il bordo non resta "agganciato").
                 var ratio = ScreenGeometry.Ratio(monitors, edge, nx, ny);
                 if (_layout.Cross(_net.SelfId, edge, ratio) is null) return;
+                // Lo schermo intero conta solo sul PC con il mouse fisico: qui (un video a tutto schermo) si resterebbe bloccati.
+                if (!EdgeAllowed(monitors, edge, nx, ny, ref _edgeDwellTarget, checkFullscreen: false)) return;
                 _latchedEdge = edge;
                 _net.Send(controller, new EdgeHit(edge, ratio));
             }
         });
+    }
+
+    /// <summary>
+    /// Il bordo toccato in (x, y) fa passare all'altro PC, secondo le regole di <see cref="Input.EdgeSettings"/>?
+    /// <paramref name="dwell"/> ricorda da quando si è contro il bordo, per la sosta.
+    /// </summary>
+    private bool EdgeAllowed(IReadOnlyList<Rect> monitors, Edge edge, int x, int y, ref (Edge Edge, long Since)? dwell, bool checkFullscreen = true)
+    {
+        EdgeSettings s;
+        try { s = EdgeSettings(); }
+        catch (Exception ex) { Log.Error("Impostazioni dei bordi", ex); s = Input.EdgeSettings.Default; }
+        if (s.ScrollLockHolds && _platform.GetLockKeys() is { } locks && locks.HasFlag(LockKeys.Scroll)) return false;
+        if (s.CornerGuard && EdgeGuard.InCorner(monitors, edge, x, y)) { dwell = null; return false; }
+        if (checkFullscreen && s.BlockFullscreen && _platform.IsFullscreenAppAt(x, y)) return false;
+        if (s.DelayMs > 0)
+        {
+            var now = Stopwatch.GetTimestamp();
+            if (dwell is not { } d || d.Edge != edge) { dwell = (edge, now); return false; }
+            if (ElapsedMs(d.Since) < s.DelayMs) return false;
+        }
+        dwell = null;
+        return true;
     }
 
     private void TakeOverLocally()
@@ -702,13 +800,14 @@ public sealed class InputCoordinator
     {
         if (FileDrag is not { } drag) return false;
         var monitors = _platform.GetMonitors();
-        if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) return false;
+        if (ScreenGeometry.DetectEdge(monitors, x, y) is not Edge edge) { _edgeDwellLocal = null; return false; }
         if (_layout.Cross(_net.SelfId, edge, ScreenGeometry.Ratio(monitors, edge, x, y)) is not { } hop
             || hop.Id == _net.SelfId || !_net.IsConnected(hop.Id)) return false;
+        if (!EdgeAllowed(monitors, edge, x, y, ref _edgeDwellLocal)) return false;
 
         if (_dragReady is { } ready && ready.Target == hop.Id)
         {
-            Log.Info("Trascinamento di file verso l'altro PC");
+            Log.Info("Trascinamento verso l'altro PC");
             _dragReady = null;
             _dragProbing = null;
             _localButtons = 0; // il rilascio del pulsante ora va all'altro PC

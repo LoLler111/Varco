@@ -20,6 +20,7 @@ internal sealed class CursorHider : IDisposable
     private const int Size = 64;
     private const string ClassName = "Varco.CursorHider";
     private const int WM_SETCURSOR = 0x0020, WM_MOUSEACTIVATE = 0x0021, MA_NOACTIVATE = 3;
+    private const int WM_QUERYENDSESSION = 0x0011, WM_ENDSESSION = 0x0016;
     private const uint WS_POPUP = 0x80000000;
     private const uint WS_EX_TOPMOST = 0x8, WS_EX_TOOLWINDOW = 0x80, WS_EX_LAYERED = 0x80000, WS_EX_NOACTIVATE = 0x08000000;
     private const uint SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
@@ -127,6 +128,13 @@ internal sealed class CursorHider : IDisposable
                 return 1;
             case WM_MOUSEACTIVATE:
                 return MA_NOACTIVATE; // un clic iniettato qui sopra non deve portare in primo piano nulla
+            case WM_QUERYENDSESSION:
+                // Non si blocca mai l'arresto, e l'agent non si chiude qui: lo chiude il servizio (vedi ShutdownGuard).
+                Log.Info("Windows chiede se si può chiudere la sessione: sì, l'agent resta attivo");
+                return 1;
+            case WM_ENDSESSION:
+                if (wParam != IntPtr.Zero) Log.Info("Windows chiude la sessione: l'agent resta attivo finché lo chiude il servizio");
+                return IntPtr.Zero;
             default:
                 return DefWindowProc(hwnd, msg, wParam, lParam);
         }

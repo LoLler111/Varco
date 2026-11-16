@@ -1,4 +1,4 @@
-using Varco.Core.Input;
+﻿using Varco.Core.Input;
 using Varco.Core.Net;
 using Varco.Core.Protocol;
 
@@ -319,6 +319,9 @@ public class CoordinatorTests
         public void InjectWheel(int d, bool h) => Log.Add($"wheel {d}");
         public void InjectKey(ushort vk, ushort scan, KeyFlags f) => Log.Add($"key {vk:X2} {f}");
         public void SendSecureAttention() => Log.Add("sas");
+        public void CancelLocalSecureScreen() => Log.Add("cancel secure screen");
+        public bool Fullscreen;
+        public bool IsFullscreenAppAt(int x, int y) => Fullscreen;
         public void CancelLocalDrag() => Log.Add("cancel drag");
         public void HideIdleCursor() => Log.Add("idle hidden");
         /// <summary>Come Windows con la finestra che nasconde il cursore: il cursore resta dov'è fino a CompletePark.</summary>
@@ -675,6 +678,135 @@ public class CoordinatorTests
         Assert.Contains(net.Sent, s => s.To == other && s.Msg is Leave);
         // i rilasci di Ctrl/Alt non arrivano al PC locale, che non li aveva visti premere
         Assert.True(c.OnLocalKey(0xA2, 0x1D, KeyFlags.Up));
+    }
+
+    [Fact]
+    public void Corners_of_the_monitor_do_not_cross()
+    {
+        var (c, _, _, _) = Setup();
+        Assert.False(c.OnLocalMouseMove(1919, 5)); // la X di una finestra massimizzata
+        Assert.False(c.OnLocalMouseMove(1919, 1075)); // angolo in basso
+        Assert.Equal(InputMode.Local, c.Mode);
+        Assert.True(c.OnLocalMouseMove(1919, 60));
+        Assert.Equal(InputMode.Controlling, c.Mode);
+
+        var (c2, _, _, _) = Setup();
+        c2.EdgeSettings = () => new EdgeSettings(CornerGuard: false);
+        Assert.True(c2.OnLocalMouseMove(1919, 5));
+    }
+
+    [Fact]
+    public void Scroll_lock_and_fullscreen_apps_keep_the_cursor_here()
+    {
+        var (c, _, p, _) = Setup();
+        p.Locks = LockKeys.Scroll;
+        Assert.False(c.OnLocalMouseMove(1919, 540));
+        p.Locks = LockKeys.None;
+        p.Fullscreen = true;
+        Assert.False(c.OnLocalMouseMove(1919, 540));
+        Assert.Equal(InputMode.Local, c.Mode);
+
+        c.EdgeSettings = () => new EdgeSettings(BlockFullscreen: false);
+        Assert.True(c.OnLocalMouseMove(1919, 540));
+    }
+
+    [Fact]
+    public void With_a_delay_the_cursor_must_rest_against_the_edge()
+    {
+        var (c, _, _, _) = Setup();
+        c.EdgeSettings = () => new EdgeSettings(DelayMs: 150);
+        Assert.False(c.OnLocalMouseMove(1919, 540)); // primo contatto
+        Assert.False(c.OnLocalMouseMove(1919, 541)); // spinta subito dopo: ancora no
+        Thread.Sleep(200);
+        Assert.True(c.OnLocalMouseMove(1919, 542));
+        Assert.Equal(InputMode.Controlling, c.Mode);
+
+        // Lasciare il bordo azzera l'attesa.
+        var (c2, _, _, _) = Setup();
+        c2.EdgeSettings = () => new EdgeSettings(DelayMs: 150);
+        c2.OnLocalMouseMove(1919, 540);
+        Thread.Sleep(200);
+        c2.OnLocalMouseMove(1800, 540);
+        Assert.False(c2.OnLocalMouseMove(1919, 540));
+    }
+
+    [Fact]
+    public void The_controlled_pc_applies_its_own_edge_rules()
+    {
+        var (t, net, p, controller) = Setup(otherOnRight: false);
+        t.OnMessage(controller, new Enter(Edge.Left, 0.5f), () => []);
+        p.Locks = LockKeys.Scroll; // Bloc Scorr acceso (sincronizzato dal PC che comanda)
+        t.OnMessage(controller, new MouseMove(-5000, 0), () => []);
+        Assert.DoesNotContain(net.Sent, s => s.Msg is EdgeHit);
+
+        p.Locks = LockKeys.None;
+        t.OnMessage(controller, new MouseMove(10, 0), () => []);
+        t.OnMessage(controller, new MouseMove(-5000, 0), () => []);
+        Assert.Contains(net.Sent, s => s.To == controller && s.Msg is EdgeHit { Edge: Edge.Left });
+    }
+
+    [Fact]
+    public void Real_ctrl_alt_del_while_controlling_goes_to_the_target_and_closes_the_local_screen()
+    {
+        var (c, net, p, other) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnLocalKey(0xA2, 0x1D, KeyFlags.None);
+        c.OnLocalKey(0xA4, 0x38, KeyFlags.None);
+        net.Sent.Clear();
+
+        // Canc non arriva agli hook: Windows apre la schermata di sicurezza qui, il desktop passa a Winlogon.
+        c.OnInputDesktopChanged("Default", "Winlogon");
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is KeyMsg { Vk: 0xA2, Scan: 0x1D } k && k.Flags.HasFlag(KeyFlags.Up));
+        Assert.Contains(net.Sent, s => s.To == other && s.Msg is KeyMsg { Vk: 0xA4, Scan: 0x38 } k && k.Flags.HasFlag(KeyFlags.Up));
+        Assert.Single(net.Sent, s => s.To == other && s.Msg is SecureAttention);
+        Assert.Contains("cancel secure screen", p.Log);
+        Assert.Equal(InputMode.Controlling, c.Mode);
+
+        // Esc ha chiuso la schermata: il ritorno al desktop normale non fa altro.
+        net.Sent.Clear();
+        c.OnInputDesktopChanged("Winlogon", "Default");
+        Assert.DoesNotContain(net.Sent, s => s.Msg is SecureAttention);
+    }
+
+    [Fact]
+    public void Desktop_switch_without_ctrl_alt_is_not_a_ctrl_alt_del()
+    {
+        var (c, net, p, _) = Setup();
+        c.OnLocalMouseMove(1919, 540);
+        c.OnInputDesktopChanged("Default", "Winlogon"); // UAC sul PC che comanda
+        Assert.DoesNotContain(net.Sent, s => s.Msg is SecureAttention);
+
+        // Win+Ctrl+Alt: non è Ctrl+Alt+Canc (Win+L blocca il PC, anche quello non passa dagli hook).
+        c.OnInputDesktopChanged("Winlogon", "Default");
+        c.OnLocalKey(0x5B, 0x5B, KeyFlags.Extended);
+        c.OnLocalKey(0xA2, 0x1D, KeyFlags.None);
+        c.OnLocalKey(0xA4, 0x38, KeyFlags.None);
+        c.OnInputDesktopChanged("Default", "Winlogon");
+        Assert.DoesNotContain(net.Sent, s => s.Msg is SecureAttention);
+        Assert.DoesNotContain("cancel secure screen", p.Log);
+
+        // Ctrl+Alt rilasciati da un pezzo: nemmeno.
+        var (c2, net2, p2, _) = Setup();
+        c2.OnLocalMouseMove(1919, 540);
+        c2.OnLocalKey(0xA2, 0x1D, KeyFlags.None);
+        c2.OnLocalKey(0xA4, 0x38, KeyFlags.None);
+        c2.OnLocalKey(0xA4, 0x38, KeyFlags.Up);
+        c2.OnLocalKey(0xA2, 0x1D, KeyFlags.Up);
+        Thread.Sleep(600);
+        c2.OnInputDesktopChanged("Default", "Winlogon");
+        Assert.DoesNotContain(net2.Sent, s => s.Msg is SecureAttention);
+        Assert.DoesNotContain("cancel secure screen", p2.Log);
+    }
+
+    [Fact]
+    public void Ctrl_alt_del_on_the_local_pc_is_left_alone_when_not_controlling()
+    {
+        var (c, net, p, _) = Setup();
+        c.OnLocalKey(0xA2, 0x1D, KeyFlags.None);
+        c.OnLocalKey(0xA4, 0x38, KeyFlags.None);
+        c.OnInputDesktopChanged("Default", "Winlogon");
+        Assert.DoesNotContain(net.Sent, s => s.Msg is SecureAttention);
+        Assert.DoesNotContain("cancel secure screen", p.Log);
     }
 
     [Fact]

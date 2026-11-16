@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using Varco.Core;
 using Varco.Core.Input;
@@ -218,6 +218,90 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     }
 
     /// <summary>Ctrl+Alt+Canc: lo esegue il servizio (SendSAS funziona solo da un servizio), vedi Varco.Service.SecureAttention.</summary>
+    private static readonly string[] ShellClasses = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+    private long _fullscreenCheckedAt = long.MinValue / 2;
+    private bool _fullscreen;
+
+    /// <summary>
+    /// App a schermo intero in primo piano sul monitor del punto: finestra non massimizzata che copre tutto il monitor
+    /// (giochi, presentazioni, video a schermo intero, F11 nel browser). Solo sul desktop normale: la schermata di blocco
+    /// e l'UAC coprono tutto lo schermo ma lì il cursore deve poter passare. Risultato tenuto per 100 ms (mouse a 1000 Hz).
+    /// </summary>
+    public bool IsFullscreenAppAt(int x, int y)
+    {
+        var now = Environment.TickCount64;
+        if (now - Interlocked.Read(ref _fullscreenCheckedAt) < 100) return _fullscreen;
+        _fullscreen = CheckFullscreen(x, y);
+        Interlocked.Exchange(ref _fullscreenCheckedAt, now);
+        return _fullscreen;
+    }
+
+    private bool CheckFullscreen(int x, int y)
+    {
+        try
+        {
+            if (_thread?.DesktopName is { } desk && !string.Equals(desk, "Default", StringComparison.OrdinalIgnoreCase)) return false;
+            var hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero || IsZoomed(hwnd)) return false;
+            var cls = new System.Text.StringBuilder(64);
+            if (GetClassName(hwnd, cls, cls.Capacity) > 0 && ShellClasses.Contains(cls.ToString())) return false;
+            if (!GetWindowRect(hwnd, out var r)) return false;
+            var mon = MonitorFromWindow(hwnd, 0 /* MONITOR_DEFAULTTONULL */);
+            if (mon == IntPtr.Zero) return false;
+            var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+            if (!GetMonitorInfo(mon, ref mi)) return false;
+            var m = mi.rcMonitor;
+            if (x < m.Left || x >= m.Right || y < m.Top || y >= m.Bottom) return false;
+            return r.Left <= m.Left && r.Top <= m.Top && r.Right >= m.Right && r.Bottom >= m.Bottom;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Controllo schermo intero: {ex.Message}");
+            return false;
+        }
+    }
+
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern bool IsZoomed(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int max);
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    /// <summary>
+    /// Chiude la schermata di Ctrl+Alt+Canc aperta su questo PC con un Esc iniettato sul desktop Winlogon (l'agent è
+    /// SYSTEM, quindi può). Si riprova qualche volta: la schermata ci mette un attimo a comparire, e un Esc mentre
+    /// Ctrl e Alt sono ancora tenuti premuti diventa Ctrl+Alt+Esc. Se il desktop è già tornato quello normale, basta.
+    /// </summary>
+    public void CancelLocalSecureScreen()
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                foreach (var delay in new[] { 400, 700, 1000, 1500 })
+                {
+                    await Task.Delay(delay);
+                    if (!IsSecureDesktop(InputDesktopName())) return;
+                    Log.Info("Schermata di Ctrl+Alt+Canc aperta su questo PC: premo Esc");
+                    Post(() =>
+                    {
+                        InjectKey(0x1B, 0x01, KeyFlags.None);
+                        InjectKey(0x1B, 0x01, KeyFlags.Up);
+                    });
+                }
+                await Task.Delay(1000);
+                if (IsSecureDesktop(InputDesktopName()))
+                    Log.Warn("La schermata di Ctrl+Alt+Canc su questo PC non si è chiusa (Ctrl+Alt+F12 riporta qui mouse e tastiera)");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Chiusura della schermata di Ctrl+Alt+Canc", ex);
+            }
+        });
+
+        static bool IsSecureDesktop(string? name) => string.Equals(name, "Winlogon", StringComparison.OrdinalIgnoreCase);
+    }
+
     public void SendSecureAttention()
     {
         try
@@ -296,8 +380,9 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             if (_disposed) return;
             if (_thread is { IsAlive: true } && !restart) return;
             var replacing = _thread is not null;
+            var previousDesktop = _thread?.DesktopName;
             _thread?.Stop();
-            _thread = new InputThread(this, replacing);
+            _thread = new InputThread(this, replacing, previousDesktop);
             _thread.Start();
         }
     }
@@ -362,6 +447,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         private readonly HookProc _mouseProc;
         private readonly HookProc _keyProc;
         private readonly bool _replacing;
+        private readonly string? _previousDesktop;
         private uint _threadId;
         /// <summary>Il thread degli hook che sta eseguendo questo codice, se lo è.</summary>
         [ThreadStatic] public static InputThread? Current;
@@ -375,10 +461,11 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         public string? DesktopName { get; private set; }
         public bool IsAlive => _alive && _thread.IsAlive && _injector.IsAlive;
 
-        public InputThread(WindowsInput owner, bool replacing)
+        public InputThread(WindowsInput owner, bool replacing, string? previousDesktop)
         {
             _owner = owner;
             _replacing = replacing;
+            _previousDesktop = previousDesktop;
             _mouseProc = MouseHook;
             _keyProc = KeyHook;
             _thread = new Thread(Run) { IsBackground = true, Name = "Varco hook", Priority = ThreadPriority.Highest };
@@ -512,7 +599,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 Log.Info($"Thread di input attivo sul desktop \"{DesktopName ?? "corrente"}\"");
                 // Da qui SetCursorPos agisce sul nuovo desktop: il coordinatore rimette a posto il cursore.
                 if (_replacing)
-                    try { _owner.Coordinator?.OnInputDesktopChanged(); }
+                    try { _owner.Coordinator?.OnInputDesktopChanged(_previousDesktop, DesktopName); }
                     catch (Exception ex) { Log.Error("Cambio desktop", ex); }
                 if (_owner.CursorShouldHide) ShowHider(); // dopo il riparcheggio: la finestra va dove sta il cursore
 

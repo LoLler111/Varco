@@ -28,6 +28,8 @@ public sealed partial class VarcoHost : IAsyncDisposable
     public Update.Updater? Updater { get; private set; }
 
     public static Version CurrentVersion => Update.UpdateSignature.Normalize(typeof(VarcoHost).Assembly.GetName().Version ?? new Version(0, 0, 0));
+    /// <summary>Quando è partito questo host: le statistiche di connessione partono da qui.</summary>
+    public DateTime StartedUtc { get; } = DateTime.UtcNow;
 
     public void EnableUpdates()
     {
@@ -61,7 +63,14 @@ public sealed partial class VarcoHost : IAsyncDisposable
             _store.Update(c => c.Layout = l);
             _net.Broadcast(new LayoutMsg(l));
         };
-        Coordinator = new InputCoordinator(_net, platform, Layout);
+        Coordinator = new InputCoordinator(_net, platform, Layout)
+        {
+            EdgeSettings = () =>
+            {
+                var c = _store.Current;
+                return new EdgeSettings(c.EdgeCorners, c.EdgeDelay ? EdgeSettings.StandardDelayMs : 0, c.EdgeBlockFullscreen, c.EdgeScrollLock);
+            },
+        };
         if (clipboard is not null)
         {
             if (fileAccess is not null) FileOffers = new Files.FileOffers(fileAccess);
@@ -272,6 +281,9 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 case "dragFiles":
                     return OnDraggedFiles(req.Seq, req.Paths);
 
+                case "dragData":
+                    return OnDraggedData(req.Seq, req.Formats);
+
                 case "dragReady":
                     return OnDragSourceReady(req.Seq);
 
@@ -285,6 +297,23 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     _store.Update(c => c.MonitorStandby = req.Enabled != false, immediate: true);
                     Log.Info($"Standby dei monitor mentre si comanda un altro PC {(req.Enabled != false ? "attivato" : "disattivato")}");
                     return new ControlResponse { Status = GetStatus() };
+
+                case "setEdgeOption":
+                {
+                    var on = req.Enabled != false;
+                    Action<VarcoConfig>? set = req.Option switch
+                    {
+                        "corners" => c => c.EdgeCorners = on,
+                        "delay" => c => c.EdgeDelay = on,
+                        "fullscreen" => c => c.EdgeBlockFullscreen = on,
+                        "scrollLock" => c => c.EdgeScrollLock = on,
+                        _ => null,
+                    };
+                    if (set is null) return new ControlResponse { Ok = false, Error = $"Regola dei bordi sconosciuta: {req.Option}" };
+                    _store.Update(set, immediate: true);
+                    Log.Info($"Bordi: {req.Option} {(on ? "attivato" : "disattivato")}");
+                    return new ControlResponse { Status = GetStatus() };
+                }
 
                 case "setPaused":
                 {
@@ -357,6 +386,9 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     await JoinGroupAsync(GroupKey.Generate()).ConfigureAwait(false);
                     return new ControlResponse { Status = GetStatus() };
 
+                case "exportLogs":
+                    return new ControlResponse { Zip = Diagnostics.ExportLogs(_store, GetStatus()) };
+
                 case "reconnect":
                     _node?.ResetAll("richiesta dall'utente");
                     return new ControlResponse { Status = GetStatus() };
@@ -414,7 +446,15 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 Address = p.Address,
                 RttMs = Math.Round(p.RttMs, 1),
                 LastError = p.LastError,
+                Link = NetworkLinks.Describe(p.LocalEndPoint?.Address)?.Kind,
+                Adapter = NetworkLinks.Describe(p.LocalEndPoint?.Address)?.Adapter,
+                LocalAddress = p.LocalEndPoint is { } le ? (le.Address.IsIPv4MappedToIPv6 ? le.Address.MapToIPv4() : le.Address).ToString() : null,
+                ConnectedSinceUtc = p.ConnectedSinceUtc,
+                Drops24h = p.Drops24h,
+                LastDropReason = p.LastDropReason,
+                LastDropUtc = p.LastDropUtc,
             }).ToList(),
+            AgentStartedUtc = StartedUtc,
             Layout = Layout.Current.Entries,
             ManualAddresses = cfg.ManualAddresses.ToList(),
             Discovered = DiscoveredPeers(),
@@ -424,6 +464,10 @@ public sealed partial class VarcoHost : IAsyncDisposable
             AutoUpdate = cfg.AutoUpdate,
             ShareClipboard = cfg.ShareClipboard,
             MonitorStandby = cfg.MonitorStandby,
+            EdgeCorners = cfg.EdgeCorners,
+            EdgeDelay = cfg.EdgeDelay,
+            EdgeBlockFullscreen = cfg.EdgeBlockFullscreen,
+            EdgeScrollLock = cfg.EdgeScrollLock,
             Update = Updater?.Status,
         };
     }

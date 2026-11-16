@@ -1,4 +1,4 @@
-using Varco.Core.Clipboard;
+﻿using Varco.Core.Clipboard;
 using Varco.Core.Control;
 using Varco.Core.Files;
 using Varco.Core.Input;
@@ -7,7 +7,7 @@ using Varco.Core.Protocol;
 namespace Varco.Core;
 
 /// <summary>
-/// Trascinamento di file da uno schermo all'altro. Chi trascina e chi riceve sono Esplora risorse, che gira come utente:
+/// Trascinamento di file (e di testo e immagini, vedi <see cref="DragPayload"/>) da uno schermo all'altro. Chi trascina e chi riceve sono Esplora risorse, che gira come utente:
 /// l'agent (SYSTEM) non può fare da bersaglio né da sorgente di un trascinamento, quindi chiede all'icona
 /// (vedi <see cref="DragEventDto"/>). I dati dei file viaggiano come per gli appunti (<see cref="FileOffers"/>), quando
 /// l'utente rilascia sopra una cartella.
@@ -33,13 +33,16 @@ public sealed partial class VarcoHost : IFileDrag
         Coordinator.FileDrag = this;
     }
 
-    private long PublishDrag(string kind, FilesOfferDto? offer = null)
+    private long PublishDrag(string kind, FilesOfferDto? offer = null) => PublishDrag(new DragEventDto { Kind = kind, Offer = offer });
+
+    private long PublishDrag(DragEventDto e)
     {
         TaskCompletionSource fire;
         long seq;
         lock (_dragGate)
         {
-            _dragEvent = new DragEventDto { Seq = seq = _dragEvent.Seq + 1, Kind = kind, Offer = offer };
+            e.Seq = seq = _dragEvent.Seq + 1;
+            _dragEvent = e;
             fire = _dragChanged;
             _dragChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
@@ -82,15 +85,36 @@ public sealed partial class VarcoHost : IFileDrag
     void IFileDrag.Incoming(Guid from, byte[] offer)
     {
         FileOffer? parsed = null;
-        try { parsed = FileOffer.Deserialize(ClipboardSync.Decompress(offer)); }
+        try
+        {
+            var raw = ClipboardSync.Decompress(offer);
+            if (DragPayload.TryUnwrap(raw) is { } data)
+            {
+                if (data.Formats.Count == 0)
+                {
+                    Log.Warn("Trascinamento senza formati utilizzabili (versione più recente?)");
+                    return;
+                }
+                Log.Info($"Trascinamento in arrivo da {PeerName(from)}: {DragPayload.Describe(data)}");
+                var dto = new DragEventDto
+                {
+                    Kind = "Source",
+                    PeerName = PeerName(from),
+                    Data = data.Formats.Select(f => new ClipFormatDto { Name = f.Name, Data = f.Data }).ToList(),
+                };
+                lock (_dragGate) _sourceSeq = PublishDrag(dto);
+                return;
+            }
+            parsed = FileOffer.Deserialize(raw);
+        }
         catch (Exception ex) { Log.Warn($"File trascinati non validi: {ex.Message}"); }
         if (parsed is null)
         {
             Log.Warn("File trascinati non validi o di una versione più recente");
             return; // senza risposta il coordinatore annulla da solo dopo qualche secondo
         }
-        var dto = ToDto(from, parsed);
-        lock (_dragGate) _sourceSeq = PublishDrag("Source", dto);
+        var offerDto = ToDto(from, parsed);
+        lock (_dragGate) _sourceSeq = PublishDrag("Source", offerDto);
     }
 
     void IFileDrag.CancelIncoming()
@@ -155,6 +179,52 @@ public sealed partial class VarcoHost : IFileDrag
             catch (Exception ex)
             {
                 Log.Error("File trascinati", ex);
+                wire = null;
+            }
+            Coordinator.OnDragProbeResult(target, wire);
+        });
+        return new ControlResponse();
+    }
+
+    /// <summary>
+    /// L'icona ha visto che contro il bordo si trascina testo o un'immagine (da un browser, da Word…), non dei file.
+    /// Passa solo verso i PC che lo sanno ricevere e se sta in un messaggio.
+    /// </summary>
+    private ControlResponse OnDraggedData(long? seq, List<ClipFormatDto>? formats)
+    {
+        Guid target;
+        lock (_dragGate)
+        {
+            if (seq != _probeSeq || _probeTarget is not Guid t) return new ControlResponse();
+            target = t;
+        }
+        var content = new ClipContent((formats ?? []).Where(f => DragPayload.Formats.Contains(f.Name) && f.Data.Length > 0)
+            .Select(f => new ClipFormat(f.Name, f.Data)).ToList());
+        _ = Task.Run(() =>
+        {
+            byte[]? wire = null;
+            try
+            {
+                if (content.Formats.Count == 0) { }
+                else if (Clipboard?.CapsOf(target).HasFlag(PeerCaps.DragData) != true)
+                    Log.Info("Si trascina testo o un'immagine, ma l'altro PC ha una versione di Varco che riceve solo file");
+                else
+                {
+                    wire = DragPayload.Wrap(content);
+                    if (wire.Length > MaxDragOfferBytes)
+                    {
+                        Log.Info($"Troppo grande da trascinare ({DragPayload.Describe(content)}): usa copia e incolla");
+                        wire = null;
+                    }
+                    else
+                    {
+                        Log.Info($"Si trascina verso il bordo: {DragPayload.Describe(content)}. Può passare all'altro PC");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Dati trascinati", ex);
                 wire = null;
             }
             Coordinator.OnDragProbeResult(target, wire);

@@ -1,4 +1,4 @@
-using System.IO.Compression;
+﻿using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using Varco.Core.Files;
@@ -76,9 +76,9 @@ public sealed class ClipboardSync
 
     private PeerCaps MyCaps => !_enabled() ? PeerCaps.None
         : _files is null ? PeerCaps.Clipboard
-        : PeerCaps.Clipboard | PeerCaps.Files | (DragSupported ? PeerCaps.DragFiles : PeerCaps.None);
+        : PeerCaps.Clipboard | PeerCaps.Files | (DragSupported ? PeerCaps.DragFiles | PeerCaps.DragData : PeerCaps.None);
 
-    /// <summary>Questo PC sa ricevere file trascinati da un altro (l'agent con mouse e tastiera veri).</summary>
+    /// <summary>Questo PC sa ricevere file, testo e immagini trascinati da un altro (l'agent con mouse e tastiera veri).</summary>
     public bool DragSupported { get; set; }
 
     /// <summary>Funzioni annunciate dal PC indicato (nessuna se non ha mandato <see cref="Capabilities"/>).</summary>

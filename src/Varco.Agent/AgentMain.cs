@@ -37,6 +37,8 @@ public static class AgentMain
             return 1;
         }
 
+        // Resta vivo durante lo spegnimento, per comandare da un altro PC la schermata "Chiusura app in corso".
+        ShutdownGuard.Install();
         Native.SetProcessDpiAwarenessContext(Native.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         Log.Info($"Agent Varco avviato (utente {Environment.UserName}, sessione {System.Diagnostics.Process.GetCurrentProcess().SessionId}, config {configDir})");
 

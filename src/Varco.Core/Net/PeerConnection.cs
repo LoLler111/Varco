@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
@@ -57,6 +57,9 @@ public sealed class PeerConnection : IAsyncDisposable
     /// <summary>Id del PC che ha aperto la connessione (serve a risolvere connessioni doppie in modo deterministico).</summary>
     public Guid InitiatorId { get; }
     public long EstablishedAt { get; } = Environment.TickCount64;
+    public DateTime EstablishedUtc { get; } = DateTime.UtcNow;
+    /// <summary>Indirizzo di questo PC usato dalla connessione (dice se passa dal cavo o dal Wi-Fi).</summary>
+    public IPEndPoint? LocalEndPoint { get; }
     public byte[] SessionId { get; }
     /// <summary>Chiave di gruppo con cui è nata la connessione: può essere una chiave sostituita (PC rimasto spento a un cambio).</summary>
     public byte[] GroupKey { get; }
@@ -80,6 +83,7 @@ public sealed class PeerConnection : IAsyncDisposable
         SessionId = hs.SessionId;
         GroupKey = hs.GroupKey;
         RemoteEndPoint = (IPEndPoint)socket.RemoteEndPoint!;
+        LocalEndPoint = socket.LocalEndPoint as IPEndPoint;
         _intervalMs = intervalMs;
         _timeoutMs = timeoutMs;
         _lastReceived = _lastSent = Environment.TickCount64;

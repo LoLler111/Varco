@@ -58,6 +58,15 @@ public sealed class VarcoConfig
     /// </summary>
     public bool MonitorStandby { get; set; } = true;
 
+    /// <summary>Bordi: negli angoli di ogni monitor non si passa all'altro PC. Vedi <see cref="Input.EdgeSettings"/>.</summary>
+    public bool EdgeCorners { get; set; } = true;
+    /// <summary>Bordi: si passa solo dopo una breve sosta contro il bordo.</summary>
+    public bool EdgeDelay { get; set; }
+    /// <summary>Bordi: non si passa mentre un'app a schermo intero è in primo piano.</summary>
+    public bool EdgeBlockFullscreen { get; set; } = true;
+    /// <summary>Bordi: con Bloc Scorr acceso il cursore resta sul PC dove si trova.</summary>
+    public bool EdgeScrollLock { get; set; } = true;
+
     /// <summary>Connessione disattivata dall'utente: rete chiusa (niente collegamenti né ricerca) finché non la riattiva.</summary>
     public bool Paused { get; set; }
 

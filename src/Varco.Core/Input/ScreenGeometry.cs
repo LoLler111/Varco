@@ -38,7 +38,7 @@ public static class ScreenGeometry
         return false;
     }
 
-    private static Rect MonitorAt(IReadOnlyList<Rect> monitors, int x, int y)
+    internal static Rect MonitorAt(IReadOnlyList<Rect> monitors, int x, int y)
     {
         Rect best = monitors[0];
         long bestDist = long.MaxValue;

@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using Varco.Core.Config;
 using Varco.Core.Control;
 
@@ -30,9 +30,15 @@ internal sealed class AdvancedForm : Form
         AutoSizeMode = AutoSizeMode.GrowAndShrink;
         Padding = Ui.P(18, 6, 18, 18);
 
-        var root = Ui.Column();
-        root.Location = new Point(Padding.Left, Padding.Top);
-        Controls.Add(root);
+        // Due colonne: in una sola la finestra non starebbe in uno schermo da 1080 righe.
+        var columns = Ui.Flow();
+        columns.Location = new Point(Padding.Left, Padding.Top);
+        Controls.Add(columns);
+        var left = Ui.Column();
+        var right = Ui.Column();
+        right.Margin = Ui.P(16, 0, 0, 0);
+        columns.Controls.Add(left);
+        columns.Controls.Add(right);
 
         // collegamento manuale
         var manual = new Card(W, "Collega un PC tramite indirizzo IP");
@@ -67,7 +73,7 @@ internal sealed class AdvancedForm : Form
             if (await Send(new ControlRequest { Cmd = "removeAddress", Address = a }) is not null) _manual.Items.Remove(a);
         };
         manual.Body.Controls.Add(Row(listBox, remove));
-        root.Controls.Add(manual);
+        left.Controls.Add(manual);
 
         // appunti
         var clip = new Card(W, "Appunti");
@@ -78,7 +84,7 @@ internal sealed class AdvancedForm : Form
             "I file passano solo quando li incolli, con la barra di avanzamento di Windows. " +
             "Non passa ciò che i gestori di password segnano come privato. " +
             "Testo e immagini richiedono Varco 0.5 su tutti e due i PC, i file Varco 0.5.1.", Ui.Small, Ui.Muted, clip.InnerWidth, Ui.P(0, 8, 0, 0)));
-        root.Controls.Add(clip);
+        left.Controls.Add(clip);
 
         // monitor
         var screens = new Card(W, "Monitor");
@@ -90,7 +96,26 @@ internal sealed class AdvancedForm : Form
             "e li riaccende quando torni qui, salvo che un video o una presentazione li tenga accesi. " +
             "Funziona con i monitor esterni che supportano DDC/CI (di solito si attiva dal menu del monitor); " +
             "lo schermo dei portatili resta acceso.", Ui.Small, Ui.Muted, screens.InnerWidth, Ui.P(0, 8, 0, 0)));
-        root.Controls.Add(screens);
+        left.Controls.Add(screens);
+
+        // bordi
+        var edges = new Card(W, "Bordi dello schermo");
+        void EdgeToggle(string text, string option, bool value, bool first = false)
+        {
+            var t = new Toggle(text) { Checked = value, Margin = first ? Padding.Empty : Ui.P(0, 8, 0, 0) };
+            t.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setEdgeOption", Option = option, Enabled = t.Checked });
+            edges.Body.Controls.Add(t);
+        }
+        EdgeToggle("Negli angoli dello schermo non passare all'altro PC", "corners", status?.EdgeCorners ?? true, first: true);
+        EdgeToggle("Bloc Scorr tiene il cursore su questo PC", "scrollLock", status?.EdgeScrollLock ?? true);
+        EdgeToggle("Non passare mentre un'app è a schermo intero", "fullscreen", status?.EdgeBlockFullscreen ?? true);
+        EdgeToggle("Passa solo dopo una breve sosta sul bordo", "delay", status?.EdgeDelay ?? false);
+        edges.Body.Controls.Add(Ui.Label("Così la X di una finestra massimizzata o le schede del browser non ti portano sull'altro PC per sbaglio. " +
+            "Con Bloc Scorr acceso il cursore resta dove si trova, su qualunque PC. " +
+            "Lo schermo intero (giochi, presentazioni) conta solo sul PC con il mouse che stai usando. " +
+            "Con la sosta il cursore deve restare contro il bordo per un attimo prima di passare. " +
+            "Ogni PC usa le proprie impostazioni per i propri bordi.", Ui.Small, Ui.Muted, edges.InnerWidth, Ui.P(0, 8, 0, 0)));
+        right.Controls.Add(edges);
 
         // problemi
         var problems = new Card(W, "Problemi");
@@ -102,15 +127,22 @@ internal sealed class AdvancedForm : Form
             var dir = Path.Combine(ConfigStore.DefaultDirectory, "logs");
             if (Directory.Exists(dir)) Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dir}\"") { UseShellExecute = true });
         };
+        var diagnostics = new VButton("Diagnostica");
+        diagnostics.Click += (_, _) =>
+        {
+            using var form = new DiagnosticsForm(_status);
+            form.ShowDialog(this);
+        };
         reconnect.Margin = Ui.P(0, 0, 8, 0);
-        problems.Body.Controls.Add(Row(reconnect, logs));
+        diagnostics.Margin = Ui.P(0, 0, 8, 0);
+        problems.Body.Controls.Add(Row(reconnect, diagnostics, logs));
         problems.Body.Controls.Add(Ui.Link("Scollega questo PC da tutti gli altri…", async () =>
         {
             if (MessageBox.Show(this, "Questo PC si scollegherà da tutti gli altri. Potrai ricollegarlo quando vuoi. Continuare?",
                     "Varco", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
                 await Send(new ControlRequest { Cmd = "leaveGroup" });
         }, Ui.P(0, 12, 0, 0)));
-        root.Controls.Add(problems);
+        right.Controls.Add(problems);
 
         // aggiornamenti
         var updates = new Card(W, "Aggiornamenti");
@@ -135,7 +167,7 @@ internal sealed class AdvancedForm : Form
             return true;
         });
         updates.Body.Controls.Add(_installNow);
-        root.Controls.Add(updates);
+        right.Controls.Add(updates);
         ShowUpdate(status);
 
         // Lo stato dell'aggiornamento cambia mentre la finestra è aperta (controllo, download…).

@@ -1,4 +1,4 @@
-#if DEBUG
+﻿#if DEBUG
 using Varco.Core.Control;
 using Varco.Core.Input;
 
@@ -53,6 +53,18 @@ internal static class UiPreview
         Save(() => { var f = new MainForm(); f.UpdateStatus(paused); return f; }, Path.Combine(dir, "main-disattivato.png"));
         Save(() => new MainForm(), Path.Combine(dir, "main-servizio-spento.png"), s => ((MainForm)s).UpdateStatus(null));
         Save(() => new AdvancedForm(linked), Path.Combine(dir, "avanzate.png"));
+        var diag = new StatusDto
+        {
+            MachineId = me, MachineName = "DESKTOP-CASA", Version = linked.Version, AgentStartedUtc = DateTime.UtcNow.AddHours(-3),
+            Peers =
+            [
+                new PeerDto { Id = lap, Name = "PORTATILE", State = "Connected", RttMs = 3.2, Link = "Wi-Fi", Adapter = "Wi-Fi",
+                    LocalAddress = "192.168.1.20", Address = "192.168.1.34:47800", ConnectedSinceUtc = DateTime.UtcNow.AddMinutes(-133),
+                    Drops24h = 2, LastDropUtc = DateTime.UtcNow.AddMinutes(-140), LastDropReason = "nessuna risposta da 3000 ms" },
+                new PeerDto { Id = off, Name = "UFFICIO", State = "Disconnected", LastError = "connessione rifiutata" },
+            ],
+        };
+        Save(() => new DiagnosticsForm(diag), Path.Combine(dir, "diagnostica.png"));
         Save(() => new PairRequestForm(new PairRequestDto { PeerName = "PORTATILE", Code = "482 913" }), Path.Combine(dir, "richiesta.png"));
         Save(() => new SetupForm(), Path.Combine(dir, "setup.png"));
         // Una cattura vera dallo schermo: è l'unico modo di vedere la barra del titolo disegnata da Windows.

@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using Varco.Core;
 using Varco.Core.Control;
 using ComTypes = System.Runtime.InteropServices.ComTypes;
@@ -64,9 +64,9 @@ internal sealed class FileDragBridge : IDisposable
             case "Probe":
                 _sta.Post(() => ShowCatcher(e.Seq));
                 break;
-            case "Source" when e.Offer is { } offer:
+            case "Source" when e.Offer is not null || e.Data is { Count: > 0 }:
                 _cancelled = false;
-                _sta.Post(() => ShowSource(e.Seq, offer));
+                _sta.Post(() => ShowSource(e));
                 break;
             case "End":
                 _cancelled = true;
@@ -85,14 +85,17 @@ internal sealed class FileDragBridge : IDisposable
     {
         _catcher ??= new DragCatcher();
         var answered = false;
-        void Answer(List<string> paths)
+        void Answer(List<string> paths, List<ClipFormatDto>? formats)
         {
             if (answered) return;
             answered = true;
-            _ = ControlClient.SendAsync(new ControlRequest { Cmd = "dragFiles", Seq = seq, Paths = paths }, 5000)
-                .ContinueWith(t => { if (t.IsFaulted) Log.Debug($"dragFiles: {t.Exception?.InnerException?.Message}"); }, TaskScheduler.Default);
+            var req = paths.Count == 0 && formats is { Count: > 0 }
+                ? new ControlRequest { Cmd = "dragData", Seq = seq, Formats = formats }
+                : new ControlRequest { Cmd = "dragFiles", Seq = seq, Paths = paths };
+            _ = ControlClient.SendAsync(req, 10_000)
+                .ContinueWith(t => { if (t.IsFaulted) Log.Debug($"{req.Cmd}: {t.Exception?.InnerException?.Message}"); }, TaskScheduler.Default);
         }
-        _catcher.FilesSeen = Answer;
+        _catcher.Seen = Answer;
         _catcher.ShowUnderCursor();
         // Il cursore è fermo contro il bordo: lo sposto di un pixel e lo rimetto, così il trascinamento in corso si
         // accorge subito della finestrella (lo controlla a ogni movimento).
@@ -105,7 +108,7 @@ internal sealed class FileDragBridge : IDisposable
         timer.Tick += (_, _) =>
         {
             timer.Dispose();
-            Answer([]);
+            Answer([], null);
         };
         timer.Start();
         // Per sicurezza: se l'agent non dice più niente, la finestrella sparisce da sola.
@@ -114,10 +117,13 @@ internal sealed class FileDragBridge : IDisposable
 
     // ───────────── PC dove arrivano i file ─────────────
 
-    private void ShowSource(long seq, FilesOfferDto offer)
+    private void ShowSource(DragEventDto e)
     {
+        var seq = e.Seq;
         _source ??= new DragSource(() => _cancelled);
-        _source.Offer = offer;
+        _source.Offer = e.Offer;
+        _source.Data = e.Offer is null ? e.Data : null;
+        _source.DataFrom = e.PeerName ?? "";
         _source.ShowUnderCursor();
         _source.HideAfter(5000); // se il pulsante non arriva, via
         _ = ControlClient.SendAsync(new ControlRequest { Cmd = "dragReady", Seq = seq }, 5000)
@@ -214,10 +220,11 @@ internal class InvisibleWindow : Form
     }
 }
 
-/// <summary>Bersaglio finto contro il bordo: legge i file trascinati e non accetta mai il rilascio.</summary>
+/// <summary>Bersaglio finto contro il bordo: legge i file (o testo, immagini) trascinati e non accetta mai il rilascio.</summary>
 internal sealed class DragCatcher : InvisibleWindow
 {
-    public Action<List<string>>? FilesSeen; // campo, non proprietà: niente serializzazione del designer
+    /// <summary>Percorsi dei file trascinati; se non ce ne sono, gli altri formati letti (null = niente).</summary>
+    public Action<List<string>, List<ClipFormatDto>?>? Seen; // campo, non proprietà: niente serializzazione del designer
 
     public DragCatcher() : base(24)
     {
@@ -232,17 +239,23 @@ internal sealed class DragCatcher : InvisibleWindow
             if (e.Data?.GetData(DataFormats.FileDrop) is string[] { Length: > 0 } paths)
             {
                 Log.Info($"Trascinamento contro il bordo: {paths.Length} elementi");
-                FilesSeen?.Invoke(paths.ToList());
+                Seen?.Invoke(paths.ToList(), null);
+            }
+            else if (e.Data is ComTypes.IDataObject com && DragDataReader.Read(com) is { Count: > 0 } formats)
+            {
+                // Testo, HTML, immagini (da un browser, da Word…), anche file senza percorso.
+                Log.Info($"Trascinamento contro il bordo: {string.Join(", ", formats.Select(f => f.Name))}");
+                Seen?.Invoke([], formats);
             }
             else
             {
-                FilesSeen?.Invoke([]); // si trascina qualcos'altro (testo, immagini da un browser…)
+                Seen?.Invoke([], null); // si trascina qualcos'altro (una finestra, un formato che non passa)
             }
         }
         catch (Exception ex) when (ex is ExternalException or InvalidOperationException)
         {
-            Log.Debug($"File trascinati non letti: {ex.Message}");
-            FilesSeen?.Invoke([]);
+            Log.Debug($"Trascinamento non letto: {ex.Message}");
+            Seen?.Invoke([], null);
         }
     }
 
@@ -257,6 +270,11 @@ internal sealed class DragSource : InvisibleWindow
 
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public FilesOfferDto? Offer { get; set; }
+    /// <summary>Testo o immagini arrivati da un altro PC (al posto di <see cref="Offer"/>).</summary>
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public List<ClipFormatDto>? Data { get; set; }
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public string DataFrom { get; set; } = "";
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public bool Dragging { get; private set; }
 
@@ -268,16 +286,28 @@ internal sealed class DragSource : InvisibleWindow
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-        if (e.Button != MouseButtons.Left || Offer is not { } offer || Dragging) return;
+        if (e.Button != MouseButtons.Left || Dragging || (Offer is null && Data is not { Count: > 0 })) return;
         Dragging = true;
         try
         {
-            var data = new VirtualFilesDataObject(offer);
-            Log.Info($"Trascinamento di {data.Count} elementi arrivati da {offer.PeerName}");
+            ComTypes.IDataObject data;
+            if (Offer is { } offer)
+            {
+                var files = new VirtualFilesDataObject(offer);
+                Log.Info($"Trascinamento di {files.Count} elementi arrivati da {offer.PeerName}");
+                data = files;
+            }
+            else
+            {
+                var memory = new MemoryDataObject(Data!);
+                if (memory.IsEmpty) return;
+                Log.Info($"Trascinamento di testo o immagini arrivati da {DataFrom}");
+                data = memory;
+            }
             // Bloccante finché l'utente non rilascia (o annulla). Se rilascia su una cartella, Esplora risorse copia
-            // da qui dentro, chiedendo i dati a VirtualFilesDataObject come per l'incolla.
+            // da qui dentro, chiedendo i dati all'oggetto come per l'incolla.
             var hr = DoDragDrop(data, _dropSource, DROPEFFECT_COPY, out var effect);
-            Log.Info(hr == DropSource.DRAGDROP_S_DROP && effect != 0 ? "File lasciati cadere: copia avviata" : "Trascinamento finito senza copiare nulla");
+            Log.Info(hr == DropSource.DRAGDROP_S_DROP && effect != 0 ? "Lasciato cadere: copia avviata" : "Trascinamento finito senza copiare nulla");
         }
         catch (Exception ex)
         {

@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using Varco.Core.Input;
 
@@ -73,7 +73,7 @@ public enum LockKeys : byte { None = 0, Caps = 1, Num = 2, Scroll = 4 }
 
 /// <summary>Funzioni che un PC sa gestire, annunciate appena connesso (le versioni senza questo messaggio non ne hanno).</summary>
 [Flags]
-public enum PeerCaps : uint { None = 0, Clipboard = 1, Files = 2, DragFiles = 4 }
+public enum PeerCaps : uint { None = 0, Clipboard = 1, Files = 2, DragFiles = 4, DragData = 8 }
 
 public abstract record Message;
 
