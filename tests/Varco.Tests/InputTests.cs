@@ -1038,6 +1038,27 @@ public class CoordinatorTests
     }
 
     [Fact]
+    public void Move_computed_by_windows_before_the_park_is_not_a_jump()
+    {
+        var (c, net, p, other) = Setup(moveIntervalMs: 0);
+        p.DeferPark = true;
+        p.Cursor = (1918, 540);
+        Assert.True(c.OnLocalMouseMove(1919, 540));
+        c.CompletePark();
+
+        // Windows aveva già calcolato questo evento dal bordo, prima che il cursore andasse al centro:
+        // va misurato da lì (3 px), non dal centro (oltre 960 px).
+        Assert.True(c.OnLocalMouseMove(1919, 542));
+        Assert.Equal(new MouseMove(1, 2), net.Sent.Last(s => s.Msg is MouseMove).Msg);
+
+        // Poi gli eventi partono dal centro, come sempre.
+        Assert.True(c.OnLocalMouseMove(964, 540));
+        Assert.Equal(new MouseMove(4, 0), net.Sent.Last(s => s.Msg is MouseMove).Msg);
+        Assert.True(c.OnLocalMouseMove(1000, 540)); // il punto vecchio non conta più
+        Assert.Equal(new MouseMove(40, 0), net.Sent.Last(s => s.Msg is MouseMove).Msg);
+    }
+
+    [Fact]
     public void Dragging_files_against_the_edge_carries_them_to_the_other_pc()
     {
         var (c, net, p, other) = Setup(moveIntervalMs: 0);

@@ -109,6 +109,16 @@ public sealed class InputCoordinator
     private int _parkX, _parkY;
     /// <summary>Dove sta davvero il cursore mentre si comanda: i movimenti si misurano da qui (vedi ParkCursor).</summary>
     private int _refX, _refY;
+    /// <summary>
+    /// Dove stava il cursore prima che <see cref="CompletePark"/> lo portasse al centro, e da quando: un movimento già
+    /// calcolato da Windows partendo da lì può arrivare dopo (vedi <see cref="MeasureFrom"/>).
+    /// </summary>
+    private (int X, int Y)? _staleRef;
+    private long _staleRefSince;
+    private const int StaleRefWindowMs = 250;
+    /// <summary>Spostamento di un solo evento oltre il quale lo si scrive nel log (px): un salto, non una mossa vera.</summary>
+    private const int JumpLogThreshold = 400;
+    private long _lastJumpLog = long.MinValue / 2;
     private int _returnX, _returnY;
     // Ritorno al PC locale in corso: dove deve finire il cursore e quando è stato deciso (vedi ReturnLocal).
     private (int X, int Y)? _homing;
@@ -286,8 +296,16 @@ public sealed class InputCoordinator
                     return true;
 
                 case InputMode.Controlling:
-                    _pendDx += x - _refX;
-                    _pendDy += y - _refY;
+                    var (fromX, fromY) = MeasureFrom(x, y);
+                    var (mdx, mdy) = (x - fromX, y - fromY);
+                    if ((Math.Abs(mdx) > JumpLogThreshold || Math.Abs(mdy) > JumpLogThreshold) && ElapsedMs(_lastJumpLog) > 1000)
+                    {
+                        _lastJumpLog = Stopwatch.GetTimestamp();
+                        Log.Info($"Salto del mouse in un solo evento: ({mdx}, {mdy}) px, evento in ({x}, {y}), " +
+                                 $"misurato da ({fromX}, {fromY}), parcheggio ({_parkX}, {_parkY})");
+                    }
+                    _pendDx += mdx;
+                    _pendDy += mdy;
                     var waited = ElapsedMs(_lastMoveSent);
                     if (waited >= MoveIntervalMs) FlushMoves();
                     else ScheduleFlush(MoveIntervalMs - waited); // invia la coda se il mouse si ferma
@@ -627,6 +645,7 @@ public sealed class InputCoordinator
             if (_mode == InputMode.Controlling)
             {
                 (_refX, _refY) = _platform.ParkCursor(_parkX, _parkY);
+                _staleRef = null;
                 if (IsLocalSecureAttention(previous, current)) ForwardLocalSecureAttention();
             }
         }
@@ -690,7 +709,13 @@ public sealed class InputCoordinator
 
     /// <summary>
     /// Il cursore non è ancora nel punto di parcheggio (vedi <see cref="IInputPlatform.ParkCursor"/>): ce lo porta ora.
-    /// Va chiamato dal thread degli hook, così nessun movimento può essere misurato dal punto sbagliato.
+    /// Va chiamato dal thread degli hook (fuori da una chiamata dell'hook).
+    ///
+    /// Anche così un movimento può essere misurato dal punto sbagliato: se il mouse fisico si sta muovendo, Windows può
+    /// aver già calcolato la posizione dell'evento successivo partendo dal bordo e stare aspettando che questo thread
+    /// chiami l'hook. Quell'evento arriva dopo, con la posizione vicina al bordo: misurato dal centro diventerebbe un
+    /// salto di mezzo schermo sul PC comandato (visto: il cursore entrava dal bordo e saltava subito più in là).
+    /// Per questo ricordo il punto di prima: <see cref="MeasureFrom"/> lo usa per quell'evento.
     /// </summary>
     public void CompletePark()
     {
@@ -698,8 +723,29 @@ public sealed class InputCoordinator
         {
             if (_mode != InputMode.Controlling || (_refX == _parkX && _refY == _parkY)) return;
             _platform.SetCursorPos(_parkX, _parkY);
+            _staleRef = (_refX, _refY);
+            _staleRefSince = Stopwatch.GetTimestamp();
             (_refX, _refY) = (_parkX, _parkY);
         }
+    }
+
+    /// <summary>
+    /// Da dove misurare l'evento in (x, y) mentre si comanda: di solito dal punto di riferimento (il parcheggio), ma
+    /// subito dopo <see cref="CompletePark"/> un evento più vicino al punto di prima è stato calcolato da lì.
+    /// Gli spostamenti di un evento sono piccoli e i due punti lontani: non ci si può sbagliare.
+    /// </summary>
+    private (int X, int Y) MeasureFrom(int x, int y)
+    {
+        if (_staleRef is not { } stale) return (_refX, _refY);
+        if (ElapsedMs(_staleRefSince) > StaleRefWindowMs) { _staleRef = null; return (_refX, _refY); }
+        long DistSq(int ax, int ay) => (long)(x - ax) * (x - ax) + (long)(y - ay) * (y - ay);
+        if (DistSq(stale.X, stale.Y) < DistSq(_refX, _refY))
+        {
+            Log.Info($"Movimento calcolato da Windows prima del parcheggio: misurato da ({stale.X}, {stale.Y}) invece che dal centro");
+            return stale;
+        }
+        _staleRef = null; // arrivato un evento calcolato dal centro: quelli vecchi sono finiti
+        return (_refX, _refY);
     }
 
     private void StartControlling(Guid target, Edge edge, float ratio, int x, int y, IReadOnlyList<Rect> monitors)
@@ -708,6 +754,7 @@ public sealed class InputCoordinator
         _returnY = y;
         (_parkX, _parkY) = monitors.Count > 0 ? monitors[0].Center : (x, y);
         (_refX, _refY) = _platform.ParkCursor(_parkX, _parkY); // siamo già sul thread degli hook
+        _staleRef = null;
         _remoteDownKeys.Clear();
         _swallowUp.Clear();
         _ctrlAltUntil = long.MinValue / 2;
