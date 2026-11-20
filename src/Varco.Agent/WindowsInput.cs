@@ -494,6 +494,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         private readonly bool _replacing;
         private readonly string? _previousDesktop;
         private uint _threadId;
+        private long _lastIgnoredLog; // solo dal thread degli hook (vedi IgnoreWhileControlled)
         /// <summary>Il thread degli hook che sta eseguendo questo codice, se lo è.</summary>
         [ThreadStatic] public static InputThread? Current;
         private const int WM_TIMER = 0x0113;
@@ -712,7 +713,8 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 try
                 {
                     var s = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                    if (s.dwExtraInfo != Marker)
+                    if (s.dwExtraInfo != Marker
+                        && !IgnoreWhileControlled(c, (s.flags & LLMHF_INJECTED) != 0 && !IsPenOrTouch(s.dwExtraInfo), "mouse", (uint)wParam))
                     {
                         _owner.OnPhysicalMouse();
                         var swallow = (int)wParam switch
@@ -741,6 +743,29 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
             return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
         }
 
+        /// <summary>
+        /// Evento iniettato da un altro programma mentre un altro PC ci comanda: lo si lascia passare senza contarlo
+        /// come input fisico. Il client di Desktop remoto (anche la sessione avanzata di Hyper-V) quando prende il
+        /// focus, o mentre lo ha, reinietta tasti e movimenti senza il nostro marcatore: prima sembravano qualcuno che
+        /// toccava questo PC e il controllo tornava al PC con il mouse fisico. Un mouse o una tastiera veri non hanno
+        /// mai il flag "injected". Negli altri stati non cambia niente: per esempio chi comanda questo PC con un
+        /// programma di assistenza remota può ancora passare il bordo.
+        /// </summary>
+        private bool IgnoreWhileControlled(InputCoordinator c, bool foreignInjected, string device, uint what)
+        {
+            if (!foreignInjected || c.Mode != InputMode.Controlled) return false;
+            var now = Environment.TickCount64;
+            if (now - _lastIgnoredLog >= 5000)
+            {
+                _lastIgnoredLog = now;
+                Log.Info($"Input iniettato da un altro programma ({device} 0x{what:X}) mentre sono comandato: non riprendo il controllo");
+            }
+            return true;
+        }
+
+        /// <summary>Mouse simulato da penna o tocco (firma MI_WP_SIGNATURE): è comunque una persona davanti a questo PC.</summary>
+        private static bool IsPenOrTouch(IntPtr extraInfo) => ((ulong)extraInfo & 0xFFFFFF00) == 0xFF515700;
+
         private IntPtr KeyHook(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0 && _owner.Coordinator is { } c)
@@ -753,7 +778,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                     // tornava al PC locale.
                     var ours = s.dwExtraInfo == Marker
                         || ((s.flags & LLKHF_INJECTED) != 0 && KeyCodes.IsAltGrFakeCtrl((ushort)s.vkCode, s.scanCode));
-                    if (!ours)
+                    if (!ours && !IgnoreWhileControlled(c, (s.flags & LLKHF_INJECTED) != 0, "tastiera", s.vkCode))
                     {
                         _owner.TrackModifier((ushort)s.vkCode, s.scanCode, (s.flags & LLKHF_UP) != 0);
                         var flags = KeyFlags.None;
