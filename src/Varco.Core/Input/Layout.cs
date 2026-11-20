@@ -140,23 +140,43 @@ public sealed class Layout
         }
     }
 
+    /// <summary>Cambia le dimensioni di un PC lasciando fermo l'angolo in alto a sinistra (vedi <see cref="Reframe"/>).</summary>
+    public void Resize(LayoutEntry e, int width, int height) => Reframe(e, e.X, e.Y, width, height);
+
     /// <summary>
-    /// Cambia le dimensioni di un PC mantenendo la disposizione: chi stava interamente alla sua destra (o sotto)
-    /// si sposta della stessa differenza, così i PC che lo toccavano continuano a toccarlo.
+    /// Porta un PC al nuovo rettangolo mantenendo la disposizione: chi gli sta accanto (a destra, a sinistra, sopra o sotto,
+    /// affiancato almeno in parte) si sposta quanto il bordo che toccava, così continua a toccarlo.
+    /// Chi non gli è affiancato resta fermo: se si muovesse, rimpicciolire e poi ingrandire non lo riporterebbe dov'era.
     /// </summary>
-    public void Resize(LayoutEntry e, int width, int height)
+    public void Reframe(LayoutEntry e, int x, int y, int width, int height)
     {
-        int dw = width - e.Width, dh = height - e.Height;
-        int oldRight = e.Right, oldBottom = e.Bottom;
+        int dl = x - e.X, dt = y - e.Y, dr = x + width - e.Right, db = y + height - e.Bottom;
         foreach (var n in Entries)
         {
             if (n == e) continue;
-            if (dw != 0 && n.X >= oldRight - EdgeTolerance) n.X += dw;
-            if (dh != 0 && n.Y >= oldBottom - EdgeTolerance) n.Y += dh;
+            bool sideBySide = n.Y < e.Bottom - EdgeTolerance && n.Bottom > e.Y + EdgeTolerance;
+            bool stacked = n.X < e.Right - EdgeTolerance && n.Right > e.X + EdgeTolerance;
+            if (sideBySide)
+            {
+                if (n.X >= e.Right - EdgeTolerance) n.X += dr;
+                else if (n.Right <= e.X + EdgeTolerance) n.X += dl;
+            }
+            if (stacked)
+            {
+                if (n.Y >= e.Bottom - EdgeTolerance) n.Y += db;
+                else if (n.Bottom <= e.Y + EdgeTolerance) n.Y += dt;
+            }
         }
+        e.X = x;
+        e.Y = y;
         e.Width = width;
         e.Height = height;
     }
+
+    /// <summary>Riassunto leggibile per il log: versione e rettangolo di ogni PC.</summary>
+    public string Describe() =>
+        $"v{Version}: " + string.Join("; ", Entries.Select(e =>
+            $"{e.Name} {e.X},{e.Y} {e.Width}x{e.Height}" + (e.Monitors.Count > 1 ? $" ({e.Monitors.Count} monitor)" : "")));
 
     /// <summary>Sposta tutto perché l'angolo in alto a sinistra sia (0,0): non cambia chi tocca chi.</summary>
     public void ToOrigin()
@@ -246,6 +266,8 @@ public sealed class LayoutManager
     private readonly string _selfName;
     private (int W, int H)? _selfSize;
     private List<LayoutMonitor>? _selfMonitors;
+    // Monitor principale di Windows (quello in 0,0), relativo all'angolo in alto a sinistra del desktop.
+    private LayoutMonitor? _selfPrimary;
     private Layout _current;
 
     /// <summary>Il layout è cambiato: va salvato e inviato agli altri.</summary>
@@ -283,7 +305,7 @@ public sealed class LayoutManager
         }
         // Se il layout adottato non contiene me o i PC connessi (o ha la mia dimensione sbagliata) lo correggo e riparte la propagazione.
         var bumped = EnsureMembers(connected);
-        if (adopted && !bumped) Raise();
+        if (adopted && !bumped) Raise($"ricevuta da {AuthorName(incoming)}");
         return adopted;
     }
 
@@ -292,7 +314,7 @@ public sealed class LayoutManager
     /// </summary>
     public bool EnsureMembers(IEnumerable<(Guid Id, string Name)> members)
     {
-        bool changed = false;
+        var reasons = new List<string>();
         lock (_gate)
         {
             foreach (var (id, name) in members.Prepend((_self, _selfName)))
@@ -301,25 +323,38 @@ public sealed class LayoutManager
                 var (w, h) = id == _self && _selfSize is { } s ? s : (Layout.DefaultWidth, Layout.DefaultHeight);
                 var last = _current.Entries.MaxBy(e => e.Right);
                 _current.Entries.Add(new LayoutEntry { Id = id, Name = name, X = last?.Right ?? 0, Y = last?.Y ?? 0, Width = w, Height = h });
-                changed = true;
+                reasons.Add($"aggiunto {name}");
             }
-            if (_selfSize is { } size && _current.Find(_self) is { } me)
+            if (_selfSize is { } size && _selfMonitors is { } mons && _current.Find(_self) is { } me
+                && (me.Width != size.W || me.Height != size.H || !me.Monitors.SequenceEqual(mons)))
             {
-                if (me.Width != size.W || me.Height != size.H)
-                {
-                    _current.Resize(me, size.W, size.H);
-                    changed = true;
-                }
-                if (_selfMonitors is { } mons && !me.Monitors.SequenceEqual(mons))
-                {
-                    me.Monitors = mons.ToList();
-                    changed = true;
-                }
+                // Il monitor principale resta dov'era nella disposizione: collegando un monitor sopra o a sinistra
+                // il rettangolo cresce da quella parte, invece di spingere in giù (o a destra) lo schermo del PC.
+                var (dx, dy) = PrimaryShift(me, _selfPrimary);
+                var before = $"{me.X},{me.Y} {me.Width}x{me.Height}";
+                _current.Reframe(me, me.X + dx, me.Y + dy, size.W, size.H);
+                me.Monitors = mons.ToList();
+                _current.ToOrigin();
+                reasons.Add($"monitor di questo PC cambiati ({before} → {me.Width}x{me.Height}, {Math.Max(1, mons.Count)} monitor)");
             }
-            if (changed) Bump();
+            if (reasons.Count > 0) Bump();
         }
-        if (changed) Raise();
-        return changed;
+        if (reasons.Count > 0) Raise(string.Join(", ", reasons));
+        return reasons.Count > 0;
+    }
+
+    /// <summary>
+    /// Di quanto spostare il rettangolo di questo PC perché il monitor principale resti nello stesso punto: lo si cerca
+    /// fra i monitor di prima (stessa dimensione; a parità, nella stessa posizione). Se non c'era (risoluzione cambiata)
+    /// resta fermo l'angolo in alto a sinistra.
+    /// </summary>
+    private static (int Dx, int Dy) PrimaryShift(LayoutEntry me, LayoutMonitor? primary)
+    {
+        if (primary is null) return (0, 0);
+        IReadOnlyList<LayoutMonitor> old = me.Monitors.Count > 0 ? me.Monitors : [new LayoutMonitor(0, 0, me.Width, me.Height)];
+        var same = old.Where(m => m.Width == primary.Width && m.Height == primary.Height).ToList();
+        var match = same.FirstOrDefault(m => m.X == primary.X && m.Y == primary.Y) ?? same.FirstOrDefault();
+        return match is null ? (0, 0) : (match.X - primary.X, match.Y - primary.Y);
     }
 
     /// <summary>Dimensione attuale del desktop di questo PC, con un solo monitor.</summary>
@@ -336,11 +371,14 @@ public sealed class LayoutManager
         if (b.Width <= 0 || b.Height <= 0) return;
         // Un solo monitor coincide con il rettangolo: lista vuota, come la scrivono le versioni precedenti (niente versioni in più).
         var rel = monitors.Count == 1 ? [] : LayoutMonitor.From(monitors);
+        var p = monitors.FirstOrDefault(m => m.Left == 0 && m.Top == 0, monitors.FirstOrDefault(m => m.Contains(0, 0), monitors[0]));
+        var primary = new LayoutMonitor(p.Left - b.Left, p.Top - b.Top, p.Width, p.Height);
         lock (_gate)
         {
             if (_selfSize == (b.Width, b.Height) && _selfMonitors is { } cur && cur.SequenceEqual(rel)) return;
             _selfSize = (b.Width, b.Height);
             _selfMonitors = rel;
+            _selfPrimary = primary;
         }
         EnsureMembers([]);
     }
@@ -351,7 +389,7 @@ public sealed class LayoutManager
         lock (_gate) _current = new Layout();
         EnsureMembers([]);
         lock (_gate) { _current.Version = 0; _current.Author = Guid.Empty; }
-        Raise();
+        Raise("azzerata");
     }
 
     /// <summary>Scelta dell'utente: nuove posizioni (pixel virtuali, angolo in alto a sinistra) dei PC indicati.</summary>
@@ -368,7 +406,7 @@ public sealed class LayoutManager
             _current.ToOrigin();
             Bump();
         }
-        Raise();
+        Raise("spostata dall'utente");
     }
 
     /// <summary>Toglie dalla disposizione i PC indicati (mai questo), lasciando gli altri dove sono.</summary>
@@ -380,7 +418,7 @@ public sealed class LayoutManager
             _current.ToOrigin();
             Bump();
         }
-        Raise();
+        Raise("rimossi dei PC");
     }
 
     /// <summary>PC in fila da sinistra a destra, allineati in alto.</summary>
@@ -400,7 +438,7 @@ public sealed class LayoutManager
             }).ToList();
             Bump();
         }
-        Raise();
+        Raise("PC messi in fila dall'utente");
     }
 
     private void Bump()
@@ -409,9 +447,13 @@ public sealed class LayoutManager
         _current.Author = _self;
     }
 
-    private void Raise()
+    private static string AuthorName(Layout l) =>
+        l.Find(l.Author)?.Name ?? (l.Author == Guid.Empty ? "un PC" : l.Author.ToString()[..8]);
+
+    private void Raise(string reason)
     {
         var snapshot = Current;
+        Log.Info($"Disposizione {reason}: {snapshot.Describe()}");
         try { Changed?.Invoke(snapshot); }
         catch (Exception ex) { Log.Error("Layout.Changed", ex); }
     }

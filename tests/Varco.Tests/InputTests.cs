@@ -282,6 +282,79 @@ public class LayoutTests
         Assert.Equal(new LayoutMonitor(0, 0, 1920, 1080), lm.Current.Find(A)!.Monitors[1]);
     }
 
+    // Portatile (A, 1920x1200) a destra del fisso (B, 3440x2880), allineato in basso; al portatile si collega
+    // un monitor esterno a destra e un po' più in alto, come in Impostazioni → Schermo: [1920,-296 1920x1080].
+    private static readonly Rect LaptopScreen = new(0, 0, 1920, 1200), ExternalAbove = new(1920, -296, 3840, 784);
+
+    private static Layout DeskWithLaptopOnTheRight() => new()
+    {
+        Version = 5,
+        Entries =
+        [
+            new LayoutEntry { Id = B, Name = "B", X = 0, Y = 0, Width = 3440, Height = 2880 },
+            new LayoutEntry { Id = A, Name = "A", X = 3440, Y = 1680, Width = 1920, Height = 1200 },
+        ],
+    };
+
+    /// <summary>Lo schermo del portatile (1920x1200) nella disposizione.</summary>
+    private static Rect PrimaryOf(LayoutManager lm, Guid id) => lm.Current.Find(id)!.Screens().First(r => r.Width == 1920 && r.Height == 1200);
+
+    [Fact]
+    public void Plugging_a_monitor_keeps_the_primary_screen_where_it_was()
+    {
+        var lm = new LayoutManager(A, "A", DeskWithLaptopOnTheRight());
+        lm.SetSelfMonitors([LaptopScreen]);
+        var before = PrimaryOf(lm, A);
+        Assert.Equal(new Rect(3440, 1680, 5360, 2880), before);
+
+        lm.SetSelfMonitors([LaptopScreen, ExternalAbove]);   // monitor collegato
+        Assert.Equal(before, PrimaryOf(lm, A));
+        Assert.Equal(new Rect(0, 0, 3440, 2880), lm.Current.Find(B)!.Screens()[0]);
+        Assert.Equal(A, lm.Cross(B, Edge.Right, 0.9f)?.Id);
+
+        lm.SetSelfMonitors([LaptopScreen]);                  // e scollegato
+        Assert.Equal(before, PrimaryOf(lm, A));
+        Assert.Equal((3440, 1680), (lm.Current.Find(A)!.X, lm.Current.Find(A)!.Y));
+    }
+
+    [Fact]
+    public void Monitor_unplugged_while_Varco_was_off_keeps_the_primary_screen_where_it_was()
+    {
+        // Spento col monitor esterno collegato (disposizione salvata così), riacceso senza.
+        var lm = new LayoutManager(A, "A", DeskWithLaptopOnTheRight());
+        lm.SetSelfMonitors([LaptopScreen, ExternalAbove]);
+        var saved = lm.Current;
+        var before = PrimaryOf(lm, A);
+
+        var restarted = new LayoutManager(A, "A", saved);
+        restarted.SetSelfMonitors([LaptopScreen]);
+        Assert.Equal(before, PrimaryOf(restarted, A));
+
+        var again = new LayoutManager(A, "A", restarted.Current);
+        again.SetSelfMonitors([LaptopScreen, ExternalAbove]);
+        Assert.Equal(before, PrimaryOf(again, A));
+    }
+
+    [Fact]
+    public void Shrinking_and_growing_back_leaves_unrelated_pcs_where_they_were()
+    {
+        // B sta sotto A, spostato a destra: né accanto al bordo destro di A né al sinistro.
+        var l = new Layout
+        {
+            Entries =
+            [
+                new LayoutEntry { Id = A, Name = "A", X = 0, Y = 0, Width = 3840, Height = 1080 },
+                new LayoutEntry { Id = B, Name = "B", X = 2000, Y = 1080, Width = 1920, Height = 1080 },
+            ],
+        };
+        var lm = new LayoutManager(A, "A", l);
+        lm.SetSelfMonitors([new Rect(0, 0, 1920, 1080), new Rect(1920, 0, 3840, 1080)]);
+        lm.SetSelfMonitors([new Rect(0, 0, 1920, 1080)]);   // un monitor si spegne
+        lm.SetSelfMonitors([new Rect(0, 0, 1920, 1080), new Rect(1920, 0, 3840, 1080)]);
+        var b = lm.Current.Find(B)!;
+        Assert.Equal((2000, 1080), (b.X, b.Y));
+    }
+
     [Fact]
     public void Monitors_survive_the_wire_format()
     {
