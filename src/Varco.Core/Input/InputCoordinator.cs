@@ -50,6 +50,11 @@ public interface IInputPlatform
     /// qualcuno non muove il mouse di questo PC (o un altro PC torna a comandarlo).
     /// </summary>
     void HideIdleCursor() { }
+    /// <summary>
+    /// In questo momento si sta spostando o ridimensionando una finestra (Windows: il ciclo di spostamento, GUI_INMOVESIZE)?
+    /// Chiamato solo dal thread di input.
+    /// </summary>
+    bool IsMovingWindow() => false;
 }
 
 public enum InputMode { Local, Controlling, Controlled }
@@ -161,6 +166,20 @@ public sealed class InputCoordinator
     // si sommano a lui invece di diventare un altro evento.
     private sealed class WheelSlot { public int Delta; public bool Horizontal; }
     private WheelSlot? _wheelSlot;
+    // Spostamento di una finestra: posizione già decisa (_vx, _vy) ma non ancora iniettata, e quando è stato iniettato
+    // l'ultimo movimento. Solo sul thread di input.
+    private bool _movePending;
+    private long _lastMoveInjected = long.MinValue / 2;
+    private readonly Timer _moveFlushTimer;
+
+    /// <summary>
+    /// Mentre si sposta o ridimensiona una finestra, intervallo minimo fra due movimenti iniettati (ms); nel frattempo
+    /// conta solo l'ultima posizione. Alcune app (WhatsApp, WinUI) spostano la finestra al massimo una volta per fotogramma
+    /// e con il mouse iniettato non saltano all'ultima posizione: ripercorrono tutte quelle in coda, una per fotogramma.
+    /// Con un movimento ogni 4 ms la coda cresceva e la finestra restava indietro di centinaia di millisecondi (misurato:
+    /// a 4 e 8 ms resta indietro, da 12 ms in su segue il cursore al pixel). Il mouse fisico non ha questo problema.
+    /// </summary>
+    public int WindowMoveIntervalMs { get; init; } = 16;
 
     public InputCoordinator(IPeerNetwork net, IInputPlatform platform, LayoutManager layout)
     {
@@ -175,6 +194,7 @@ public sealed class InputCoordinator
                 FlushPending();
             }
         });
+        _moveFlushTimer = new Timer(_ => _platform.Post(FlushThrottledMove));
         SyncDesktopSize();
     }
 
@@ -529,7 +549,39 @@ public sealed class InputCoordinator
     private void PostInput(Action action)
     {
         _wheelSlot = null;
-        _platform.Post(action);
+        _platform.Post(() =>
+        {
+            FlushThrottledMove(); // il clic o il tasto arriva dove il cursore è già arrivato
+            action();
+        });
+    }
+
+    /// <summary>
+    /// Inietta il movimento verso (x, y), oppure lo rimanda se si sta spostando una finestra e l'ultimo è troppo recente
+    /// (vedi <see cref="WindowMoveIntervalMs"/>): allo scadere parte l'ultima posizione. Solo sul thread di input.
+    /// </summary>
+    private void InjectCursorMove(int x, int y)
+    {
+        var since = ElapsedMs(_lastMoveInjected);
+        if (since < WindowMoveIntervalMs && _platform.IsMovingWindow())
+        {
+            if (_movePending) return;
+            _movePending = true;
+            _moveFlushTimer.Change(Math.Max(1, (int)Math.Ceiling(WindowMoveIntervalMs - since)), Timeout.Infinite);
+            return;
+        }
+        _movePending = false;
+        _platform.InjectMoveTo(x, y);
+        _lastMoveInjected = Stopwatch.GetTimestamp();
+    }
+
+    /// <summary>Inietta il movimento rimandato da <see cref="InjectCursorMove"/>, se c'è. Solo sul thread di input.</summary>
+    private void FlushThrottledMove()
+    {
+        if (!_movePending) return;
+        _movePending = false;
+        _platform.InjectMoveTo(_vx, _vy);
+        _lastMoveInjected = Stopwatch.GetTimestamp();
     }
 
     private void InjectWheel(int delta, bool horizontal)
@@ -550,6 +602,7 @@ public sealed class InputCoordinator
                 d = slot.Delta;
                 if (_wheelSlot == slot) _wheelSlot = null;
             }
+            FlushThrottledMove();
             if (d != 0) _platform.InjectWheel(d, slot.Horizontal);
         });
     }
@@ -577,7 +630,7 @@ public sealed class InputCoordinator
                 if (IsLocalSecureAttention(previous, current)) ForwardLocalSecureAttention();
             }
         }
-        _platform.Post(() => _vValid = false);
+        _platform.Post(() => (_vValid, _movePending) = (false, false)); // la posizione rimandata valeva per il desktop di prima
     }
 
     /// <summary>
@@ -725,6 +778,7 @@ public sealed class InputCoordinator
         {
             var (x, y) = ScreenGeometry.EntryPoint(_platform.GetMonitors(), e.From, e.Ratio);
             _platform.InjectMoveTo(x, y);
+            _lastMoveInjected = Stopwatch.GetTimestamp();
             (_vx, _vy, _vValid) = (x, y, true);
         });
     }
@@ -753,13 +807,14 @@ public sealed class InputCoordinator
     private void InjectMove(int dx, int dy)
     {
         var controller = _peer;
-        PostInput(() =>
+        _wheelSlot = null; // come PostInput, ma senza iniettare prima il movimento rimandato: questo lo sostituisce
+        _platform.Post(() =>
         {
             var monitors = _platform.GetMonitors();
             if (!_vValid) { (_vx, _vy) = _platform.GetCursorPos(); _vValid = true; }
             var (cx, cy) = (_vx, _vy);
             var (nx, ny, hit) = ScreenGeometry.MoveBy(monitors, cx, cy, dx, dy);
-            if (nx != cx || ny != cy) _platform.InjectMoveTo(nx, ny);
+            if (nx != cx || ny != cy) InjectCursorMove(nx, ny);
             (_vx, _vy) = (nx, ny);
 
             lock (_gate)

@@ -324,6 +324,8 @@ public class CoordinatorTests
         public bool IsFullscreenAppAt(int x, int y) => Fullscreen;
         public void CancelLocalDrag() => Log.Add("cancel drag");
         public void HideIdleCursor() => Log.Add("idle hidden");
+        public bool MovingWindow;
+        public bool IsMovingWindow() => MovingWindow;
         /// <summary>Come Windows con la finestra che nasconde il cursore: il cursore resta dov'è fino a CompletePark.</summary>
         public bool DeferPark;
         public (int X, int Y) ParkCursor(int x, int y)
@@ -345,7 +347,8 @@ public class CoordinatorTests
         public void CancelIncoming() => Log.Add("cancel");
     }
 
-    private static (InputCoordinator c, FakeNet net, FakePlatform p, Guid other) Setup(bool otherOnRight = true, int moveIntervalMs = 4)
+    private static (InputCoordinator c, FakeNet net, FakePlatform p, Guid other) Setup(bool otherOnRight = true, int moveIntervalMs = 4,
+        int windowMoveIntervalMs = 16)
     {
         var self = Guid.NewGuid();
         var other = Guid.NewGuid();
@@ -354,7 +357,52 @@ public class CoordinatorTests
         var layout = new LayoutManager(self, "me", new Layout());
         layout.SetRow(otherOnRight ? [(self, "me"), (other, "other")] : [(other, "other"), (self, "me")]);
         var p = new FakePlatform();
-        return (new InputCoordinator(net, p, layout) { MoveIntervalMs = moveIntervalMs }, net, p, other);
+        return (new InputCoordinator(net, p, layout) { MoveIntervalMs = moveIntervalMs, WindowMoveIntervalMs = windowMoveIntervalMs },
+            net, p, other);
+    }
+
+    [Fact]
+    public void Moving_a_window_on_the_target_injects_only_the_latest_position()
+    {
+        var (c, _, p, other) = Setup(windowMoveIntervalMs: 300);
+        c.OnMessage(other, new Enter(Edge.Left, 0.5f), () => []);
+        var (x, y) = p.Cursor;
+        c.OnMessage(other, new MouseButtonMsg(MouseButton.Left, true), () => []);
+        p.MovingWindow = true;
+        p.Log.Clear();
+        c.OnMessage(other, new MouseMove(10, 0), () => []);
+        c.OnMessage(other, new MouseMove(10, 0), () => []);
+        c.OnMessage(other, new MouseMove(10, 5), () => []);
+        Assert.Empty(p.Log); // appena entrati: tutto rimandato
+        // Il rilascio arriva dopo l'ultima posizione, non dove era rimasto il cursore.
+        c.OnMessage(other, new MouseButtonMsg(MouseButton.Left, false), () => []);
+        Assert.Equal([$"move {x + 30},{y + 5}", "btn Left False"], p.Log);
+    }
+
+    [Fact]
+    public void Held_back_window_move_is_injected_when_the_mouse_stops()
+    {
+        var (c, _, p, other) = Setup(windowMoveIntervalMs: 50);
+        c.OnMessage(other, new Enter(Edge.Left, 0.5f), () => []);
+        var (x, y) = p.Cursor;
+        p.MovingWindow = true;
+        p.Log.Clear();
+        c.OnMessage(other, new MouseMove(10, 0), () => []);
+        c.OnMessage(other, new MouseMove(10, 0), () => []);
+        Thread.Sleep(400);
+        Assert.Equal([$"move {x + 20},{y}"], p.Log);
+    }
+
+    [Fact]
+    public void Without_a_window_move_every_position_is_injected()
+    {
+        var (c, _, p, other) = Setup(windowMoveIntervalMs: 300);
+        c.OnMessage(other, new Enter(Edge.Left, 0.5f), () => []);
+        var (x, y) = p.Cursor;
+        p.Log.Clear();
+        c.OnMessage(other, new MouseMove(10, 0), () => []);
+        c.OnMessage(other, new MouseMove(10, 0), () => []);
+        Assert.Equal([$"move {x + 10},{y}", $"move {x + 20},{y}"], p.Log);
     }
 
     [Fact]

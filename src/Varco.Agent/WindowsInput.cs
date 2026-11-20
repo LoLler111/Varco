@@ -267,6 +267,28 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         }
     }
 
+    /// <summary>
+    /// Il thread in primo piano è nel ciclo di spostamento/ridimensionamento di una finestra (GUI_INMOVESIZE). Con il
+    /// mouse iniettato da uno script vale 99% del tempo mentre si trascina la barra del titolo, anche per WhatsApp (WinUI).
+    /// </summary>
+    public bool IsMovingWindow()
+    {
+        var info = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+        return GetGUIThreadInfo(0, ref info) && (info.flags & GUI_INMOVESIZE) != 0;
+    }
+
+    private const uint GUI_INMOVESIZE = 0x2;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GUITHREADINFO
+    {
+        public int cbSize;
+        public uint flags;
+        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+        public RECT rcCaret;
+    }
+
+    [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint threadId, ref GUITHREADINFO info);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern bool IsZoomed(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
