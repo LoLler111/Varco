@@ -13,7 +13,8 @@ internal sealed class TrayContext : ApplicationContext
     private static readonly Color Gray = Color.FromArgb(140, 140, 140);
     private static readonly Color Green = Color.FromArgb(46, 160, 67);
     private static readonly Color Orange = Color.FromArgb(219, 140, 20);
-    private static readonly Color Blue = Color.FromArgb(40, 110, 220);
+    private static readonly Color Blue = Color.FromArgb(40, 110, 220);     // questo PC comanda un altro PC
+    private static readonly Color Magenta = Color.FromArgb(200, 50, 160);  // questo PC è comandato da un altro
 
     private readonly NotifyIcon _icon;
     private readonly ContextMenuStrip _menu = new();
@@ -139,7 +140,8 @@ internal sealed class TrayContext : ApplicationContext
         {
             var connected = _last.Peers.Count(p => p.State == "Connected");
             var total = _last.Peers.Count;
-            color = _last.Mode != "Local" ? Blue
+            color = _last.Mode == "Controlling" ? Blue
+                : _last.Mode == "Controlled" ? Magenta
                 : total > 0 && connected == total ? Green
                 : connected > 0 ? Orange
                 : Gray;
