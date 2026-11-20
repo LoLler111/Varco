@@ -27,7 +27,7 @@ public sealed class ControlRequest
     /// <summary>
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
-    /// checkUpdate | installUpdateNow (anche sugli altri PC collegati) | setAutoUpdate (Enabled) | setClipboard (Enabled) | setMonitorStandby (Enabled) |
+    /// checkUpdate | installUpdateNow (anche sugli altri PC collegati) | setAutoUpdate (Enabled) | setClipboard (Enabled) | setMonitorStandby (Enabled) | setKeepScreenOnWithAudio (Enabled) |
     /// setEdgeOption (Option = corners | delay | fullscreen | scrollLock, Enabled) | exportLogs (risposta in Zip) | setPaused (Enabled = true disattiva la connessione) |
     /// filesOffer (Seq, attesa lunga) | localFiles (Paths: file copiati su questo PC, letti dall'icona) |
     /// dragEvents (Seq, attesa lunga) | dragFiles (Seq, Paths: file trascinati contro il bordo, vuoto = nessuno) |
@@ -118,6 +118,7 @@ public sealed class StatusDto
     public bool AutoUpdate { get; set; } = true;
     public bool ShareClipboard { get; set; } = true;
     public bool MonitorStandby { get; set; } = true;
+    public bool KeepScreenOnWithAudio { get; set; } = true;
     public bool EdgeCorners { get; set; } = true;
     public bool EdgeDelay { get; set; }
     public bool EdgeBlockFullscreen { get; set; } = true;

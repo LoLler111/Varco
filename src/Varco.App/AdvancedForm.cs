@@ -14,6 +14,7 @@ internal sealed class AdvancedForm : Form
     private readonly Toggle _autoUpdate = new("Aggiorna Varco automaticamente (consigliato)");
     private readonly Toggle _clipboard = new("Condividi gli appunti tra i PC");
     private readonly Toggle _standby = new("Spegni i monitor di questo PC mentre usi un altro PC");
+    private readonly Toggle _audioKeepsOn = new("Tieni acceso lo schermo mentre suona musica o un video") { Margin = Ui.P(0, 12, 0, 0) };
     private readonly Label _updateText;
     private readonly VButton _installNow = new("Aggiorna subito tutti i PC", primary: true);
     private StatusDto? _status;
@@ -96,6 +97,13 @@ internal sealed class AdvancedForm : Form
             "e li riaccende quando torni qui, salvo che un video o una presentazione li tenga accesi. " +
             "Funziona con i monitor esterni che supportano DDC/CI (di solito si attiva dal menu del monitor); " +
             "lo schermo dei portatili resta acceso.", Ui.Small, Ui.Muted, screens.InnerWidth, Ui.P(0, 8, 0, 0)));
+        _audioKeepsOn.Checked = status?.KeepScreenOnWithAudio ?? true;
+        _audioKeepsOn.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setKeepScreenOnWithAudio", Enabled = _audioKeepsOn.Checked });
+        screens.Body.Controls.Add(_audioKeepsOn);
+        screens.Body.Controls.Add(Ui.Label("Utile se le casse sono collegate al monitor e si spengono con lui. " +
+            "Sul PC che usi da un altro PC, Windows spegnerebbe lo schermo anche con la musica: Varco lo tiene acceso finché esce del suono. " +
+            "Sul PC da cui comandi, i monitor non vanno in standby finché esce del suono. " +
+            "Da impostare su ogni PC.", Ui.Small, Ui.Muted, screens.InnerWidth, Ui.P(0, 8, 0, 0)));
         left.Controls.Add(screens);
 
         // bordi

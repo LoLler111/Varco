@@ -60,8 +60,12 @@ public static class AgentMain
         }
 
         using var standby = noInput ? null
-            : new MonitorStandby(() => store.Current.MonitorStandby, Path.Combine(configDir, "monitor-standby.txt"));
+            : new MonitorStandby(() => store.Current.MonitorStandby, () => store.Current.KeepScreenOnWithAudio,
+                Path.Combine(configDir, "monitor-standby.txt"));
         if (standby is not null) host.Coordinator.ModeChanged += standby.OnModeChanged;
+
+        using var keepAwake = platform is WindowsInput input ? new MediaKeepAwake(() => store.Current.KeepScreenOnWithAudio, () => input.LastPhysicalInputMs) : null;
+        if (keepAwake is not null) host.Coordinator.ModeChanged += keepAwake.OnModeChanged;
 
         using var power = new PowerNotifier();
         power.Suspending += host.OnSuspend;

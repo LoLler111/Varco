@@ -1184,3 +1184,51 @@ public class MonitorStandbyPolicyTests
         Assert.Equal(StandbyAction.None, p.Decide(500_100, 300, false, true)); // niente da riaccendere
     }
 }
+
+public class MediaKeepAwakePolicyTests
+{
+    [Fact]
+    public void Remote_while_controlled_and_after_control_leaves_until_touched()
+    {
+        var p = new MediaKeepAwakePolicy();
+        Assert.False(p.IsRemote(0)); // mai comandato: lo si usa da qui
+        p.OnModeChanged(InputMode.Controlled, 1_000);
+        Assert.True(p.IsRemote(500));
+        p.OnModeChanged(InputMode.Local, 5_000); // il controllo torna sul PC che comandava
+        Assert.True(p.IsRemote(500));
+        Assert.False(p.IsRemote(6_000)); // qualcuno ha mosso il mouse di questo PC
+    }
+
+    [Fact]
+    public void Physical_takeover_makes_it_local()
+    {
+        var p = new MediaKeepAwakePolicy();
+        p.OnModeChanged(InputMode.Controlled, 1_000);
+        p.OnModeChanged(InputMode.Local, 2_000); // ripreso con il mouse di qui (input fisico a 2_000)
+        Assert.False(p.IsRemote(2_000));
+    }
+
+    [Fact]
+    public void Not_remote_while_controlling_another_pc()
+    {
+        var p = new MediaKeepAwakePolicy();
+        p.OnModeChanged(InputMode.Controlled, 1_000);
+        p.OnModeChanged(InputMode.Local, 2_000);
+        p.OnModeChanged(InputMode.Controlling, 3_000); // la persona è qui, anche se l'input passa altrove
+        Assert.False(p.IsRemote(500));
+        p.OnModeChanged(InputMode.Local, 4_000);
+        Assert.False(p.IsRemote(500));
+    }
+
+    [Fact]
+    public void Controlled_again_starts_a_new_turn()
+    {
+        var p = new MediaKeepAwakePolicy();
+        p.OnModeChanged(InputMode.Controlled, 1_000);
+        p.OnModeChanged(InputMode.Local, 2_000);
+        Assert.False(p.IsRemote(3_000)); // usato da qui
+        p.OnModeChanged(InputMode.Controlled, 10_000);
+        p.OnModeChanged(InputMode.Local, 11_000);
+        Assert.True(p.IsRemote(3_000)); // poi di nuovo comandato e lasciato lì
+    }
+}

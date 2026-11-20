@@ -298,6 +298,11 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     Log.Info($"Standby dei monitor mentre si comanda un altro PC {(req.Enabled != false ? "attivato" : "disattivato")}");
                     return new ControlResponse { Status = GetStatus() };
 
+                case "setKeepScreenOnWithAudio":
+                    _store.Update(c => c.KeepScreenOnWithAudio = req.Enabled != false, immediate: true);
+                    Log.Info($"Schermo acceso mentre suona musica o un video {(req.Enabled != false ? "attivato" : "disattivato")}");
+                    return new ControlResponse { Status = GetStatus() };
+
                 case "setEdgeOption":
                 {
                     var on = req.Enabled != false;
@@ -464,6 +469,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             AutoUpdate = cfg.AutoUpdate,
             ShareClipboard = cfg.ShareClipboard,
             MonitorStandby = cfg.MonitorStandby,
+            KeepScreenOnWithAudio = cfg.KeepScreenOnWithAudio,
             EdgeCorners = cfg.EdgeCorners,
             EdgeDelay = cfg.EdgeDelay,
             EdgeBlockFullscreen = cfg.EdgeBlockFullscreen,

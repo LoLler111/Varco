@@ -42,6 +42,13 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     /// <summary>Cursore nascosto perché questo PC era comandato e il controllo è passato altrove (vedi HideIdleCursor).</summary>
     private volatile bool _idleHidden;
     private bool CursorShouldHide => _controlling || _idleHidden;
+    private long _lastPhysicalInput;
+
+    /// <summary>
+    /// Ultimo input fisico visto dagli hook (non iniettato: né da Varco né da altri programmi; penna e tocco contano), in
+    /// ms di TickCount64; 0 = mai. Dice se qualcuno è davanti a questo PC (vedi MediaKeepAwake).
+    /// </summary>
+    public long LastPhysicalInputMs => Volatile.Read(ref _lastPhysicalInput);
     private InputCoordinator? _coordinator;
 
     public InputCoordinator? Coordinator
@@ -735,6 +742,8 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 try
                 {
                     var s = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                    if ((s.flags & LLMHF_INJECTED) == 0 || IsPenOrTouch(s.dwExtraInfo))
+                        Volatile.Write(ref _owner._lastPhysicalInput, Environment.TickCount64);
                     if (s.dwExtraInfo != Marker
                         && !IgnoreWhileControlled(c, (s.flags & LLMHF_INJECTED) != 0 && !IsPenOrTouch(s.dwExtraInfo), "mouse", (uint)wParam))
                     {
@@ -795,6 +804,7 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
                 try
                 {
                     var s = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                    if ((s.flags & LLKHF_INJECTED) == 0) Volatile.Write(ref _owner._lastPhysicalInput, Environment.TickCount64);
                     // Il Ctrl che Windows aggiunge ad AltGr iniettato non porta il marcatore: è comunque nostro. Senza
                     // questo controllo, sul PC comandato AltGr (es. AltGr+ò = @) sembrava input fisico e il controllo
                     // tornava al PC locale.

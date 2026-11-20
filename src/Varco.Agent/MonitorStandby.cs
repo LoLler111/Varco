@@ -33,19 +33,24 @@ internal sealed class MonitorStandby : IDisposable
 
     private readonly MonitorStandbyPolicy _policy = new();
     private readonly Func<bool> _enabled;
+    private readonly Func<bool> _audioKeepsOn;
     private readonly string _markerPath;
     private readonly AutoResetEvent _signal = new(false);
     private readonly Thread _thread;
     private volatile bool _stop;
     /// <summary>Monitor mandati in standby da noi (solo il thread di lavoro li tocca).</summary>
     private List<PhysicalMonitor> _asleep = [];
+    /// <summary>Standby rimandato perché suona qualcosa (solo per scriverlo una volta nel log).</summary>
+    private bool _heldByAudio;
 
     private readonly record struct PhysicalMonitor(IntPtr Handle, string Name);
 
     /// <param name="markerPath">File che esiste finché ci sono monitor in standby (vedi sopra).</param>
-    public MonitorStandby(Func<bool> enabled, string markerPath)
+    /// <param name="audioKeepsOn">Impostazione "schermo acceso mentre suona musica o un video".</param>
+    public MonitorStandby(Func<bool> enabled, Func<bool> audioKeepsOn, string markerPath)
     {
         _enabled = enabled;
+        _audioKeepsOn = audioKeepsOn;
         _markerPath = markerPath;
         _thread = new Thread(Run) { IsBackground = true, Name = "Varco.MonitorStandby" };
         _thread.Start();
@@ -74,6 +79,13 @@ internal sealed class MonitorStandby : IDisposable
     {
         var enabled = _enabled();
         var action = _policy.Decide(Environment.TickCount64, enabled ? DisplayTimeoutSeconds() : 0, DisplayRequired(), enabled);
+        // Musica in corso: niente standby, spesso le casse sono collegate al monitor e si spegnerebbero con lui.
+        // Si legge solo quando sarebbe ora (la lettura dura fino a un secondo); senza Applied si ricontrolla al prossimo giro.
+        var playing = action == StandbyAction.Standby && _audioKeepsOn() && AudioOutput.IsPlaying(() => _stop);
+        if (playing && !_heldByAudio)
+            Log.Info("Si sta comandando un altro PC, ma su questo suona musica o un video: i monitor restano accesi");
+        _heldByAudio = playing;
+        if (playing) return;
         switch (action)
         {
             case StandbyAction.Standby: Standby(); break;

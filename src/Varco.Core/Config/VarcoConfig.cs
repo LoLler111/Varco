@@ -58,6 +58,13 @@ public sealed class VarcoConfig
     /// </summary>
     public bool MonitorStandby { get; set; } = true;
 
+    /// <summary>
+    /// Schermo acceso mentre suona musica o un video, anche senza toccare il PC: sul PC comandato (Windows lo spegnerebbe)
+    /// e sul PC che comanda (niente standby dei monitor). Le casse collegate al monitor si spegnerebbero con lui.
+    /// Vedi <see cref="Input.MediaKeepAwakePolicy"/>.
+    /// </summary>
+    public bool KeepScreenOnWithAudio { get; set; } = true;
+
     /// <summary>Bordi: negli angoli di ogni monitor non si passa all'altro PC. Vedi <see cref="Input.EdgeSettings"/>.</summary>
     public bool EdgeCorners { get; set; } = true;
     /// <summary>Bordi: si passa solo dopo una breve sosta contro il bordo.</summary>
