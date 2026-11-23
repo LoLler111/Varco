@@ -106,8 +106,8 @@ public sealed class StatusDto
     public string Mode { get; set; } = "Local";
     public string? ActivePeerName { get; set; }
     /// <summary>
-    /// Slave: il PC che comanda questo, anche se in questo momento il mouse è altrove, finché nessuno tocca il mouse o
-    /// la tastiera di questo PC (vedi <see cref="Input.ControlRole"/>). Null = questo PC è master.
+    /// Slave: il master del gruppo, cioè il PC connesso toccato più di recente (o quello che comanda questo adesso), anche
+    /// se il mouse non ha mai lasciato il master (vedi <see cref="Input.ControlRole"/>). Null = questo PC è master.
     /// </summary>
     public string? ControllerName { get; set; }
     public int ListenPort { get; set; }

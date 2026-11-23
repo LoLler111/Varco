@@ -100,7 +100,7 @@ internal static class UiPreview
         {
             ("comanda", With("Controlling", "PORTATILE", "Connected", "Connected")),
             ("comandato", With("Controlled", "PORTATILE", "Connected", "Connected")),
-            ("slave, mouse sul master", WithController(With("Local", null, "Connected", "Connected"), "PORTATILE")),
+            ("slave, mouse mai qui", WithController(With("Local", null, "Connected", "Connected"), "PORTATILE")),
             ("tutti", With("Local", null, "Connected", "Connected")),
             ("alcuni", With("Local", null, "Connected", "Disconnected")),
             ("nessuno", With("Local", null, "Disconnected", "Disconnected")),

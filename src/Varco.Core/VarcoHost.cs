@@ -87,7 +87,8 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 files: FileOffers);
             Clipboard.FilesOffered += OnFilesOffered;
         }
-        Coordinator.ModeChanged += (mode, peer) => _role.OnModeChanged(mode, peer, Environment.TickCount64);
+        _role = new ControlRole(cfg.MachineId);
+        _activityWatch = new Timer(_ => SendInputActivity(), null, 500, 500);
         // Cambi di risoluzione o monitor collegati/scollegati: la dimensione del desktop finisce nel layout condiviso.
         _desktopWatch = new Timer(_ =>
         {
@@ -157,6 +158,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 Coordinator.OnPeerConnected(c.PeerId, c.PeerName);
                 Clipboard?.OnPeerConnected(c.PeerId);
                 c.Send(new AudioActive(Volatile.Read(ref _localAudio) == 1));
+                c.Send(new InputActivity(IdleMs()));
                 Audio.OnPeerConnected(c.PeerId);
             };
             node.PeerDisconnected += (id, _) =>
@@ -164,6 +166,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 Coordinator.OnPeerDisconnected(id);
                 Clipboard?.OnPeerDisconnected(id);
                 MediaRouter.Forget(id);
+                _role.Forget(id);
                 Audio.OnPeerDisconnected(id);
             };
             node.MessageReceived += (id, m) =>
@@ -173,6 +176,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 if (Audio.OnMessage(id, m)) return;
                 if (m is AudioActive aa) { MediaRouter.SetPlaying(id, aa.Playing, Environment.TickCount64); return; }
                 if (m is LockScreen) { OnRemoteLock(id); return; }
+                if (m is InputActivity ia) { _role.OnPeerActivity(id, ia.IdleMs, Environment.TickCount64); return; }
                 if (Clipboard?.OnMessage(id, m) == true) return;
                 Coordinator.OnMessage(id, m, ConnectedPeers);
             };
@@ -275,7 +279,42 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
     /// <summary>Ultimo input fisico (non iniettato) su questo PC, in ms di TickCount64: impostato dall'agent con gli hook.</summary>
     public Func<long>? LastPhysicalInput { get; set; }
-    private readonly ControlRole _role = new();
+
+    // ───────────────────────────── master e slave ─────────────────────────────
+
+    /// <summary>Chi è il master del gruppo (il PC toccato più di recente), per l'icona nella tray.</summary>
+    private readonly ControlRole _role;
+    private readonly Timer _activityWatch;
+    private long _sentLastInput = -1, _sentAt;
+
+    private uint IdleMs() => ControlRole.IdleMs(LastPhysicalInput?.Invoke() ?? 0, Environment.TickCount64);
+
+    /// <summary>Dice agli altri PC quando è stato toccato questo, al massimo una volta al secondo e solo se è cambiato.</summary>
+    private void SendInputActivity()
+    {
+        try
+        {
+            var last = LastPhysicalInput?.Invoke() ?? 0;
+            var now = Environment.TickCount64;
+            if (last == Interlocked.Read(ref _sentLastInput) || now - Interlocked.Read(ref _sentAt) < 1000) return;
+            Interlocked.Exchange(ref _sentLastInput, last);
+            Interlocked.Exchange(ref _sentAt, now);
+            _net.Broadcast(new InputActivity(ControlRole.IdleMs(last, now)));
+        }
+        catch (Exception ex) { Log.Error("Attività di mouse e tastiera", ex); }
+    }
+
+    /// <summary>Il master del gruppo se non è questo PC; null = questo PC è master.</summary>
+    private Guid? Master(IReadOnlyCollection<PeerStatus> peers)
+    {
+        switch (Coordinator.Mode)
+        {
+            case InputMode.Controlling: return null;
+            case InputMode.Controlled: return Coordinator.ActivePeer;
+        }
+        var connected = peers.Where(p => p.State == PeerState.Connected && p.Id is not null).Select(p => p.Id!.Value).ToHashSet();
+        return _role.Master(LastPhysicalInput?.Invoke() ?? 0, connected.Contains);
+    }
 
     /// <summary>Questo PC si è appena bloccato. Se l'ha bloccato a mano chi ci sta davanti, si bloccano anche gli altri.</summary>
     /// <param name="lastPhysicalInputMs">Ultimo input fisico visto qui (TickCount64); 0 = mai.</param>
@@ -564,8 +603,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
             Paused = cfg.Paused,
             Mode = Coordinator.Mode.ToString(),
             ActivePeerName = active is Guid a ? peers.FirstOrDefault(p => p.Id == a)?.Name : null,
-            ControllerName = _role.Controller(LastPhysicalInput?.Invoke() ?? 0) is Guid ctl
-                ? peers.FirstOrDefault(p => p.Id == ctl && p.State == PeerState.Connected)?.Name : null,
+            ControllerName = Master(peers) is Guid master ? peers.FirstOrDefault(p => p.Id == master)?.Name : null,
             ListenPort = _node?.ListenPort ?? 0,
             Peers = peers.Select(p => new PeerDto
             {
@@ -615,6 +653,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
         Updater?.Dispose();
         Audio.Dispose();
         await _desktopWatch.DisposeAsync().ConfigureAwait(false);
+        await _activityWatch.DisposeAsync().ConfigureAwait(false);
         _net.Node = null;
         if (_node is not null) await _node.DisposeAsync().ConfigureAwait(false);
         _store.SaveNow();

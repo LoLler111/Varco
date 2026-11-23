@@ -127,8 +127,8 @@ internal sealed class TrayContext : ApplicationContext
     /// <summary>
     /// Conta chi comanda chi; quanti PC sono connessi si legge solo nella frase.
     ///  • viola con la freccia del mouse (master): mouse e tastiera di questo PC comandano un altro PC o questo stesso;
-    ///  • rosso con uno schermo (slave): questo PC è comandato da un altro, anche se adesso il mouse è altrove,
-    ///    finché nessuno tocca il suo mouse o la sua tastiera;
+    ///  • rosso con uno schermo (slave): un altro PC connesso è stato toccato più di recente (è lui il master), anche se
+    ///    il mouse non è mai venuto qui;
     ///  • grigio con la croce: non connesso a nessun PC (o servizio spento);
     ///  • grigio con gli schermi: connessione disattivata o nessun PC abbinato.
     /// </summary>
@@ -136,15 +136,15 @@ internal sealed class TrayContext : ApplicationContext
     {
         if (s is null) return new(Gray, TrayGlyph.Off, "Servizio Varco non attivo");
         if (s.Paused) return new(Gray, TrayGlyph.Screens, "Connessione disattivata");
-        if (s.Mode == "Controlling") return new(Purple, TrayGlyph.Cursor, $"Stai comandando {s.ActivePeerName ?? "un altro PC"}");
-        if (s.Mode == "Controlled") return new(Red, TrayGlyph.Monitor, $"Comandato da {s.ActivePeerName ?? "un altro PC"}");
-        // Il mouse è tornato sul master (o è passato a un altro PC) e nessuno ha toccato questo: resta slave.
-        if (s.ControllerName is { } master) return new(Red, TrayGlyph.Monitor, $"Comandato da {master}");
+        if (s.Mode == "Controlling") return new(Purple, TrayGlyph.Cursor, $"Master: stai comandando {s.ActivePeerName ?? "un altro PC"}");
+        if (s.Mode == "Controlled") return new(Red, TrayGlyph.Monitor, $"Slave: comandato da {s.ActivePeerName ?? "un altro PC"}");
+        // Un altro PC connesso è stato toccato più di recente: è lui il master, anche se il mouse non è mai venuto qui.
+        if (s.ControllerName is { } master) return new(Red, TrayGlyph.Monitor, $"Slave: il master è {master}");
         var connected = s.Peers.Count(p => p.State == "Connected");
         var total = s.Peers.Count;
         if (total == 0) return new(Gray, TrayGlyph.Screens, "Nessun PC abbinato");
         if (connected == 0) return new(Gray, TrayGlyph.Off, "Non connesso a nessun PC");
-        return new(Purple, TrayGlyph.Cursor, $"Stai comandando questo PC ({connected} di {total} PC connessi)");
+        return new(Purple, TrayGlyph.Cursor, $"Master ({connected} di {total} PC connessi)");
     }
 
     private void UpdateIcon()
@@ -159,9 +159,10 @@ internal sealed class TrayContext : ApplicationContext
     private static string PeerLine(StatusDto s, PeerDto p)
     {
         var active = s.ActivePeerName == p.Name;
-        if (active && s.Mode == "Controlling") return $"● {p.Name} — lo stai comandando";
-        if ((active && s.Mode == "Controlled") || s.ControllerName == p.Name) return $"● {p.Name} — comanda questo PC";
-        return p.State == "Connected" ? $"● {p.Name} — connesso" : $"○ {p.Name} — non connesso";
+        if (p.State != "Connected") return $"○ {p.Name} — non connesso";
+        if (active && s.Mode == "Controlling") return $"● {p.Name} — slave, lo stai comandando";
+        if ((active && s.Mode == "Controlled") || s.ControllerName == p.Name) return $"● {p.Name} — master";
+        return $"● {p.Name} — slave";
     }
 
     private void BuildMenu()

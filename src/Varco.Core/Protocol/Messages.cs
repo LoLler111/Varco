@@ -31,6 +31,7 @@ public enum MsgType : byte
     PointerScale = 32,
     AudioRouting = 33,
     AudioFrame = 34,
+    InputActivity = 35,
     PeerList = 40,
     RelayOpen = 41,
     RelayData = 42,
@@ -234,6 +235,13 @@ public sealed record AudioFrame(ushort Seq, byte[] Data) : Message;
 /// </summary>
 public sealed record PeerList(PeerRef[] Connected) : Message;
 
+/// <summary>
+/// Da quanti ms nessuno tocca il mouse o la tastiera di chi lo manda (<see cref="uint.MaxValue"/> = mai, da quando gira
+/// l'agent). Mandato a ogni nuova connessione e poi, al massimo una volta al secondo, quando cambia: il PC toccato più di
+/// recente è il master del gruppo, gli altri sono slave (vedi <see cref="Input.ControlRole"/>). Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record InputActivity(uint IdleMs) : Message;
+
 /// <summary>Un PC del gruppo in <see cref="PeerList"/>: chi riceve l'elenco impara anche i PC che non ha mai visto.</summary>
 public sealed record PeerRef(Guid Id, string Name);
 
@@ -299,6 +307,7 @@ public static class MessageCodec
                 foreach (var id in a.Sources) w.Write(id.ToByteArray());
                 break;
             case AudioFrame f: w.Write((byte)MsgType.AudioFrame); w.Write(f.Seq); w.Write((ushort)f.Data.Length); w.Write(f.Data); break;
+            case InputActivity a: w.Write((byte)MsgType.InputActivity); w.Write(a.IdleMs); break;
             case PeerList l:
                 w.Write((byte)MsgType.PeerList); w.Write((ushort)l.Connected.Length);
                 foreach (var p in l.Connected) { w.Write(p.Id.ToByteArray()); w.Write(p.Name); }
@@ -344,6 +353,7 @@ public static class MessageCodec
             MsgType.PointerScale => new PointerScale(r.ReadUInt16()),
             MsgType.AudioRouting => ReadAudioRouting(r),
             MsgType.AudioFrame => ReadAudioFrame(r),
+            MsgType.InputActivity => new InputActivity(r.ReadUInt32()),
             MsgType.PeerList => ReadPeerList(r),
             MsgType.RelayOpen => new RelayOpen(new Guid(r.ReadBytes(16)), new Guid(r.ReadBytes(16)), r.ReadBoolean()),
             MsgType.RelayData => new RelayData(new Guid(r.ReadBytes(16)), ReadBlob(r)),
