@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using Varco.Core;
 
 namespace Varco.Agent;
@@ -17,12 +17,17 @@ internal static class AudioOutput
     private static int _broken; // per non riempire il log se il livello non si legge
 
     /// <summary>Lento (fino a un secondo): solo da thread di lavoro, mai da quello degli hook.</summary>
-    public static bool IsPlaying(Func<bool>? stop = null)
+    /// <param name="ignoreOwnProcess">
+    /// Non conta il suono riprodotto da Varco stesso (l'audio degli altri PC, sul PC centrale): si leggono i livelli delle
+    /// singole sessioni audio, saltando quelle di questo processo.
+    /// </param>
+    public static bool IsPlaying(Func<bool>? stop = null, bool ignoreOwnProcess = false)
     {
         var meters = new List<IAudioMeterInformation>();
         try
         {
-            var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+            // Una sola classe COM per CLSID nell'assembly (vedi Wasapi): due dichiarazioni dello stesso enumeratore fanno fallire il cast.
+            var enumerator = (IMMDeviceEnumerator)Wasapi.CreateEnumerator();
             try
             {
                 Marshal.ThrowExceptionForHR(enumerator.EnumAudioEndpoints(EDataFlow.eRender, DEVICE_STATE_ACTIVE, out var devices));
@@ -34,9 +39,13 @@ internal static class AudioOutput
                         if (devices.Item(i, out var device) != 0) continue;
                         try
                         {
-                            var iid = typeof(IAudioMeterInformation).GUID;
-                            if (device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out var meter) == 0 && meter is IAudioMeterInformation m)
-                                meters.Add(m);
+                            if (ignoreOwnProcess) AddOtherSessionMeters(device, meters);
+                            else
+                            {
+                                var iid = typeof(IAudioMeterInformation).GUID;
+                                if (device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out var meter) == 0 && meter is IAudioMeterInformation m)
+                                    meters.Add(m);
+                            }
                         }
                         finally { Marshal.ReleaseComObject(device); }
                     }
@@ -66,15 +75,36 @@ internal static class AudioOutput
         }
     }
 
+    /// <summary>I livelli delle sessioni audio del dispositivo, tranne quelle di questo processo.</summary>
+    private static void AddOtherSessionMeters(IMMDevice device, List<IAudioMeterInformation> meters)
+    {
+        var iid = Wasapi.IID_IAudioSessionManager2;
+        if (device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out var obj) != 0 || obj is not Wasapi.IAudioSessionManager2 manager) return;
+        try
+        {
+            if (manager.GetSessionEnumerator(out var sessions) != 0) return;
+            try
+            {
+                if (sessions.GetCount(out var count) != 0) return;
+                for (var i = 0; i < count; i++)
+                {
+                    if (sessions.GetSession(i, out var session) != 0) continue;
+                    if (session.GetProcessId(out var pid) == 0 && pid != Environment.ProcessId && session is IAudioMeterInformation m)
+                        meters.Add(m); // stesso oggetto COM: rilasciato con i livelli
+                    else Marshal.ReleaseComObject(session);
+                }
+            }
+            finally { Marshal.ReleaseComObject(sessions); }
+        }
+        finally { Marshal.ReleaseComObject(manager); }
+    }
+
     // ───────────── interop ─────────────
 
     private const uint DEVICE_STATE_ACTIVE = 0x1;
     private const int CLSCTX_ALL = 0x17;
 
     private enum EDataFlow { eRender, eCapture, eAll }
-
-    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-    private class MMDeviceEnumerator;
 
     [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IMMDeviceEnumerator

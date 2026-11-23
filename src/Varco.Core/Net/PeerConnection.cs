@@ -14,14 +14,22 @@ namespace Varco.Core.Net;
 /// </summary>
 public sealed class PeerConnection : IAsyncDisposable
 {
-    private readonly Socket _socket;
-    private readonly NetworkStream _stream;
+    /// <summary>Null per le connessioni tramite un altro PC (vedi <see cref="RelayTunnel"/>).</summary>
+    private readonly Socket? _socket;
+    private readonly Stream _stream;
     private readonly FrameCipher _cipher;
     private readonly Channel<byte[]> _outbox = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
     // Dati voluminosi (appunti): un pezzo per scrittura, dopo i messaggi normali, così un'immagine copiata non rallenta il mouse.
     private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _bulk = new();
     /// <summary>Segnaposto nell'outbox: "c'è qualcosa in <see cref="_bulk"/>". Mai inviato.</summary>
     private static readonly byte[] BulkReady = new byte[0];
+    // Audio verso il PC centrale: solo gli ultimi pacchetti. Se la rete si blocca, alla ripresa partono quelli recenti
+    // invece di secondi di audio vecchio (che il centrale butterebbe comunque per non accumulare ritardo).
+    private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _audio = new();
+    /// <summary>Segnaposto nell'outbox: "c'è qualcosa in <see cref="_audio"/>". Mai inviato.</summary>
+    private static readonly byte[] AudioReady = new byte[0];
+    /// <summary>Pacchetti audio in coda al massimo (20 ms l'uno).</summary>
+    private const int MaxAudioQueue = 10;
     private readonly CancellationTokenSource _cts = new();
     private readonly TaskCompletionSource<string> _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly int _intervalMs;
@@ -53,7 +61,11 @@ public sealed class PeerConnection : IAsyncDisposable
     /// (firewall), inutile riprovarla a ogni file. Vale finché dura questa connessione.
     /// </summary>
     internal bool FilesNeedDialBack { get; set; }
+    /// <summary>Indirizzo dell'altro PC; per le connessioni tramite un altro PC, quello del PC tramite.</summary>
     public IPEndPoint RemoteEndPoint { get; }
+    /// <summary>Connessione tramite un altro PC: la connessione con lui (null = diretta).</summary>
+    public PeerConnection? Via { get; }
+    public bool IsRelayed => Via is not null;
     /// <summary>Id del PC che ha aperto la connessione (serve a risolvere connessioni doppie in modo deterministico).</summary>
     public Guid InitiatorId { get; }
     public long EstablishedAt { get; } = Environment.TickCount64;
@@ -72,9 +84,21 @@ public sealed class PeerConnection : IAsyncDisposable
     public Task<string> Closed => _closed.Task;
 
     internal PeerConnection(Socket socket, NetworkStream stream, HandshakeResult hs, Guid initiatorId, int intervalMs, int timeoutMs)
+        : this(socket, stream, hs, initiatorId, intervalMs, timeoutMs, via: null)
+    {
+    }
+
+    /// <summary>Connessione tramite un altro PC, sopra un tunnel di inoltro.</summary>
+    internal PeerConnection(RelayTunnel tunnel, HandshakeResult hs, Guid initiatorId, int intervalMs, int timeoutMs)
+        : this(null, tunnel, hs, initiatorId, intervalMs, timeoutMs, via: tunnel.Carrier)
+    {
+    }
+
+    private PeerConnection(Socket? socket, Stream stream, HandshakeResult hs, Guid initiatorId, int intervalMs, int timeoutMs, PeerConnection? via)
     {
         _socket = socket;
         _stream = stream;
+        Via = via;
         _cipher = hs.Cipher;
         PeerId = hs.PeerId;
         PeerName = hs.PeerName;
@@ -82,12 +106,12 @@ public sealed class PeerConnection : IAsyncDisposable
         InitiatorId = initiatorId;
         SessionId = hs.SessionId;
         GroupKey = hs.GroupKey;
-        RemoteEndPoint = (IPEndPoint)socket.RemoteEndPoint!;
-        LocalEndPoint = socket.LocalEndPoint as IPEndPoint;
+        RemoteEndPoint = socket is not null ? (IPEndPoint)socket.RemoteEndPoint! : via!.RemoteEndPoint;
+        LocalEndPoint = socket?.LocalEndPoint as IPEndPoint;
         _intervalMs = intervalMs;
         _timeoutMs = timeoutMs;
         _lastReceived = _lastSent = Environment.TickCount64;
-        _qos = SocketQos.TryApply(socket);
+        _qos = socket is null ? null : SocketQos.TryApply(socket);
     }
 
     /// <summary>Avvia lettura, scrittura e heartbeat. Va chiamato dopo aver agganciato gli eventi.</summary>
@@ -108,6 +132,13 @@ public sealed class PeerConnection : IAsyncDisposable
             if (chunk.Offset == 0) _bulk.Clear();
             _bulk.Enqueue(MessageCodec.Encode(m));
             _outbox.Writer.TryWrite(BulkReady);
+            return;
+        }
+        if (m is AudioFrame)
+        {
+            _audio.Enqueue(MessageCodec.Encode(m));
+            while (_audio.Count > MaxAudioQueue && _audio.TryDequeue(out _)) { }
+            _outbox.Writer.TryWrite(AudioReady);
             return;
         }
         _outbox.Writer.TryWrite(MessageCodec.Encode(m));
@@ -150,8 +181,15 @@ public sealed class PeerConnection : IAsyncDisposable
         _outbox.Writer.TryComplete();
         _cts.Cancel();
         _qos?.Dispose();
-        try { _socket.Shutdown(SocketShutdown.Both); } catch { }
-        try { _socket.Close(0); } catch { }
+        if (_socket is not null)
+        {
+            try { _socket.Shutdown(SocketShutdown.Both); } catch { }
+            try { _socket.Close(0); } catch { }
+        }
+        else
+        {
+            try { _stream.Dispose(); } catch { }
+        }
         _cipher.Dispose();
         _closed.TrySetResult(reason);
     }
@@ -202,6 +240,10 @@ public sealed class PeerConnection : IAsyncDisposable
                 while (batch.WrittenCount < 64 * 1024 && reader.TryRead(out var plain))
                 {
                     if (ReferenceEquals(plain, BulkReady)) bulkPending = true;
+                    else if (ReferenceEquals(plain, AudioReady))
+                    {
+                        while (_audio.TryDequeue(out var sound)) Framing.AppendFrame(batch, _cipher.Seal(sound));
+                    }
                     else Framing.AppendFrame(batch, _cipher.Seal(plain));
                 }
                 // Al massimo un pezzo voluminoso per scrittura; se ne restano, ci si risveglia per il prossimo.
@@ -254,5 +296,5 @@ public sealed class PeerConnection : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
-    public override string ToString() => $"{PeerName} ({RemoteEndPoint})";
+    public override string ToString() => Via is { } v ? $"{PeerName} (tramite {v.PeerName})" : $"{PeerName} ({RemoteEndPoint})";
 }

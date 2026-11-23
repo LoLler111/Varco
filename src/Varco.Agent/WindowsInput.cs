@@ -179,12 +179,14 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
         uint f = 0;
         if (flags.HasFlag(KeyFlags.Up)) f |= KEYEVENTF_KEYUP;
         if (flags.HasFlag(KeyFlags.Extended)) f |= KEYEVENTF_EXTENDEDKEY;
-        // Scancode: indipendente dal layout di tastiera dei due PC. Senza scancode (tasti multimediali) uso il VK.
-        if (scan != 0) f |= KEYEVENTF_SCANCODE;
+        // Scancode: indipendente dal layout di tastiera dei due PC. Per VK i tasti dove lo scancode non basta
+        // (multimediali, Bloc Num, Pausa: vedi KeyCodes.InjectByVk); lo scancode resta comunque nel messaggio.
+        var byVk = KeyCodes.InjectByVk(vk, scan);
+        if (!byVk) f |= KEYEVENTF_SCANCODE;
         var input = new INPUT
         {
             type = INPUT_KEYBOARD,
-            U = new InputUnion { ki = new KEYBDINPUT { wVk = scan != 0 ? (ushort)0 : vk, wScan = scan, dwFlags = f, dwExtraInfo = Marker } },
+            U = new InputUnion { ki = new KEYBDINPUT { wVk = byVk ? vk : (ushort)0, wScan = scan, dwFlags = f, dwExtraInfo = Marker } },
         };
         if (SendInput(1, [input], Marshal.SizeOf<INPUT>()) == 0) InjectionFailed("SendInput tastiera");
     }
@@ -285,6 +287,31 @@ internal sealed class WindowsInput : IInputPlatform, IDisposable
     }
 
     private const uint GUI_INMOVESIZE = 0x2;
+
+    /// <summary>Scala del monitor che contiene il punto (o del più vicino): 96 = 100%, 144 = 150%. L'agent è DPI-aware per monitor.</summary>
+    public int GetDpiAt(int x, int y)
+    {
+        var mon = MonitorFromPoint(new POINT { X = x, Y = y }, 2 /* MONITOR_DEFAULTTONEAREST */);
+        return mon != IntPtr.Zero && GetDpiForMonitor(mon, 0 /* MDT_EFFECTIVE_DPI */, out var dpiX, out _) == 0 && dpiX > 0 ? (int)dpiX : 96;
+    }
+
+    /// <summary>
+    /// Blocca questo PC (chiesto da un altro PC del gruppo). LockWorkStation funziona solo sul desktop interattivo:
+    /// la si chiama dal thread di iniezione, agganciato al desktop di input della sessione dell'utente.
+    /// </summary>
+    public void LockWorkstation() => Post(() =>
+    {
+        if (_thread?.DesktopName is { } desk && !string.Equals(desk, "Default", StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Info($"Blocco dello schermo non necessario: è già visibile il desktop \"{desk}\"");
+            return;
+        }
+        if (!LockWorkStation()) Log.Warn($"Blocco dello schermo non riuscito ({Marshal.GetLastWin32Error()})");
+    });
+
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
+    [DllImport("shcore.dll")] private static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool LockWorkStation();
 
     [StructLayout(LayoutKind.Sequential)]
     private struct GUITHREADINFO

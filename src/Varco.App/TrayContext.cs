@@ -11,15 +11,14 @@ namespace Varco.App;
 internal sealed class TrayContext : ApplicationContext
 {
     private static readonly Color Gray = Color.FromArgb(140, 140, 140);
-    private static readonly Color Green = Color.FromArgb(46, 160, 67);
-    private static readonly Color Orange = Color.FromArgb(219, 140, 20);
-    private static readonly Color Blue = Color.FromArgb(40, 110, 220);     // questo PC comanda un altro PC
-    private static readonly Color Magenta = Color.FromArgb(200, 50, 160);  // questo PC è comandato da un altro
+    private static readonly Color Purple = Color.FromArgb(120, 70, 210);   // questo PC comanda un altro PC o se stesso
+    private static readonly Color Red = Color.FromArgb(210, 55, 55);       // questo PC è comandato da un altro
 
     private readonly NotifyIcon _icon;
     private readonly ContextMenuStrip _menu = new();
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
-    private readonly Dictionary<Color, Icon> _icons = new();
+    private readonly Dictionary<(Color, TrayGlyph), Icon> _icons = new();
+    private readonly Dictionary<(Color, TrayGlyph), Image> _menuImages = new();
     private readonly HashSet<Guid> _announced = new();
     private MainForm? _main;
     private readonly VirtualFileClipboard _files;
@@ -122,53 +121,65 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    /// <summary>Come appare lo stato nella tray: colore, simbolo e frase (tooltip e prima riga del menu).</summary>
+    internal readonly record struct TrayState(Color Color, TrayGlyph Glyph, string Text);
+
+    /// <summary>
+    /// Conta chi comanda chi; quanti PC sono connessi si legge solo nella frase.
+    ///  • viola con la freccia del mouse (master): mouse e tastiera di questo PC comandano un altro PC o questo stesso;
+    ///  • rosso con uno schermo (slave): questo PC è comandato da un altro, anche se adesso il mouse è altrove,
+    ///    finché nessuno tocca il suo mouse o la sua tastiera;
+    ///  • grigio con la croce: non connesso a nessun PC (o servizio spento);
+    ///  • grigio con gli schermi: connessione disattivata o nessun PC abbinato.
+    /// </summary>
+    internal static TrayState Describe(StatusDto? s)
+    {
+        if (s is null) return new(Gray, TrayGlyph.Off, "Servizio Varco non attivo");
+        if (s.Paused) return new(Gray, TrayGlyph.Screens, "Connessione disattivata");
+        if (s.Mode == "Controlling") return new(Purple, TrayGlyph.Cursor, $"Stai comandando {s.ActivePeerName ?? "un altro PC"}");
+        if (s.Mode == "Controlled") return new(Red, TrayGlyph.Monitor, $"Comandato da {s.ActivePeerName ?? "un altro PC"}");
+        // Il mouse è tornato sul master (o è passato a un altro PC) e nessuno ha toccato questo: resta slave.
+        if (s.ControllerName is { } master) return new(Red, TrayGlyph.Monitor, $"Comandato da {master}");
+        var connected = s.Peers.Count(p => p.State == "Connected");
+        var total = s.Peers.Count;
+        if (total == 0) return new(Gray, TrayGlyph.Screens, "Nessun PC abbinato");
+        if (connected == 0) return new(Gray, TrayGlyph.Off, "Non connesso a nessun PC");
+        return new(Purple, TrayGlyph.Cursor, $"Stai comandando questo PC ({connected} di {total} PC connessi)");
+    }
+
     private void UpdateIcon()
     {
-        string text;
-        Color color;
-        if (_last is null)
-        {
-            color = Gray;
-            text = "Varco: servizio non attivo";
-        }
-        else if (_last.Paused)
-        {
-            color = Gray;
-            text = "Varco: connessione disattivata";
-        }
-        else
-        {
-            var connected = _last.Peers.Count(p => p.State == "Connected");
-            var total = _last.Peers.Count;
-            color = _last.Mode == "Controlling" ? Blue
-                : _last.Mode == "Controlled" ? Magenta
-                : total > 0 && connected == total ? Green
-                : connected > 0 ? Orange
-                : Gray;
-            text = _last.Mode switch
-            {
-                "Controlling" => $"Varco: stai usando {_last.ActivePeerName}",
-                "Controlled" => $"Varco: {_last.ActivePeerName} sta usando questo PC",
-                _ when total == 0 => "Varco: nessun PC collegato",
-                _ => $"Varco: {connected} di {total} PC collegati",
-            };
-        }
-        _icon.Icon = IconFor(color);
+        var state = Describe(_last);
+        var text = "Varco: " + state.Text;
+        _icon.Icon = IconFor(state.Color, state.Glyph);
         _icon.Text = text.Length > 63 ? text[..63] : text;
+    }
+
+    /// <summary>Ruolo di un PC abbinato, per l'elenco nel menu.</summary>
+    private static string PeerLine(StatusDto s, PeerDto p)
+    {
+        var active = s.ActivePeerName == p.Name;
+        if (active && s.Mode == "Controlling") return $"● {p.Name} — lo stai comandando";
+        if ((active && s.Mode == "Controlled") || s.ControllerName == p.Name) return $"● {p.Name} — comanda questo PC";
+        return p.State == "Connected" ? $"● {p.Name} — connesso" : $"○ {p.Name} — non connesso";
     }
 
     private void BuildMenu()
     {
         _menu.Items.Clear();
+        var state = Describe(_last);
+        _menu.Items.Add(new ToolStripMenuItem(state.Text, MenuImage(state)) { Enabled = false });
+        _menu.Items.Add(new ToolStripSeparator());
+
         var open = new ToolStripMenuItem("Apri Varco", null, (_, _) => ShowMain());
         open.Font = new Font(open.Font, FontStyle.Bold);
         _menu.Items.Add(open);
 
-        if (_last is { Peers.Count: > 0 })
+        if (_last is { Peers.Count: > 0 } s)
         {
             _menu.Items.Add(new ToolStripSeparator());
-            foreach (var p in _last.Peers.OrderBy(p => p.Name))
-                _menu.Items.Add(new ToolStripMenuItem($"{(p.State == "Connected" ? "●" : "○")} {p.Name}") { Enabled = false });
+            foreach (var p in s.Peers.OrderBy(p => p.Name))
+                _menu.Items.Add(new ToolStripMenuItem(PeerLine(s, p)) { Enabled = false });
         }
 
         _menu.Items.Add(new ToolStripSeparator());
@@ -206,14 +217,22 @@ internal sealed class TrayContext : ApplicationContext
         _main.Activate();
     }
 
-    private Icon IconFor(Color color)
+    private Image MenuImage(TrayState state)
     {
-        if (_icons.TryGetValue(color, out var icon)) return icon;
+        if (_menuImages.TryGetValue((state.Color, state.Glyph), out var img)) return img;
+        img = IconFor(state.Color, state.Glyph).ToBitmap();
+        _menuImages[(state.Color, state.Glyph)] = img;
+        return img;
+    }
+
+    private Icon IconFor(Color color, TrayGlyph glyph = TrayGlyph.Screens)
+    {
+        if (_icons.TryGetValue((color, glyph), out var icon)) return icon;
         // Dimensione reale dell'icona nella tray (16 px al 100%, 24 al 150%, 32 al 200%).
         var size = SystemInformation.SmallIconSize.Width;
-        using var bmp = VarcoIcon.RenderTray(size, color);
+        using var bmp = VarcoIcon.RenderTray(size, color, glyph);
         icon = Icon.FromHandle(bmp.GetHicon());
-        _icons[color] = icon;
+        _icons[(color, glyph)] = icon;
         return icon;
     }
 

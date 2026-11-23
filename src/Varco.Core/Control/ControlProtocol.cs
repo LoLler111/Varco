@@ -28,7 +28,9 @@ public sealed class ControlRequest
     /// status | pair (Id o Address) | pairAnswer (RequestId, Accept) | pairCancel | forget (Id) | leaveGroup |
     /// setRow (Order) | setLayout (Positions) | addAddress | removeAddress | reconnect | getKey | setKey |
     /// checkUpdate | installUpdateNow (anche sugli altri PC collegati) | setAutoUpdate (Enabled) | setClipboard (Enabled) | setMonitorStandby (Enabled) | setKeepScreenOnWithAudio (Enabled) |
-    /// setEdgeOption (Option = corners | delay | fullscreen | scrollLock, Enabled) | exportLogs (risposta in Zip) | setPaused (Enabled = true disattiva la connessione) |
+    /// setEdgeOption (Option = corners | delay | fullscreen | scrollLock, Enabled) |
+    /// setInputOption (Option = groupLock | mediaKeys | pointerScale, Enabled) |
+    /// setAudio (Id = PC centrale, null = spento; Sources = PC che gli mandano l'audio) | exportLogs (risposta in Zip) | setPaused (Enabled = true disattiva la connessione) |
     /// filesOffer (Seq, attesa lunga) | localFiles (Paths: file copiati su questo PC, letti dall'icona) |
     /// dragEvents (Seq, attesa lunga) | dragFiles (Seq, Paths: file trascinati contro il bordo, vuoto = nessuno) |
     /// dragData (Seq, Formats: testo, HTML, immagini trascinati contro il bordo) |
@@ -52,6 +54,8 @@ public sealed class ControlRequest
     public List<string>? Paths { get; set; }
     /// <summary>dragData: i formati letti da ciò che si trascina (stessi nomi degli appunti condivisi).</summary>
     public List<ClipFormatDto>? Formats { get; set; }
+    /// <summary>setAudio: i PC che mandano il loro audio al PC centrale.</summary>
+    public List<Guid>? Sources { get; set; }
 }
 
 /// <summary>Un formato di dati trascinati: nome come negli appunti condivisi ("CF_UNICODETEXT", "HTML Format", "PNG"…) e byte grezzi.</summary>
@@ -101,6 +105,11 @@ public sealed class StatusDto
     public bool Paused { get; set; }
     public string Mode { get; set; } = "Local";
     public string? ActivePeerName { get; set; }
+    /// <summary>
+    /// Slave: il PC che comanda questo, anche se in questo momento il mouse è altrove, finché nessuno tocca il mouse o
+    /// la tastiera di questo PC (vedi <see cref="Input.ControlRole"/>). Null = questo PC è master.
+    /// </summary>
+    public string? ControllerName { get; set; }
     public int ListenPort { get; set; }
     public List<PeerDto> Peers { get; set; } = [];
     public List<LayoutEntry> Layout { get; set; } = [];
@@ -123,6 +132,16 @@ public sealed class StatusDto
     public bool EdgeDelay { get; set; }
     public bool EdgeBlockFullscreen { get; set; } = true;
     public bool EdgeScrollLock { get; set; } = true;
+    public bool GroupLock { get; set; } = true;
+    public bool MediaKeysFollowAudio { get; set; } = true;
+    public bool PointerScaleCompensation { get; set; }
+    /// <summary>Audio fra i PC (impostazione di gruppo): PC centrale (vuoto = spento) e PC che gli mandano l'audio.</summary>
+    public Guid AudioHub { get; set; }
+    public List<Guid> AudioSources { get; set; } = [];
+    /// <summary>Questo PC sta mandando il suo audio al centrale.</summary>
+    public bool AudioSending { get; set; }
+    /// <summary>Su questo PC (centrale): i PC da cui arriva audio in questo momento.</summary>
+    public List<Guid> AudioReceiving { get; set; } = [];
     /// <summary>Null se gli aggiornamenti non sono attivi (agent avviato a mano per sviluppo).</summary>
     public UpdateStatusDto? Update { get; set; }
 }
@@ -212,6 +231,8 @@ public sealed class PeerDto
     /// <summary>Indirizzo di questo PC usato dalla connessione.</summary>
     public string? LocalAddress { get; set; }
     public DateTime? ConnectedSinceUtc { get; set; }
+    /// <summary>Collegato tramite un altro PC (inoltro), perché i due PC non si vedono: il nome di quel PC.</summary>
+    public string? Via { get; set; }
     /// <summary>Connessioni cadute nelle ultime 24 ore (da quando l'agent è partito, se è partito da meno).</summary>
     public int Drops24h { get; set; }
     public string? LastDropReason { get; set; }

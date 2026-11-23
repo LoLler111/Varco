@@ -120,6 +120,35 @@ public class ReconnectTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Audio_frames_and_input_both_arrive_in_order()
+    {
+        var b = NewNode("B");
+        var a = NewNode("A", manual: $"127.0.0.1:{b.ListenPort}");
+        var frames = new List<int>();
+        var wheels = 0;
+        b.MessageReceived += (_, m) =>
+        {
+            lock (frames)
+            {
+                if (m is AudioFrame f) frames.Add(f.Seq);
+                else if (m is MouseWheel) wheels++;
+            }
+        };
+        a.Start(); b.Start();
+        await Eventually(() => a.IsConnected(b.Me.Id) && b.IsConnected(a.Me.Id), what: "connessione iniziale");
+
+        // Al ritmo della cattura (un pacchetto ogni 20 ms) la coda non scarta nulla, e il mouse passa insieme all'audio.
+        for (var i = 0; i < 25; i++)
+        {
+            a.Send(b.Me.Id, new AudioFrame((ushort)i, new byte[160]));
+            a.Send(b.Me.Id, new MouseWheel(120, false));
+            await Task.Delay(20);
+        }
+        await Eventually(() => { lock (frames) return frames.Count == 25 && wheels == 25; }, what: "audio e mouse");
+        lock (frames) Assert.Equal(Enumerable.Range(0, 25), frames);
+    }
+
+    [Fact]
     public async Task Reconnects_after_peer_restart_on_same_port()
     {
         var bId = Guid.NewGuid();

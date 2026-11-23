@@ -54,6 +54,22 @@ public class KeyCodeTests
     }
 
     [Fact]
+    public void NumLock_and_pause_are_injected_by_vk()
+    {
+        // Come li segnala l'hook (misurato): Bloc Num vk 90 scancode 45 esteso, Pausa vk 13 scancode 45
+        Assert.True(KeyCodes.InjectByVk(0x90, 0x45));
+        Assert.True(KeyCodes.InjectByVk(0x13, 0x45));
+        // tasti multimediali: senza scancode
+        Assert.True(KeyCodes.InjectByVk(0xB3, 0));
+        // il resto del numpad e i tasti normali vanno per scancode (indipendenti dal layout)
+        Assert.False(KeyCodes.InjectByVk(0x61, 0x4F)); // 1 del numpad
+        Assert.False(KeyCodes.InjectByVk(0x6F, 0x35)); // / del numpad
+        Assert.False(KeyCodes.InjectByVk(0x0D, 0x1C)); // Invio del numpad
+        Assert.False(KeyCodes.InjectByVk(0x41, 0x1E)); // A
+        Assert.False(KeyCodes.InjectByVk(0x14, 0x3A)); // Bloc Maiusc
+    }
+
+    [Fact]
     public void AltGr_fake_ctrl_is_recognized()
     {
         // Come lo segnala l'hook (misurato) dopo AltGr iniettato: vk A2, scancode 21D
@@ -364,7 +380,7 @@ public class LayoutTests
     }
 }
 
-public class CoordinatorTests
+public partial class CoordinatorTests
 {
     private sealed class FakeNet(Guid self) : IPeerNetwork
     {
@@ -399,6 +415,8 @@ public class CoordinatorTests
         public void HideIdleCursor() => Log.Add("idle hidden");
         public bool MovingWindow;
         public bool IsMovingWindow() => MovingWindow;
+        public int Dpi = 96;
+        public int GetDpiAt(int x, int y) => Dpi;
         /// <summary>Come Windows con la finestra che nasconde il cursore: il cursore resta dov'è fino a CompletePark.</summary>
         public bool DeferPark;
         public (int X, int Y) ParkCursor(int x, int y)

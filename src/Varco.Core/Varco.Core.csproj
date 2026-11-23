@@ -4,6 +4,10 @@
     <RootNamespace>Varco.Core</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Opus in C# puro (licenza BSD): niente DLL native da caricare. -->
+    <PackageReference Include="Concentus" Version="2.2.2" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="Varco.Tests" />
   </ItemGroup>
 </Project>

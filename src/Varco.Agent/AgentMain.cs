@@ -45,10 +45,12 @@ public static class AgentMain
         var store = new ConfigStore(configDir);
         IInputPlatform platform = noInput ? new NullInput() : new WindowsInput();
         using var clipboard = noInput ? null : new WindowsClipboard();
-        await using var host = new VarcoHost(store, platform, port, discoveryPort, clipboard, clipboard is null ? null : new UserFileAccess());
+        var audioPlatform = noInput ? null : new WindowsAudio(configDir);
+        await using var host = new VarcoHost(store, platform, port, discoveryPort, clipboard, clipboard is null ? null : new UserFileAccess(), audioPlatform);
         if (platform is WindowsInput wi)
         {
             wi.Coordinator = host.Coordinator;
+            host.LastPhysicalInput = () => wi.LastPhysicalInputMs;
             host.EnableFileDrag(); // serve anche l'icona: è lei che vede i file trascinati e li lascia cadere
         }
 
@@ -66,6 +68,17 @@ public static class AgentMain
 
         using var keepAwake = platform is WindowsInput input ? new MediaKeepAwake(() => store.Current.KeepScreenOnWithAudio, () => input.LastPhysicalInputMs) : null;
         if (keepAwake is not null) host.Coordinator.ModeChanged += keepAwake.OnModeChanged;
+
+        // Blocco di gruppo: chi blocca questo PC a mano blocca anche gli altri, e gli altri bloccano questo.
+        using var sessionLock = platform is WindowsInput ? new SessionLockWatcher() : null;
+        if (platform is WindowsInput lockInput && sessionLock is not null)
+        {
+            host.LockWorkstation = lockInput.LockWorkstation;
+            sessionLock.Locked += () => host.OnSessionLocked(lockInput.LastPhysicalInputMs);
+        }
+
+        // Tasti multimediali al PC che suona: gli altri PC devono sapere se qui esce del suono.
+        using var audio = noInput ? null : new AudioActivity(() => host.HasConnectedPeers, host.SetLocalAudio, () => host.Audio.Playing);
 
         using var power = new PowerNotifier();
         power.Suspending += host.OnSuspend;

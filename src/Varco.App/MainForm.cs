@@ -255,7 +255,7 @@ internal sealed class MainForm : Form
         if (showStrip) _strip.SetItems(items);
 
         // i miei PC
-        var peersSig = string.Join("|", s.Peers.Select(p => $"{p.Id}{p.State}{p.Name}{Math.Round(p.RttMs)}"));
+        var peersSig = string.Join("|", s.Peers.Select(p => $"{p.Id}{p.State}{p.Name}{Math.Round(p.RttMs)}{p.Via}"));
         if (peersSig != _peersSig)
         {
             _peersSig = peersSig;
@@ -297,7 +297,7 @@ internal sealed class MainForm : Form
     {
         var (color, hollow, text) = p.State switch
         {
-            "Connected" => (Ui.Ok, false, p.RttMs >= 0 ? $"collegato · {p.RttMs:0} ms" : "collegato"),
+            "Connected" => (Ui.Ok, false, (p.Via is { } via ? $"collegato tramite {via}" : "collegato") + (p.RttMs >= 0 ? $" · {p.RttMs:0} ms" : "")),
             "Connecting" => (Ui.Idle, true, "collegamento in corso…"),
             "Paused" => (Ui.Idle, true, "connessione disattivata"),
             _ => (Ui.Idle, true, "spento o non raggiungibile"),

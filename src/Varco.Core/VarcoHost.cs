@@ -50,7 +50,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
 
     /// <param name="fileAccess">Con gli appunti attivi abilita anche i file copiati in Esplora risorse.</param>
     public VarcoHost(ConfigStore store, IInputPlatform platform, int? tcpPort = null, int? discoveryPort = null,
-        IClipboardPlatform? clipboard = null, Files.IFileAccess? fileAccess = null)
+        IClipboardPlatform? clipboard = null, Files.IFileAccess? fileAccess = null, Audio.IAudioPlatform? audio = null)
     {
         _store = store;
         _tcpPortOverride = tcpPort;
@@ -63,6 +63,9 @@ public sealed partial class VarcoHost : IAsyncDisposable
             _store.Update(c => c.Layout = l);
             _net.Broadcast(new LayoutMsg(l));
         };
+        MediaRouter = new MediaKeyRouter(cfg.MachineId);
+        Audio = new Audio.AudioShare(_net, audio, () => _store.Current.AudioRouting,
+            r => _store.Update(c => c.AudioRouting = r, immediate: true), NameOf);
         Coordinator = new InputCoordinator(_net, platform, Layout)
         {
             EdgeSettings = () =>
@@ -70,6 +73,10 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 var c = _store.Current;
                 return new EdgeSettings(c.EdgeCorners, c.EdgeDelay ? EdgeSettings.StandardDelayMs : 0, c.EdgeBlockFullscreen, c.EdgeScrollLock);
             },
+            MediaRouter = MediaRouter,
+            MediaKeysFollowAudio = () => _store.Current.MediaKeysFollowAudio,
+            PointerScaleCompensation = () => _store.Current.PointerScaleCompensation,
+            VolumeKeysTarget = Audio.VolumeKeysTarget,
         };
         if (clipboard is not null)
         {
@@ -80,6 +87,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 files: FileOffers);
             Clipboard.FilesOffered += OnFilesOffered;
         }
+        Coordinator.ModeChanged += (mode, peer) => _role.OnModeChanged(mode, peer, Environment.TickCount64);
         // Cambi di risoluzione o monitor collegati/scollegati: la dimensione del desktop finisce nel layout condiviso.
         _desktopWatch = new Timer(_ =>
         {
@@ -148,16 +156,23 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 CheckGroupKey(c);
                 Coordinator.OnPeerConnected(c.PeerId, c.PeerName);
                 Clipboard?.OnPeerConnected(c.PeerId);
+                c.Send(new AudioActive(Volatile.Read(ref _localAudio) == 1));
+                Audio.OnPeerConnected(c.PeerId);
             };
             node.PeerDisconnected += (id, _) =>
             {
                 Coordinator.OnPeerDisconnected(id);
                 Clipboard?.OnPeerDisconnected(id);
+                MediaRouter.Forget(id);
+                Audio.OnPeerDisconnected(id);
             };
             node.MessageReceived += (id, m) =>
             {
                 if (m is InstallUpdate iu) { OnInstallUpdateRequested(id, iu.Version); return; }
                 if (m is GroupKeyChange gk) { OnGroupKeyChange(id, gk); return; }
+                if (Audio.OnMessage(id, m)) return;
+                if (m is AudioActive aa) { MediaRouter.SetPlaying(id, aa.Playing, Environment.TickCount64); return; }
+                if (m is LockScreen) { OnRemoteLock(id); return; }
                 if (Clipboard?.OnMessage(id, m) == true) return;
                 Coordinator.OnMessage(id, m, ConnectedPeers);
             };
@@ -172,11 +187,23 @@ public sealed partial class VarcoHost : IAsyncDisposable
             _node = node;
             _net.Node = node;
             node.Start();
+            Audio.Start();
         }
         finally
         {
             _netGate.Release();
         }
+    }
+
+    /// <summary>Nome di un PC del gruppo (anche scollegato) per log e Mixer volume.</summary>
+    private string NameOf(Guid id)
+    {
+        var cfg = _store.Current;
+        if (id == cfg.MachineId) return cfg.MachineName;
+        return ConnectedPeers().FirstOrDefault(p => p.Item1 == id).Item2
+            ?? cfg.KnownPeers.FirstOrDefault(p => p.Id == id)?.Name
+            ?? Layout.Current.Entries.FirstOrDefault(e => e.Id == id)?.Name
+            ?? id.ToString()[..8];
     }
 
     private IEnumerable<(Guid, string)> ConnectedPeers() =>
@@ -205,6 +232,82 @@ public sealed partial class VarcoHost : IAsyncDisposable
     }
 
     public void OnSuspend() => Coordinator.OnPeerDisconnected(Coordinator.ActivePeer ?? Guid.Empty);
+
+    // ───────────────────────────── tasti multimediali ─────────────────────────────
+
+    /// <summary>Chi sta suonando nel gruppo, per mandare lì i tasti multimediali.</summary>
+    public MediaKeyRouter MediaRouter { get; }
+    private int _localAudio; // 1 = suona
+
+    /// <summary>C'è almeno un altro PC collegato? Solo allora serve sapere se qui suona qualcosa.</summary>
+    public bool HasConnectedPeers => _node?.ConnectedPeers.Count > 0;
+
+    /// <summary>Esce del suono da questo PC? (dall'agent, che lo controlla ogni pochi secondi). Lo sanno anche gli altri PC.</summary>
+    public void SetLocalAudio(bool playing)
+    {
+        MediaRouter.SetPlaying(MediaRouter.Self, playing, Environment.TickCount64);
+        if (Interlocked.Exchange(ref _localAudio, playing ? 1 : 0) == (playing ? 1 : 0)) return;
+        Log.Info(playing ? "Esce del suono da questo PC" : "Da questo PC non esce più suono");
+        _net.Broadcast(new AudioActive(playing));
+    }
+
+    // ───────────────────────────── audio fra i PC ─────────────────────────────
+
+    /// <summary>Audio degli altri PC sul PC centrale.</summary>
+    public Audio.AudioShare Audio { get; }
+
+    private ControlResponse SetAudioRouting(Guid? hub, List<Guid>? sources)
+    {
+        var h = hub ?? Guid.Empty;
+        var cfg = _store.Current;
+        var known = cfg.KnownPeers.Select(p => p.Id).Append(cfg.MachineId).ToHashSet();
+        if (h != Guid.Empty && !known.Contains(h)) return new ControlResponse { Ok = false, Error = "PC centrale sconosciuto" };
+        Audio.SetRouting(h, (sources ?? []).Where(known.Contains), DateTime.UtcNow);
+        return new ControlResponse { Status = GetStatus() };
+    }
+
+    // ───────────────────────────── blocco di gruppo ─────────────────────────────
+
+    private readonly GroupLockPolicy _lockPolicy = new();
+
+    /// <summary>Blocca questo PC (impostato dall'agent). Null = non disponibile (test, agent senza input).</summary>
+    public Action? LockWorkstation { get; set; }
+
+    /// <summary>Ultimo input fisico (non iniettato) su questo PC, in ms di TickCount64: impostato dall'agent con gli hook.</summary>
+    public Func<long>? LastPhysicalInput { get; set; }
+    private readonly ControlRole _role = new();
+
+    /// <summary>Questo PC si è appena bloccato. Se l'ha bloccato a mano chi ci sta davanti, si bloccano anche gli altri.</summary>
+    /// <param name="lastPhysicalInputMs">Ultimo input fisico visto qui (TickCount64); 0 = mai.</param>
+    public void OnSessionLocked(long lastPhysicalInputMs)
+    {
+        if (!_store.Current.GroupLock) return;
+        var now = Environment.TickCount64;
+        if (!_lockPolicy.ShouldPropagate(now, lastPhysicalInputMs))
+        {
+            Log.Info($"Schermo bloccato (ultimo input fisico {(lastPhysicalInputMs == 0 ? "mai" : $"{(now - lastPhysicalInputMs) / 1000} s fa")}, " +
+                     "o chiesto da un altro PC): gli altri PC restano come sono");
+            return;
+        }
+        var peers = ConnectedPeers().Select(p => p.Item2).ToList();
+        Log.Info(peers.Count == 0 ? "Schermo bloccato: nessun altro PC collegato da bloccare"
+                                  : $"Schermo bloccato a mano: blocco anche {string.Join(", ", peers)}");
+        _net.Broadcast(new LockScreen());
+    }
+
+    private void OnRemoteLock(Guid from)
+    {
+        var name = ConnectedPeers().FirstOrDefault(p => p.Item1 == from).Item2 ?? from.ToString()[..8];
+        if (!_store.Current.GroupLock)
+        {
+            Log.Info($"{name} chiede di bloccare lo schermo, ma qui il blocco di gruppo è spento");
+            return;
+        }
+        Log.Info($"{name} è stato bloccato: blocco anche questo PC");
+        _lockPolicy.OnRemoteLock(Environment.TickCount64);
+        try { LockWorkstation?.Invoke(); }
+        catch (Exception ex) { Log.Error("Blocco dello schermo", ex); }
+    }
 
     // ───────────────────────────── aggiornamento immediato ─────────────────────────────
 
@@ -319,6 +422,25 @@ public sealed partial class VarcoHost : IAsyncDisposable
                     Log.Info($"Bordi: {req.Option} {(on ? "attivato" : "disattivato")}");
                     return new ControlResponse { Status = GetStatus() };
                 }
+
+                case "setInputOption":
+                {
+                    var on = req.Enabled != false;
+                    Action<VarcoConfig>? set = req.Option switch
+                    {
+                        "groupLock" => c => c.GroupLock = on,
+                        "mediaKeys" => c => c.MediaKeysFollowAudio = on,
+                        "pointerScale" => c => c.PointerScaleCompensation = on,
+                        _ => null,
+                    };
+                    if (set is null) return new ControlResponse { Ok = false, Error = $"Opzione sconosciuta: {req.Option}" };
+                    _store.Update(set, immediate: true);
+                    Log.Info($"Opzione {req.Option} {(on ? "attivata" : "disattivata")}");
+                    return new ControlResponse { Status = GetStatus() };
+                }
+
+                case "setAudio":
+                    return SetAudioRouting(req.Id, req.Sources);
 
                 case "setPaused":
                 {
@@ -442,6 +564,8 @@ public sealed partial class VarcoHost : IAsyncDisposable
             Paused = cfg.Paused,
             Mode = Coordinator.Mode.ToString(),
             ActivePeerName = active is Guid a ? peers.FirstOrDefault(p => p.Id == a)?.Name : null,
+            ControllerName = _role.Controller(LastPhysicalInput?.Invoke() ?? 0) is Guid ctl
+                ? peers.FirstOrDefault(p => p.Id == ctl && p.State == PeerState.Connected)?.Name : null,
             ListenPort = _node?.ListenPort ?? 0,
             Peers = peers.Select(p => new PeerDto
             {
@@ -455,6 +579,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
                 Adapter = NetworkLinks.Describe(p.LocalEndPoint?.Address)?.Adapter,
                 LocalAddress = p.LocalEndPoint is { } le ? (le.Address.IsIPv4MappedToIPv6 ? le.Address.MapToIPv4() : le.Address).ToString() : null,
                 ConnectedSinceUtc = p.ConnectedSinceUtc,
+                Via = p.Via,
                 Drops24h = p.Drops24h,
                 LastDropReason = p.LastDropReason,
                 LastDropUtc = p.LastDropUtc,
@@ -474,6 +599,13 @@ public sealed partial class VarcoHost : IAsyncDisposable
             EdgeDelay = cfg.EdgeDelay,
             EdgeBlockFullscreen = cfg.EdgeBlockFullscreen,
             EdgeScrollLock = cfg.EdgeScrollLock,
+            GroupLock = cfg.GroupLock,
+            MediaKeysFollowAudio = cfg.MediaKeysFollowAudio,
+            PointerScaleCompensation = cfg.PointerScaleCompensation,
+            AudioHub = cfg.AudioRouting.Hub,
+            AudioSources = cfg.AudioRouting.Sources.ToList(),
+            AudioSending = Audio.Sending,
+            AudioReceiving = Audio.Receiving(Environment.TickCount64),
             Update = Updater?.Status,
         };
     }
@@ -481,6 +613,7 @@ public sealed partial class VarcoHost : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         Updater?.Dispose();
+        Audio.Dispose();
         await _desktopWatch.DisposeAsync().ConfigureAwait(false);
         _net.Node = null;
         if (_node is not null) await _node.DisposeAsync().ConfigureAwait(false);

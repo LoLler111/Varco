@@ -74,6 +74,19 @@ public sealed class VarcoConfig
     /// <summary>Bordi: con Bloc Scorr acceso il cursore resta sul PC dove si trova.</summary>
     public bool EdgeScrollLock { get; set; } = true;
 
+    /// <summary>
+    /// Blocco di gruppo: bloccando a mano questo PC si bloccano anche gli altri collegati, e questo PC si blocca quando
+    /// lo chiede un altro. Vedi <see cref="Input.GroupLockPolicy"/>.
+    /// </summary>
+    public bool GroupLock { get; set; } = true;
+    /// <summary>Tasti multimediali premuti su questo PC al PC dove suona la musica. Vedi <see cref="Input.MediaKeyRouter"/>.</summary>
+    public bool MediaKeysFollowAudio { get; set; } = true;
+    /// <summary>
+    /// Quando questo PC comanda gli altri, gli spostamenti del cursore seguono la scala dei monitor (100%, 150%...)
+    /// invece dei pixel. Spento: al pixel, come sempre.
+    /// </summary>
+    public bool PointerScaleCompensation { get; set; }
+
     /// <summary>Connessione disattivata dall'utente: rete chiusa (niente collegamenti né ricerca) finché non la riattiva.</summary>
     public bool Paused { get; set; }
 
@@ -81,6 +94,9 @@ public sealed class VarcoConfig
     public bool AutoUpdate { get; set; } = true;
     /// <summary>Solo per i test: indirizzo alternativo della release (formato API di GitHub). Null = GitHub.</summary>
     public string? UpdateFeedUrl { get; set; }
+
+    /// <summary>Audio degli altri PC sul PC centrale: impostazione di tutto il gruppo. Vedi <see cref="Audio.AudioRouting"/>.</summary>
+    public Audio.AudioRouting AudioRouting { get; set; } = new();
 
     public Layout Layout { get; set; } = new();
     public List<KnownPeer> KnownPeers { get; set; } = [];

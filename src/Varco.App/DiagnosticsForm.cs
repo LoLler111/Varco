@@ -105,7 +105,11 @@ internal sealed class DiagnosticsForm : Form
                 var since = p.ConnectedSinceUtc is { } c ? $"collegato da {Duration(DateTime.UtcNow - c)}" : "collegato";
                 lines.Add($"{Capitalize(since)} · latenza {(p.RttMs >= 0 ? $"{p.RttMs:0.0} ms" : "?")}");
                 var link = p.Link is null ? "Rete" : p.Adapter is { } a && a != p.Link ? $"{p.Link} ({a})" : p.Link;
-                lines.Add($"{link}: {p.LocalAddress ?? "?"} → {p.Address ?? "?"}");
+                if (p.Via is { } via)
+                    lines.Add($"Tramite {via}: i due PC non si vedono direttamente ({link} verso {via}). " +
+                              "Mouse, tastiera e appunti passano; i file no. Varco continua a cercare il collegamento diretto.");
+                else
+                    lines.Add($"{link}: {p.LocalAddress ?? "?"} → {p.Address ?? "?"}");
                 break;
             case "Connecting":
                 lines.Add("Collegamento in corso…");

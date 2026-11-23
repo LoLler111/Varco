@@ -24,7 +24,17 @@ public enum MsgType : byte
     SecureAttention = 25,
     GroupKeyChange = 26,
     DragFiles = 27,
+    LockScreen = 28,
+    AudioActive = 29,
     ClipChunk = 30,
+    MediaKey = 31,
+    PointerScale = 32,
+    AudioRouting = 33,
+    AudioFrame = 34,
+    PeerList = 40,
+    RelayOpen = 41,
+    RelayData = 42,
+    RelayClose = 43,
 }
 
 public enum Edge : byte { Left = 0, Right = 1, Top = 2, Bottom = 3 }
@@ -57,7 +67,25 @@ public static class KeyCodes
     public static KeyFlags ForInjection(ushort vk, ushort scan, KeyFlags flags) =>
         vk == VK_RSHIFT && scan == 0x36 ? flags & ~KeyFlags.Extended : flags;
 
+    public const ushort VK_PAUSE = 0x13;
+
+    /// <summary>
+    /// Se il tasto va iniettato per VK invece che per scancode. Bloc Num e Pausa hanno tutti e due lo scancode 45 e
+    /// Windows li distingue solo dal tipo di sequenza (Pausa è E1 1D 45), che con SendInput non si può riprodurre.
+    /// Misurato: Bloc Num come lo segnala l'hook (45 esteso) iniettato per scancode diventa VK FF, cioè niente, e
+    /// Pausa (45 non esteso) diventa Bloc Num. Sul PC comandato Bloc Num non cambiava, il numpad dava frecce e
+    /// Home/Fine invece dei numeri, e Pausa accendeva o spegneva Bloc Num. Questi due VK non dipendono dal layout.
+    /// Anche i tasti senza scancode (multimediali) vanno per VK.
+    /// </summary>
+    public static bool InjectByVk(ushort vk, ushort scan) => scan == 0 || vk is VK_NUMLOCK or VK_PAUSE;
+
     public const ushort VK_LCONTROL = 0xA2;
+
+    /// <summary>Muto, volume giù, volume su.</summary>
+    public static bool IsVolumeKey(ushort vk) => vk is >= 0xAD and <= 0xAF;
+
+    /// <summary>Tasti multimediali: muto, volume giù/su, brano successivo/precedente, stop, play/pausa.</summary>
+    public static bool IsMediaKey(ushort vk) => vk is >= 0xAD and <= 0xB3;
 
     /// <summary>
     /// Il Ctrl sinistro "finto" che Windows aggiunge da sé attorno ad AltGr con i layout che lo hanno (italiano compreso):
@@ -152,6 +180,76 @@ public sealed record GroupKeyChange(byte[] Key, long ChangedUtcTicks, Guid[] Rem
 /// </summary>
 public sealed record DragFiles(byte[] Offer) : Message;
 
+/// <summary>
+/// "Blocca lo schermo": mandato a tutti i PC collegati quando l'utente blocca il PC che ha davanti (Win+L, Start →
+/// Blocca). Chi lo riceve si blocca, se ha il blocco di gruppo attivo. Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record LockScreen() : Message;
+
+/// <summary>
+/// Esce del suono da chi lo manda (musica, video)? Mandato appena connesso e a ogni cambio: serve a mandare i tasti
+/// multimediali al PC che suona (vedi <see cref="Input.MediaKeyRouter"/>). Chi lo manda sa anche ricevere
+/// <see cref="MediaKeyMsg"/>. Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record AudioActive(bool Playing) : Message;
+
+/// <summary>
+/// Un tasto multimediale (volume, play/pausa, brano successivo...) premuto su un altro PC, da eseguire qui anche se
+/// questo PC non è comandato: qui sta suonando la musica. Solo verso i PC che hanno mandato <see cref="AudioActive"/>.
+/// </summary>
+public sealed record MediaKeyMsg(ushort Vk, ushort Scan, KeyFlags Flags) : Message;
+
+/// <summary>
+/// Controller → target, subito dopo <see cref="Enter"/>: la scala (DPI, 96 = 100%) del monitor da cui è partito il
+/// cursore. Con un valore diverso da 0 il target moltiplica gli spostamenti per il rapporto fra la scala del suo monitor
+/// e questa, così lo stesso gesto attraversa la stessa porzione di finestre su tutti e due. 0 = spostamenti al pixel,
+/// come sempre. Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record PointerScale(ushort Dpi) : Message;
+
+/// <summary>
+/// Audio fra i PC, impostazione di tutto il gruppo: <paramref name="Hub"/> è il PC centrale che riceve l'audio
+/// (<see cref="Guid.Empty"/> = funzione spenta), <paramref name="Sources"/> i PC che gli mandano il loro.
+/// Mandato appena connesso e a ogni cambio; vince il cambio più recente (<paramref name="ChangedUtcTicks"/>).
+/// Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record AudioRoutingMsg(Guid Hub, Guid[] Sources, long ChangedUtcTicks) : Message
+{
+    public bool Equals(AudioRoutingMsg? other) =>
+        other is not null && Hub == other.Hub && ChangedUtcTicks == other.ChangedUtcTicks && Sources.SequenceEqual(other.Sources);
+    public override int GetHashCode() => HashCode.Combine(Hub, ChangedUtcTicks, Sources.Length);
+}
+
+/// <summary>
+/// 20 ms dell'audio di chi lo manda, compressi con Opus (48 kHz stereo), verso il PC centrale. <paramref name="Seq"/>
+/// conta i pacchetti: un salto vuol dire pacchetti scartati da chi manda perché la rete non stava al passo.
+/// Viaggia in una coda a parte che tiene solo gli ultimi pacchetti (vedi <see cref="Net.PeerConnection"/>).
+/// </summary>
+public sealed record AudioFrame(ushort Seq, byte[] Data) : Message;
+
+/// <summary>
+/// I PC con cui chi lo manda è collegato direttamente (senza inoltro). Mandato appena connesso e quando cambiano: dice
+/// tramite chi si può raggiungere un PC che non si vede direttamente (vedi <see cref="Net.RelayTunnel"/>).
+/// Chi lo manda sa inoltrare. Le versioni vecchie lo ignorano.
+/// </summary>
+public sealed record PeerList(PeerRef[] Connected) : Message;
+
+/// <summary>Un PC del gruppo in <see cref="PeerList"/>: chi riceve l'elenco impara anche i PC che non ha mai visto.</summary>
+public sealed record PeerRef(Guid Id, string Name);
+
+/// <summary>
+/// Apre un tunnel di inoltro. Da chi vuole collegarsi al PC che fa da tramite (<paramref name="Forwarded"/> = false):
+/// <paramref name="Peer"/> è il PC da raggiungere. Dal tramite al PC raggiunto (<paramref name="Forwarded"/> = true):
+/// <paramref name="Peer"/> è chi vuole collegarsi.
+/// </summary>
+public sealed record RelayOpen(Guid Tunnel, Guid Peer, bool Forwarded) : Message;
+
+/// <summary>Byte di un tunnel di inoltro: l'handshake e i frame cifrati fra i due PC alle estremità. Il tramite non li legge.</summary>
+public sealed record RelayData(Guid Tunnel, byte[] Data) : Message;
+
+/// <summary>Tunnel di inoltro chiuso (o rifiutato dal tramite).</summary>
+public sealed record RelayClose(Guid Tunnel) : Message;
+
 public static class MessageCodec
 {
     private static readonly JsonSerializerOptions Json = new();
@@ -191,6 +289,23 @@ public static class MessageCodec
                 foreach (var id in g.Removed) w.Write(id.ToByteArray());
                 break;
             case DragFiles d: w.Write((byte)MsgType.DragFiles); w.Write(d.Offer.Length); w.Write(d.Offer); break;
+            case LockScreen: w.Write((byte)MsgType.LockScreen); break;
+            case AudioActive a: w.Write((byte)MsgType.AudioActive); w.Write(a.Playing); break;
+            case MediaKeyMsg k: w.Write((byte)MsgType.MediaKey); w.Write(k.Vk); w.Write(k.Scan); w.Write((byte)k.Flags); break;
+            case PointerScale p: w.Write((byte)MsgType.PointerScale); w.Write(p.Dpi); break;
+            case AudioRoutingMsg a:
+                w.Write((byte)MsgType.AudioRouting); w.Write(a.Hub.ToByteArray()); w.Write(a.ChangedUtcTicks);
+                w.Write((ushort)a.Sources.Length);
+                foreach (var id in a.Sources) w.Write(id.ToByteArray());
+                break;
+            case AudioFrame f: w.Write((byte)MsgType.AudioFrame); w.Write(f.Seq); w.Write((ushort)f.Data.Length); w.Write(f.Data); break;
+            case PeerList l:
+                w.Write((byte)MsgType.PeerList); w.Write((ushort)l.Connected.Length);
+                foreach (var p in l.Connected) { w.Write(p.Id.ToByteArray()); w.Write(p.Name); }
+                break;
+            case RelayOpen o: w.Write((byte)MsgType.RelayOpen); w.Write(o.Tunnel.ToByteArray()); w.Write(o.Peer.ToByteArray()); w.Write(o.Forwarded); break;
+            case RelayData d: w.Write((byte)MsgType.RelayData); w.Write(d.Tunnel.ToByteArray()); w.Write(d.Data.Length); w.Write(d.Data); break;
+            case RelayClose c: w.Write((byte)MsgType.RelayClose); w.Write(c.Tunnel.ToByteArray()); break;
             default: throw new ArgumentException($"Messaggio non supportato: {m.GetType().Name}");
         }
         w.Flush();
@@ -223,6 +338,16 @@ public static class MessageCodec
             MsgType.SecureAttention => new SecureAttention(),
             MsgType.GroupKeyChange => ReadGroupKeyChange(r),
             MsgType.DragFiles => new DragFiles(ReadBlob(r)),
+            MsgType.LockScreen => new LockScreen(),
+            MsgType.AudioActive => new AudioActive(r.ReadBoolean()),
+            MsgType.MediaKey => new MediaKeyMsg(r.ReadUInt16(), r.ReadUInt16(), (KeyFlags)r.ReadByte()),
+            MsgType.PointerScale => new PointerScale(r.ReadUInt16()),
+            MsgType.AudioRouting => ReadAudioRouting(r),
+            MsgType.AudioFrame => ReadAudioFrame(r),
+            MsgType.PeerList => ReadPeerList(r),
+            MsgType.RelayOpen => new RelayOpen(new Guid(r.ReadBytes(16)), new Guid(r.ReadBytes(16)), r.ReadBoolean()),
+            MsgType.RelayData => new RelayData(new Guid(r.ReadBytes(16)), ReadBlob(r)),
+            MsgType.RelayClose => new RelayClose(new Guid(r.ReadBytes(16))),
             _ => null,
         };
     }
@@ -234,6 +359,30 @@ public static class MessageCodec
         var removed = new Guid[r.ReadUInt16()];
         for (var i = 0; i < removed.Length; i++) removed[i] = new Guid(r.ReadBytes(16));
         return new GroupKeyChange(key, ticks, removed);
+    }
+
+    private static AudioRoutingMsg ReadAudioRouting(BinaryReader r)
+    {
+        var hub = new Guid(r.ReadBytes(16));
+        var ticks = r.ReadInt64();
+        var sources = new Guid[r.ReadUInt16()];
+        for (var i = 0; i < sources.Length; i++) sources[i] = new Guid(r.ReadBytes(16));
+        return new AudioRoutingMsg(hub, sources, ticks);
+    }
+
+    private static AudioFrame ReadAudioFrame(BinaryReader r)
+    {
+        var seq = r.ReadUInt16();
+        var len = r.ReadUInt16();
+        if (len > r.BaseStream.Length - r.BaseStream.Position) throw new InvalidDataException("AudioFrame troncato");
+        return new AudioFrame(seq, r.ReadBytes(len));
+    }
+
+    private static PeerList ReadPeerList(BinaryReader r)
+    {
+        var peers = new PeerRef[r.ReadUInt16()];
+        for (var i = 0; i < peers.Length; i++) peers[i] = new PeerRef(new Guid(r.ReadBytes(16)), r.ReadString());
+        return new PeerList(peers);
     }
 
     private static byte[] ReadBlob(BinaryReader r)

@@ -18,6 +18,8 @@ public sealed record PeerStatus(Guid? Id, string Name, PeerState State, string? 
     public int Drops24h { get; init; }
     public string? LastDropReason { get; init; }
     public DateTime? LastDropUtc { get; init; }
+    /// <summary>Collegato tramite un altro PC (inoltro): il suo nome. Null = collegamento diretto.</summary>
+    public string? Via { get; init; }
 }
 
 public sealed class NodeOptions
@@ -41,6 +43,13 @@ public sealed class NodeOptions
     /// Letta a ogni connessione: segue la configurazione senza ricreare il nodo.
     /// </summary>
     public Func<Guid, IReadOnlyList<byte[]>>? RetiredKeysFor { get; init; }
+    /// <summary>
+    /// Dopo quanto tempo senza collegamento diretto si prova a passare da un altro PC del gruppo (ms). 0 = mai.
+    /// Il collegamento diretto si continua a cercare anche dopo, e appena riesce sostituisce l'inoltro.
+    /// </summary>
+    public int RelayAfterMs { get; init; } = 8000;
+    /// <summary>Dopo un inoltro non riuscito, attesa prima di riprovare (ms).</summary>
+    public int RelayRetryMs { get; init; } = 10_000;
 }
 
 /// <summary>
@@ -76,6 +85,13 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     private readonly Dictionary<string, PeerSlot> _slots = new();
     private readonly Dictionary<Guid, long> _lastReply = new();
     private bool _started;
+
+    // Inoltro (vedi RelayTunnel). Tunnel di cui questo PC è un capo, tunnel che questo PC gira da un PC all'altro
+    // (id → i due capi), PC collegati direttamente a ciascun PC (dai loro PeerList), PC per cui è in corso un tentativo.
+    private readonly Dictionary<Guid, RelayTunnel> _tunnels = new();
+    private readonly Dictionary<Guid, (Guid A, Guid B)> _relays = new();
+    private readonly Dictionary<Guid, HashSet<Guid>> _peerLists = new();
+    private readonly HashSet<Guid> _relayAttempts = new();
 
     public LocalIdentity Me { get; }
     public int ListenPort { get; }
@@ -159,6 +175,7 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
             foreach (var s in _slots.Values) StartSlot(s);
         }
         _ = Task.Run(AcceptLoop);
+        if (_opt.RelayAfterMs > 0) _ = Task.Run(RelayLoop);
         _discovery?.Start();
         NetworkChange.NetworkAddressChanged += OnNetworkChanged;
         NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
@@ -170,6 +187,18 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     public bool IsConnected(Guid id)
     {
         lock (_gate) return _conns.ContainsKey(id);
+    }
+
+    /// <summary>Collegato senza passare da un altro PC?</summary>
+    public bool IsDirectlyConnected(Guid id)
+    {
+        lock (_gate) return _conns.TryGetValue(id, out var c) && !c.IsRelayed;
+    }
+
+    /// <summary>Collegato tramite un altro PC: il suo id (null se diretto o non collegato).</summary>
+    public Guid? RelayedVia(Guid id)
+    {
+        lock (_gate) return _conns.TryGetValue(id, out var c) ? c.Via?.PeerId : null;
     }
 
     /// <summary>Chiave di gruppo con cui è nata la connessione attuale verso quel PC (null se non è collegato).</summary>
@@ -228,6 +257,8 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         PeerConnection? c;
         lock (_gate) _conns.TryGetValue(peer, out c);
         if (c is null) throw new IOException("il PC che ha copiato i file non è collegato");
+        if (c.IsRelayed)
+            throw new IOException($"{c.PeerName} è collegato tramite {c.Via!.PeerName}: i file passano solo fra PC che si vedono direttamente");
         if (!c.FilesNeedDialBack)
         {
             var ep = new IPEndPoint(Normalize(c.RemoteEndPoint.Address), c.PeerListenPort);
@@ -283,6 +314,7 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     /// <summary>Un PC che incolla i nostri file non riesce a collegarsi: ci colleghiamo noi a lui.</summary>
     private void OnFileDialBack(PeerConnection c, Guid token)
     {
+        if (c.IsRelayed) return; // non può raggiungerci direttamente, e noi nemmeno lui
         var ep = new IPEndPoint(Normalize(c.RemoteEndPoint.Address), c.PeerListenPort);
         Log.Info($"{c.PeerName} non riesce a collegarsi per i file: mi collego io a {ep}");
         _ = Task.Run(async () =>
@@ -344,10 +376,11 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
                 resolvedIds.Add(id);
                 var (drops, lastReason, lastAt) = s.DropStats();
                 var status = _conns.TryGetValue(id, out var c)
-                    ? new PeerStatus(id, c.PeerName, PeerState.Connected, c.RemoteEndPoint.ToString(), c.RttMs, null)
+                    ? new PeerStatus(id, c.PeerName, PeerState.Connected, c.Via is { } via ? $"tramite {via.PeerName}" : c.RemoteEndPoint.ToString(), c.RttMs, null)
                     {
-                        LocalEndPoint = c.LocalEndPoint,
+                        LocalEndPoint = c.Via?.LocalEndPoint ?? c.LocalEndPoint,
                         ConnectedSinceUtc = c.EstablishedUtc,
+                        Via = c.Via?.PeerName,
                     }
                     : new PeerStatus(id, s.Name, s.Connecting ? PeerState.Connecting : PeerState.Disconnected, null, -1, s.LastError);
                 result.Add(status with { Drops24h = drops, LastDropReason = lastReason, LastDropUtc = lastAt });
@@ -440,6 +473,10 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         public string? LastError { get; set; }
         public int BackoffMs { get; set; }
         public bool Started { get; set; }
+        /// <summary>Da quando non c'è collegamento con questo PC (TickCount64): serve a decidere quando passare da un altro PC.</summary>
+        public long DownSince { get; set; } = Environment.TickCount64;
+        /// <summary>Prossimo tentativo di inoltro possibile (dopo uno non riuscito).</summary>
+        public long NextRelayAt { get; set; }
         private readonly Queue<DateTime> _drops = new();
         private string? _lastDropReason;
         private DateTime? _lastDropUtc;
@@ -533,9 +570,10 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         while (!ct.IsCancellationRequested)
         {
             var target = slot.Id ?? slot.ResolvedId;
-            if (target is Guid id && (IsConnected(id) || (slot.Id is null && HasIdSlot(id))))
+            if (target is Guid id && (IsDirectlyConnected(id) || (slot.Id is null && HasIdSlot(id))))
             {
-                // Connesso (o uno slot dedicato gestisce già quel PC): aspetto un segnale.
+                // Connesso (o uno slot dedicato gestisce già quel PC): aspetto un segnale. Se il collegamento passa da
+                // un altro PC si continua a cercare quello diretto, che appena riesce lo sostituisce.
                 await slot.WaitAsync(2000, ct).ConfigureAwait(false);
                 continue;
             }
@@ -656,7 +694,8 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
 
     // ───────────────────────────── registro connessioni ─────────────────────────────
 
-    private void Register(PeerConnection conn, IPEndPoint learned, PeerSlot? viaSlot)
+    /// <param name="learned">Indirizzo a cui l'altro PC risponde; null per le connessioni tramite un altro PC.</param>
+    private void Register(PeerConnection conn, IPEndPoint? learned, PeerSlot? viaSlot)
     {
         PeerConnection? replaced = null;
         bool accepted;
@@ -666,8 +705,13 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
 
             if (_conns.TryGetValue(conn.PeerId, out var existing))
             {
-                var inRace = conn.EstablishedAt - existing.EstablishedAt < _opt.RaceWindowMs;
-                accepted = inRace ? Rank(conn).CompareTo(Rank(existing)) < 0 : true;
+                // Il collegamento diretto vince sempre su quello tramite un altro PC.
+                if (existing.IsRelayed != conn.IsRelayed) accepted = !conn.IsRelayed;
+                else
+                {
+                    var inRace = conn.EstablishedAt - existing.EstablishedAt < _opt.RaceWindowMs;
+                    accepted = inRace ? Rank(conn).CompareTo(Rank(existing)) < 0 : true;
+                }
                 if (accepted) replaced = existing;
             }
             else
@@ -686,13 +730,14 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         }
 
         var slot = GetOrCreateSlot(conn.PeerId, conn.PeerName);
-        slot.AddEndpoint(learned, front: true);
+        if (learned is not null) slot.AddEndpoint(learned, front: true);
         slot.LastError = null;
 
         conn.MessageReceived += (c, m) =>
         {
             if (!IsCurrent(c)) return;
             if (m is FileDialBack fd) { if (FileProvider is not null) OnFileDialBack(c, fd.Token); return; }
+            if (OnRelayMessage(c, m)) return;
             MessageReceived?.Invoke(c.PeerId, m);
         };
         _ = conn.Closed.ContinueWith(t => OnConnectionClosed(conn, t.Result), TaskScheduler.Default);
@@ -705,10 +750,16 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
             SafeInvoke(() => PeerDisconnected?.Invoke(conn.PeerId, "sostituita"));
         }
 
-        Log.Info($"Connesso a {conn.PeerName} {conn.RemoteEndPoint} ({(conn.InitiatorId == Me.Id ? "in uscita" : "in ingresso")})");
-        SafeInvoke(() => PeerLearned?.Invoke(conn.PeerId, conn.PeerName, learned.ToString()));
+        if (conn.Via is { } via)
+            Log.Info($"Connesso a {conn.PeerName} tramite {via.PeerName}: i due PC non si vedono direttamente " +
+                     $"({(conn.InitiatorId == Me.Id ? "in uscita" : "in ingresso")})");
+        else
+            Log.Info($"Connesso a {conn.PeerName} {conn.RemoteEndPoint} ({(conn.InitiatorId == Me.Id ? "in uscita" : "in ingresso")})" +
+                     (replaced?.IsRelayed == true ? ": di nuovo collegamento diretto" : ""));
+        if (learned is not null) SafeInvoke(() => PeerLearned?.Invoke(conn.PeerId, conn.PeerName, learned.ToString()));
         SafeInvoke(() => PeerConnected?.Invoke(conn));
         conn.Start();
+        if (!conn.IsRelayed || replaced is { IsRelayed: false }) AnnouncePeerList();
     }
 
     /// <summary>Ordine di preferenza in caso di gara: prima la connessione aperta dall'ID più basso, poi SessionId più basso.</summary>
@@ -731,7 +782,9 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
             wasCurrent = _conns.TryGetValue(conn.PeerId, out var cur) && ReferenceEquals(cur, conn);
             if (wasCurrent) _conns.Remove(conn.PeerId);
         }
+        CloseTunnelsOf(conn);
         if (!wasCurrent) return;
+        if (!conn.IsRelayed) AnnouncePeerList();
 
         Log.Info($"Disconnesso da {conn.PeerName}: {reason}");
         SafeInvoke(() => PeerDisconnected?.Invoke(conn.PeerId, reason));
@@ -739,9 +792,246 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         {
             var slot = GetOrCreateSlot(conn.PeerId, conn.PeerName);
             slot.RecordDrop(reason);
+            slot.DownSince = Environment.TickCount64;
             slot.Kick(_opt.BackoffMinMs);
             _discovery?.Announce();
         }
+    }
+
+    // ───────────────────────────── inoltro tramite un altro PC ─────────────────────────────
+
+    /// <summary>Manda a tutti i PC collegati direttamente l'elenco di quelli collegati direttamente a questo.</summary>
+    private void AnnouncePeerList()
+    {
+        List<PeerConnection> direct;
+        lock (_gate) direct = _conns.Values.Where(c => !c.IsRelayed).ToList();
+        var msg = new PeerList(direct.Select(c => new PeerRef(c.PeerId, c.PeerName)).ToArray());
+        foreach (var c in direct) c.Send(msg);
+    }
+
+    /// <summary>
+    /// Ogni secondo: per ogni PC del gruppo senza collegamento da almeno <see cref="NodeOptions.RelayAfterMs"/>, se un
+    /// PC collegato direttamente a questo lo è anche a lui, si passa da quello. Per non aprire due tunnel in parallelo
+    /// prova solo il PC con l'id più basso; l'altro aspetta.
+    /// </summary>
+    private async Task RelayLoop()
+    {
+        var ct = _cts.Token;
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(1000, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            var now = Environment.TickCount64;
+            List<(PeerSlot Slot, Guid Id, PeerConnection Carrier)> attempts = [];
+            lock (_gate)
+            {
+                foreach (var slot in _slots.Values)
+                {
+                    if (slot.Id is not Guid id || _conns.ContainsKey(id) || _relayAttempts.Contains(id)) continue;
+                    if (Me.Id.CompareTo(id) > 0 || now - slot.DownSince < _opt.RelayAfterMs || now < slot.NextRelayAt) continue;
+                    var carrier = _conns.Values.FirstOrDefault(c => !c.IsRelayed && _peerLists.TryGetValue(c.PeerId, out var l) && l.Contains(id));
+                    if (carrier is null) continue;
+                    _relayAttempts.Add(id);
+                    attempts.Add((slot, id, carrier));
+                }
+            }
+            foreach (var (slot, id, carrier) in attempts) _ = Task.Run(() => TryRelayAsync(slot, id, carrier));
+        }
+    }
+
+    private async Task TryRelayAsync(PeerSlot slot, Guid id, PeerConnection carrier)
+    {
+        var tunnel = new RelayTunnel(Guid.NewGuid(), carrier, ForgetTunnel);
+        lock (_gate) _tunnels[tunnel.Id] = tunnel;
+        try
+        {
+            Log.Info($"{slot.Name} non si vede direttamente da {(Environment.TickCount64 - slot.DownSince) / 1000} s: provo tramite {carrier.PeerName}");
+            carrier.Send(new RelayOpen(tunnel.Id, id, Forwarded: false));
+            using var t = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            t.CancelAfter(_opt.HandshakeTimeoutMs);
+            var hs = await Handshake.RunClientAsync(tunnel, Me, t.Token).ConfigureAwait(false);
+            if (hs.PeerId != id) throw new HandshakeException("ha risposto un altro PC");
+            Register(new PeerConnection(tunnel, hs, initiatorId: Me.Id, _opt.HeartbeatIntervalMs, _opt.HeartbeatTimeoutMs), null, null);
+        }
+        catch (Exception ex)
+        {
+            tunnel.Dispose();
+            slot.NextRelayAt = Environment.TickCount64 + _opt.RelayRetryMs;
+            var why = ex switch
+            {
+                OperationCanceledException => "nessuna risposta",
+                EndOfStreamException => $"{carrier.PeerName} non riesce a raggiungerlo",
+                _ => ex.Message,
+            };
+            Log.Info($"Collegamento con {slot.Name} tramite {carrier.PeerName} non riuscito: {why}");
+        }
+        finally
+        {
+            lock (_gate) _relayAttempts.Remove(id);
+        }
+    }
+
+    private void ForgetTunnel(RelayTunnel t)
+    {
+        lock (_gate)
+            if (_tunnels.TryGetValue(t.Id, out var cur) && ReferenceEquals(cur, t)) _tunnels.Remove(t.Id);
+    }
+
+    /// <summary>
+    /// Messaggi dell'inoltro, da qualunque connessione diretta: elenco dei PC collegati, tunnel da girare a un altro PC
+    /// (questo PC fa da tramite) o tunnel di cui questo PC è un capo. Restituisce true se il messaggio era dell'inoltro.
+    /// </summary>
+    private bool OnRelayMessage(PeerConnection c, Message m)
+    {
+        switch (m)
+        {
+            case PeerList pl:
+                if (c.IsRelayed) return true; // solo i collegamenti diretti fanno da tramite: niente catene
+                lock (_gate) _peerLists[c.PeerId] = [.. pl.Connected.Select(p => p.Id)];
+                // PC del gruppo mai visti da qui (collegati al gruppo tramite un altro PC mentre questo era spento):
+                // li si conosce così, e se non si vedono direttamente ci si collega tramite chi li vede.
+                foreach (var p in pl.Connected)
+                    if (p.Id != Me.Id && !HasIdSlot(p.Id))
+                    {
+                        Log.Info($"{c.PeerName} è collegato a {p.Name}, che questo PC non conosceva");
+                        GetOrCreateSlot(p.Id, p.Name);
+                    }
+                return true;
+
+            case RelayOpen { Forwarded: false } ro:
+                ForwardTunnel(c, ro);
+                return true;
+
+            case RelayOpen { Forwarded: true } ro:
+                AcceptTunnel(c, ro);
+                return true;
+
+            case RelayData rd:
+            {
+                RelayTunnel? mine;
+                PeerConnection? next = null;
+                lock (_gate)
+                {
+                    if (_tunnels.TryGetValue(rd.Tunnel, out mine) && !ReferenceEquals(mine.Carrier, c)) mine = null;
+                    if (mine is null && OtherEnd(rd.Tunnel, c.PeerId) is Guid other) _conns.TryGetValue(other, out next);
+                }
+                if (mine is not null) mine.Deliver(rd.Data);
+                else if (next is { IsRelayed: false }) next.Send(rd);
+                else if (!c.IsRelayed)
+                {
+                    lock (_gate) _relays.Remove(rd.Tunnel);
+                    c.Send(new RelayClose(rd.Tunnel));
+                }
+                return true;
+            }
+
+            case RelayClose rc:
+            {
+                RelayTunnel? mine;
+                PeerConnection? next = null;
+                lock (_gate)
+                {
+                    if (_tunnels.TryGetValue(rc.Tunnel, out mine) && !ReferenceEquals(mine.Carrier, c)) mine = null;
+                    if (mine is null && OtherEnd(rc.Tunnel, c.PeerId) is Guid other)
+                    {
+                        _relays.Remove(rc.Tunnel);
+                        _conns.TryGetValue(other, out next);
+                    }
+                }
+                mine?.RemoteClosed();
+                next?.Send(rc);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>L'altro capo di un tunnel che questo PC gira, se <paramref name="from"/> è uno dei due capi.</summary>
+    private Guid? OtherEnd(Guid tunnel, Guid from) =>
+        _relays.TryGetValue(tunnel, out var ends) ? ends.A == from ? ends.B : ends.B == from ? ends.A : null : null;
+
+    /// <summary>Questo PC fa da tramite: un PC collegato chiede di raggiungerne un altro collegato.</summary>
+    private void ForwardTunnel(PeerConnection from, RelayOpen ro)
+    {
+        PeerConnection? to = null;
+        string? refuse = null;
+        lock (_gate)
+        {
+            if (from.IsRelayed) refuse = "la richiesta arriva già tramite un altro PC";
+            else if (ro.Peer == Me.Id) refuse = "chiede questo PC";
+            else if (!_conns.TryGetValue(ro.Peer, out to) || to.IsRelayed) refuse = "non è collegato direttamente a questo PC";
+            else if (!_peerLists.ContainsKey(ro.Peer)) refuse = "ha una versione di Varco senza inoltro";
+            else if (_relays.ContainsKey(ro.Tunnel)) refuse = "tunnel già aperto";
+            else _relays[ro.Tunnel] = (from.PeerId, ro.Peer);
+        }
+        if (refuse is not null)
+        {
+            Log.Info($"{from.PeerName} chiede di raggiungere {to?.PeerName ?? ro.Peer.ToString()[..8]} tramite questo PC: rifiutato ({refuse})");
+            from.Send(new RelayClose(ro.Tunnel));
+            return;
+        }
+        Log.Info($"{from.PeerName} e {to!.PeerName} non si vedono: i loro dati passano da questo PC");
+        to.Send(new RelayOpen(ro.Tunnel, from.PeerId, Forwarded: true));
+    }
+
+    /// <summary>Un PC del gruppo vuole collegarsi a questo tramite <paramref name="carrier"/>: handshake sopra il tunnel.</summary>
+    private void AcceptTunnel(PeerConnection carrier, RelayOpen ro)
+    {
+        if (carrier.IsRelayed || IsDirectlyConnected(ro.Peer))
+        {
+            carrier.Send(new RelayClose(ro.Tunnel));
+            return;
+        }
+        var tunnel = new RelayTunnel(ro.Tunnel, carrier, ForgetTunnel);
+        lock (_gate)
+        {
+            if (_tunnels.ContainsKey(ro.Tunnel)) { carrier.Send(new RelayClose(ro.Tunnel)); return; }
+            _tunnels[ro.Tunnel] = tunnel;
+        }
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var t = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+                t.CancelAfter(_opt.HandshakeTimeoutMs);
+                var hs = await Handshake.RunServerAsync(tunnel, Me, t.Token).ConfigureAwait(false);
+                if (hs.PeerId != ro.Peer) throw new HandshakeException("si è presentato un PC diverso da quello annunciato");
+                Register(new PeerConnection(tunnel, hs, initiatorId: hs.PeerId, _opt.HeartbeatIntervalMs, _opt.HeartbeatTimeoutMs), null, null);
+            }
+            catch (Exception ex)
+            {
+                Log.Debug($"Handshake tramite {carrier.PeerName} fallito: {ex.Message}");
+                tunnel.Dispose();
+            }
+        });
+    }
+
+    /// <summary>
+    /// La connessione si è chiusa: i tunnel che passavano da lei si chiudono, e gli altri capi dei tunnel che questo PC
+    /// girava per lei lo sanno subito (senza aspettare il timeout dell'heartbeat).
+    /// </summary>
+    private void CloseTunnelsOf(PeerConnection conn)
+    {
+        List<RelayTunnel> mine;
+        List<(Guid Tunnel, PeerConnection? Other)> relayed = [];
+        lock (_gate)
+        {
+            mine = _tunnels.Values.Where(t => ReferenceEquals(t.Carrier, conn)).ToList();
+            if (!conn.IsRelayed)
+            {
+                // L'elenco resta se nel frattempo è arrivata una connessione diretta nuova (lo manda lei).
+                if (!_conns.TryGetValue(conn.PeerId, out var cur) || cur.IsRelayed) _peerLists.Remove(conn.PeerId);
+                // I tunnel girati per lei passavano da questa connessione: il suo capo li ha già chiusi.
+                foreach (var (id, ends) in _relays.Where(kv => kv.Value.A == conn.PeerId || kv.Value.B == conn.PeerId).ToList())
+                {
+                    _relays.Remove(id);
+                    _conns.TryGetValue(ends.A == conn.PeerId ? ends.B : ends.A, out var other);
+                    relayed.Add((id, other));
+                }
+            }
+        }
+        foreach (var t in mine) t.RemoteClosed();
+        foreach (var (id, other) in relayed) other?.Send(new RelayClose(id));
     }
 
     // ───────────────────────────── eventi esterni ─────────────────────────────
@@ -750,7 +1040,7 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
     {
         var slot = GetOrCreateSlot(id, name);
         slot.AddEndpoint(ep, front: true);
-        if (IsConnected(id)) return;
+        if (IsDirectlyConnected(id)) return;
 
         slot.Kick(_opt.BackoffMinMs);
         // Rispondo in unicast (max 1/s per peer): così anche l'altro lato ci trova subito.
@@ -833,6 +1123,7 @@ public sealed class NetworkNode : IPeerNetwork, IAsyncDisposable
         _discovery?.Dispose();
         List<PeerConnection> all;
         lock (_gate) { all = _conns.Values.ToList(); _conns.Clear(); }
-        foreach (var c in all) await c.DisposeAsync().ConfigureAwait(false);
+        // Prima quelle tramite un altro PC: chiudono i loro tunnel mentre la connessione con lui è ancora aperta.
+        foreach (var c in all.OrderBy(c => c.IsRelayed ? 0 : 1)) await c.DisposeAsync().ConfigureAwait(false);
     }
 }

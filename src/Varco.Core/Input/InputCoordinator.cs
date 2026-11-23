@@ -55,6 +55,8 @@ public interface IInputPlatform
     /// Chiamato solo dal thread di input.
     /// </summary>
     bool IsMovingWindow() => false;
+    /// <summary>Scala (DPI, 96 = 100%) del monitor che contiene (x, y).</summary>
+    int GetDpiAt(int x, int y) => 96;
 }
 
 public enum InputMode { Local, Controlling, Controlled }
@@ -190,6 +192,28 @@ public sealed class InputCoordinator
     /// a 4 e 8 ms resta indietro, da 12 ms in su segue il cursore al pixel). Il mouse fisico non ha questo problema.
     /// </summary>
     public int WindowMoveIntervalMs { get; init; } = 16;
+
+    // Scala del monitor del PC che comanda (0 = spostamenti al pixel) e frazioni di pixel non ancora iniettate.
+    private int _scaleFromDpi;
+    private double _fracX, _fracY; // solo sul thread di input
+
+    /// <summary>Tasti multimediali al PC che suona (null = sempre dove va la tastiera).</summary>
+    public MediaKeyRouter? MediaRouter { get; set; }
+    /// <summary>Impostazione "tasti multimediali al PC che suona" di questo PC (letta a ogni tasto).</summary>
+    public Func<bool> MediaKeysFollowAudio { get; set; } = () => true;
+    /// <summary>
+    /// Dove vanno i tasti del volume diretti al PC indicato, se non a lui: un PC che manda il suo audio al PC centrale si
+    /// sente da lì, e il suo volume non conta (vedi <see cref="Audio.AudioShare.VolumeKeysTarget"/>). Null = nessuna deviazione.
+    /// </summary>
+    public Func<Guid, Guid?> VolumeKeysTarget { get; set; } = _ => null;
+    /// <summary>Tasti multimediali premuti e mandati altrove: dove va il loro rilascio (anche le ripetizioni).</summary>
+    private readonly Dictionary<ushort, Guid> _mediaDest = new();
+
+    /// <summary>
+    /// Impostazione "compensa la scala dello schermo" di questo PC, quando comanda gli altri: il PC comandato moltiplica
+    /// gli spostamenti per il rapporto fra le scale dei due monitor (vedi <see cref="PointerScale"/>).
+    /// </summary>
+    public Func<bool> PointerScaleCompensation { get; set; } = () => false;
 
     public InputCoordinator(IPeerNetwork net, IInputPlatform platform, LayoutManager layout)
     {
@@ -367,6 +391,7 @@ public sealed class InputCoordinator
             switch (_mode)
             {
                 case InputMode.Local:
+                    if (RouteMediaKey(vk, scan, flags, _net.SelfId) is bool routed) return routed;
                     if (!up) { _localDownKeys.Add(vk); return false; }
                     if (_remoteDownKeys.Remove(vk)) return true; // premuto sul remoto: il PC locale non l'ha mai visto giù
                     _localDownKeys.Remove(vk);
@@ -400,6 +425,7 @@ public sealed class InputCoordinator
                         _remoteDownKeys.Add(vk);
                         return true;
                     }
+                    if (RouteMediaKey(vk, scan, flags, _peer) is bool media) return media;
                     FlushPending();
                     _net.Send(_peer, new KeyMsg(vk, scan, flags));
                     // Bloc Maiusc/Num/Scorr cambiano su tutti e due i PC: il tasto passa anche al PC locale, così la spia
@@ -416,6 +442,51 @@ public sealed class InputCoordinator
                     return false;
             }
         }
+    }
+
+    /// <summary>
+    /// Tasto multimediale da mandare a un PC diverso da quello dove va la tastiera (<paramref name="current"/>), perché
+    /// la musica suona lì (vedi <see cref="MediaKeyRouter"/>). Restituisce null se il tasto segue la strada normale,
+    /// false se va lasciato a questo PC (suona qui mentre si comanda un altro PC), true se è stato mandato altrove.
+    /// </summary>
+    private bool? RouteMediaKey(ushort vk, ushort scan, KeyFlags flags, Guid current)
+    {
+        if (!KeyCodes.IsMediaKey(vk) || MediaRouter is not { } router) return null;
+        var up = flags.HasFlag(KeyFlags.Up);
+        Guid dest;
+        if (_mediaDest.TryGetValue(vk, out var held))
+        {
+            dest = held; // ripetizioni e rilascio vanno dove è andata la pressione
+            if (up) _mediaDest.Remove(vk);
+        }
+        else
+        {
+            if (up) return null;
+            bool follow;
+            try { follow = MediaKeysFollowAudio(); }
+            catch (Exception ex) { Log.Error("Impostazione dei tasti multimediali", ex); follow = false; }
+            dest = follow ? router.Route(current, Environment.TickCount64, _net.IsConnected) : current;
+            var why = "al PC che suona";
+            if (KeyCodes.IsVolumeKey(vk))
+            {
+                Guid? hub;
+                try { hub = VolumeKeysTarget(dest); }
+                catch (Exception ex) { Log.Error("Volume dell'audio fra i PC", ex); hub = null; }
+                if (hub is Guid h && h != dest)
+                {
+                    dest = h;
+                    why = "al PC centrale dell'audio";
+                }
+            }
+            if (dest == current) return null;
+            _mediaDest[vk] = dest;
+            Log.Info($"Tasto multimediale {vk:X2} {why} ({(dest == _net.SelfId ? "questo PC" : dest)})");
+        }
+        if (dest == current) return null;
+        if (dest == _net.SelfId) return false;
+        if (_net.Send(dest, new MediaKeyMsg(vk, scan, flags))) return true;
+        _mediaDest.Remove(vk); // scollegato nel frattempo: il tasto torna dove va la tastiera
+        return null;
     }
 
     // ═══════════════════════ eventi dalla rete ═══════════════════════
@@ -506,6 +577,15 @@ public sealed class InputCoordinator
                     break;
                 case LockKeysMsg l when IsControlledBy(from):
                     PostInput(() => _platform.SetLockKeys(l.State));
+                    break;
+                case PointerScale ps when IsControlledBy(from):
+                    _scaleFromDpi = ps.Dpi;
+                    break;
+                case MediaKeyMsg mk:
+                    // Da qualunque PC del gruppo, anche se non ci comanda: la musica suona qui. Per VK: i tasti
+                    // multimediali non dipendono dal layout di tastiera.
+                    Log.Debug($"Tasto multimediale {mk.Vk:X2} {mk.Flags} da {from}");
+                    _platform.Post(() => _platform.InjectKey(mk.Vk, 0, mk.Flags));
                     break;
                 case SecureAttention when IsControlledBy(from):
                     // Solo dal PC che ci sta comandando: non basta essere collegati per aprire la schermata di sicurezza.
@@ -763,6 +843,26 @@ public sealed class InputCoordinator
         SetMode(InputMode.Controlling, target);
         _net.Send(target, new Enter(ScreenGeometry.Opposite(edge), ratio));
         SendLockKeys(target);
+        SendPointerScale(target);
+    }
+
+    /// <summary>
+    /// Con la compensazione della scala attiva, manda al target la scala del monitor da cui è partito il cursore.
+    /// Letta sul thread di input, inviata solo se nel frattempo il controllo non è passato altrove.
+    /// </summary>
+    private void SendPointerScale(Guid target)
+    {
+        bool on;
+        try { on = PointerScaleCompensation(); }
+        catch (Exception ex) { Log.Error("Impostazione della scala", ex); on = false; }
+        if (!on) return;
+        var (x, y) = (_returnX, _returnY);
+        _platform.Post(() =>
+        {
+            var dpi = Math.Clamp(_platform.GetDpiAt(x, y), 48, 960);
+            lock (_gate)
+                if (_mode == InputMode.Controlling && _peer == target) _net.Send(target, new PointerScale((ushort)dpi));
+        });
     }
 
     /// <summary>
@@ -820,9 +920,11 @@ public sealed class InputCoordinator
             ReleaseInjected();
         }
         _latchedEdge = null;
+        _scaleFromDpi = 0; // la scala del PC che comanda, se serve, arriva subito dopo
         SetMode(InputMode.Controlled, from);
         PostInput(() =>
         {
+            (_fracX, _fracY) = (0, 0);
             var (x, y) = ScreenGeometry.EntryPoint(_platform.GetMonitors(), e.From, e.Ratio);
             _platform.InjectMoveTo(x, y);
             _lastMoveInjected = Stopwatch.GetTimestamp();
@@ -848,19 +950,22 @@ public sealed class InputCoordinator
             SetMode(InputMode.Controlling, hop.Id);
             _net.Send(hop.Id, new Enter(entry, hop.Ratio));
             SendLockKeys(hop.Id);
+            SendPointerScale(hop.Id);
         }
     }
 
     private void InjectMove(int dx, int dy)
     {
         var controller = _peer;
+        var fromDpi = _scaleFromDpi;
         _wheelSlot = null; // come PostInput, ma senza iniettare prima il movimento rimandato: questo lo sostituisce
         _platform.Post(() =>
         {
             var monitors = _platform.GetMonitors();
             if (!_vValid) { (_vx, _vy) = _platform.GetCursorPos(); _vValid = true; }
             var (cx, cy) = (_vx, _vy);
-            var (nx, ny, hit) = ScreenGeometry.MoveBy(monitors, cx, cy, dx, dy);
+            var (mx, my) = fromDpi > 0 ? Scale(dx, dy, _platform.GetDpiAt(cx, cy) / (double)fromDpi) : (dx, dy);
+            var (nx, ny, hit) = ScreenGeometry.MoveBy(monitors, cx, cy, mx, my);
             if (nx != cx || ny != cy) InjectCursorMove(nx, ny);
             (_vx, _vy) = (nx, ny);
 
@@ -880,6 +985,20 @@ public sealed class InputCoordinator
                 _net.Send(controller, new EdgeHit(edge, ratio));
             }
         });
+    }
+
+    /// <summary>
+    /// Spostamento moltiplicato per <paramref name="factor"/>; le frazioni di pixel si sommano ai movimenti successivi,
+    /// così i movimenti lenti non si perdono. Solo sul thread di input.
+    /// </summary>
+    private (int, int) Scale(int dx, int dy, double factor)
+    {
+        _fracX += dx * factor;
+        _fracY += dy * factor;
+        var (sx, sy) = ((int)Math.Truncate(_fracX), (int)Math.Truncate(_fracY));
+        _fracX -= sx;
+        _fracY -= sy;
+        return (sx, sy);
     }
 
     /// <summary>

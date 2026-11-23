@@ -17,6 +17,9 @@ internal sealed class AdvancedForm : Form
     private readonly Toggle _audioKeepsOn = new("Tieni acceso lo schermo mentre suona musica o un video") { Margin = Ui.P(0, 12, 0, 0) };
     private readonly Label _updateText;
     private readonly VButton _installNow = new("Aggiorna subito tutti i PC", primary: true);
+    private readonly Card _audio = new(W, "Audio fra i PC");
+    private readonly FlowLayoutPanel _audioBody = Ui.Column();
+    private string _audioShown = "";
     private StatusDto? _status;
 
     public AdvancedForm(StatusDto? status)
@@ -106,6 +109,25 @@ internal sealed class AdvancedForm : Form
             "Da impostare su ogni PC.", Ui.Small, Ui.Muted, screens.InnerWidth, Ui.P(0, 8, 0, 0)));
         left.Controls.Add(screens);
 
+        // mouse e tastiera
+        var input = new Card(W, "Mouse e tastiera");
+        void InputToggle(string text, string option, bool value, string help, bool first = false)
+        {
+            var t = new Toggle(text) { Checked = value, Margin = first ? Padding.Empty : Ui.P(0, 12, 0, 0) };
+            t.CheckedChanged += async (_, _) => await Send(new ControlRequest { Cmd = "setInputOption", Option = option, Enabled = t.Checked });
+            input.Body.Controls.Add(t);
+            input.Body.Controls.Add(Ui.Label(help, Ui.Small, Ui.Muted, input.InnerWidth, Ui.P(0, 6, 0, 0)));
+        }
+        InputToggle("Bloccando questo PC blocca anche gli altri", "groupLock", status?.GroupLock ?? true,
+            "Con Win+L o Start › Blocca si bloccano tutti i PC collegati; lo sblocco resta separato. " +
+            "Il blocco automatico per inattività non blocca gli altri PC.", first: true);
+        InputToggle("Tasti multimediali al PC che suona", "mediaKeys", status?.MediaKeysFollowAudio ?? true,
+            "Volume e play/pausa vanno al PC da cui esce la musica, anche se in quel momento usi un altro PC.");
+        InputToggle("Compensa la scala dello schermo", "pointerScale", status?.PointerScaleCompensation ?? false,
+            "Quando comandi un altro PC il cursore segue la scala dei monitor (100%, 150%…) invece dei pixel: " +
+            "su un monitor 4K non sembra più lento. Serve la stessa versione di Varco sull'altro PC.");
+        right.Controls.Add(input);
+
         // bordi
         var edges = new Card(W, "Bordi dello schermo");
         void EdgeToggle(string text, string option, bool value, bool first = false)
@@ -124,6 +146,15 @@ internal sealed class AdvancedForm : Form
             "Con la sosta il cursore deve restare contro il bordo per un attimo prima di passare. " +
             "Ogni PC usa le proprie impostazioni per i propri bordi.", Ui.Small, Ui.Muted, edges.InnerWidth, Ui.P(0, 8, 0, 0)));
         right.Controls.Add(edges);
+
+        // audio fra i PC
+        _audio.Body.Controls.Add(_audioBody);
+        _audio.Body.Controls.Add(Ui.Label("Ogni PC compare nel Mixer volume di Windows come \"Audio NOME-PC\", con il suo volume. " +
+            "Le sue casse restano mute e i tasti del volume regolano il PC centrale. Il microfono non passa. " +
+            "Vale per tutti i PC collegati; serve la stessa versione di Varco su tutti.",
+            Ui.Small, Ui.Muted, _audio.InnerWidth, Ui.P(0, 8, 0, 0)));
+        ShowAudio(status);
+        right.Controls.Add(_audio);
 
         // problemi
         var problems = new Card(W, "Problemi");
@@ -150,7 +181,7 @@ internal sealed class AdvancedForm : Form
                     "Varco", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
                 await Send(new ControlRequest { Cmd = "leaveGroup" });
         }, Ui.P(0, 12, 0, 0)));
-        right.Controls.Add(problems);
+        left.Controls.Add(problems);
 
         // aggiornamenti
         var updates = new Card(W, "Aggiornamenti");
@@ -182,10 +213,99 @@ internal sealed class AdvancedForm : Form
         var timer = new System.Windows.Forms.Timer { Interval = 1000 };
         timer.Tick += async (_, _) =>
         {
-            try { ShowUpdate((await ControlClient.SendAsync(new ControlRequest { Cmd = "status" })).Status); } catch { }
+            try
+            {
+                var s = (await ControlClient.SendAsync(new ControlRequest { Cmd = "status" })).Status;
+                ShowUpdate(s);
+                ShowAudio(s);
+            }
+            catch { }
         };
         timer.Start();
         FormClosed += (_, _) => timer.Dispose();
+    }
+
+    /// <summary>
+    /// Riquadro dell'audio: sul PC centrale l'elenco dei PC da ascoltare, sugli altri l'invio del proprio audio.
+    /// Si ridisegna solo quando cambia qualcosa, per non perdere un clic a metà.
+    /// </summary>
+    private void ShowAudio(StatusDto? s)
+    {
+        if (IsDisposed || s is null) return;
+        var me = s.MachineId;
+        var others = s.Peers.Where(p => p.Id is Guid id && id != me).Select(p => (Id: p.Id!.Value, p.Name)).ToList();
+        var shown = string.Join("|", s.AudioHub, string.Join(",", s.AudioSources), s.AudioSending,
+            string.Join(",", s.AudioReceiving), string.Join(",", others.Select(o => $"{o.Id}={o.Name}")));
+        if (shown == _audioShown) return;
+        _audioShown = shown;
+
+        _audioBody.SuspendLayout();
+        foreach (Control c in _audioBody.Controls.Cast<Control>().ToList()) c.Dispose();
+        _audioBody.Controls.Clear();
+        string NameOf(Guid id) => id == me ? s.MachineName : others.FirstOrDefault(o => o.Id == id).Name ?? "un PC non più collegato";
+        void Help(string text) => _audioBody.Controls.Add(Ui.Label(text, Ui.Small, Ui.Muted, _audio.InnerWidth, Ui.P(0, 6, 0, 0)));
+
+        if (others.Count == 0)
+        {
+            Help("Collega almeno un altro PC per ascoltarne l'audio da qui.");
+        }
+        else
+        {
+            var hubHere = s.AudioHub == me;
+            var hubElsewhere = s.AudioHub != Guid.Empty && !hubHere;
+            var here = new Toggle("Ascolta qui l'audio degli altri PC") { Checked = hubHere };
+            // Diventando centrale si ascoltano subito tutti gli altri PC: poi si tolgono quelli che non servono.
+            here.CheckedChanged += (_, _) => SendAudio(here.Checked ? me : null, here.Checked ? others.Select(o => o.Id) : []);
+            _audioBody.Controls.Add(here);
+            if (hubElsewhere)
+                Help($"Ora il PC centrale è {NameOf(s.AudioHub)}. Attivando qui, il centrale diventa questo PC.");
+
+            if (hubHere)
+            {
+                foreach (var (id, name) in others)
+                {
+                    var on = s.AudioSources.Contains(id);
+                    var t = new Toggle($"Audio di {name}") { Checked = on, Margin = Ui.P(0, 10, 0, 0) };
+                    t.CheckedChanged += (_, _) =>
+                    {
+                        var next = s.AudioSources.Where(x => x != id).ToList();
+                        if (t.Checked) next.Add(id);
+                        SendAudio(me, next);
+                    };
+                    _audioBody.Controls.Add(t);
+                }
+                var receiving = s.AudioReceiving.Select(NameOf).ToList();
+                Help(receiving.Count > 0 ? $"Arriva ora l'audio di {string.Join(", ", receiving)}." : "In questo momento non arriva audio dagli altri PC.");
+            }
+            else if (hubElsewhere)
+            {
+                var hub = NameOf(s.AudioHub);
+                var send = new Toggle($"Manda l'audio di questo PC a {hub}") { Checked = s.AudioSources.Contains(me), Margin = Ui.P(0, 10, 0, 0) };
+                send.CheckedChanged += (_, _) =>
+                {
+                    var next = s.AudioSources.Where(x => x != me).ToList();
+                    if (send.Checked) next.Add(me);
+                    SendAudio(s.AudioHub, next);
+                };
+                _audioBody.Controls.Add(send);
+                if (s.AudioSending) Help($"L'audio di questo PC ora esce da {hub}: le casse di questo PC sono mute.");
+                else if (s.AudioSources.Contains(me)) Help($"L'audio passerà a {hub} appena i due PC sono collegati.");
+            }
+        }
+        _audioBody.ResumeLayout();
+        _audio.PerformLayout();
+    }
+
+    private void SendAudio(Guid? hub, IEnumerable<Guid> sources)
+    {
+        var req = new ControlRequest { Cmd = "setAudio", Id = hub, Sources = sources.ToList() };
+        // Dopo il clic: il riquadro si ridisegna con lo stato nuovo, fuori dall'evento del pulsante che verrà eliminato.
+        BeginInvoke(async () =>
+        {
+            var r = await Send(req);
+            _audioShown = "";
+            ShowAudio(r?.Status ?? _status);
+        });
     }
 
     private async Task PairByAddress()
