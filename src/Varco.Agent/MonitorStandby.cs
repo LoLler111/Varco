@@ -15,10 +15,15 @@ namespace Varco.Agent;
 /// Windows non sa niente di questo standby, quindi l'input non lo interrompe. Funziona con i monitor esterni che hanno
 /// DDC/CI attivo; gli altri (lo schermo dei portatili) restano accesi.
 ///
-/// Riaccensione: alcuni monitor in standby rispondono a singhiozzo e ignorano i primi comandi (misurato: uno subito,
-/// un altro dopo 4-8 tentativi, cioè 4-9 secondi). Quindi il comando si ripete finché il monitor non dice "acceso",
-/// che è affidabile. Finché ci sono monitor in standby esiste un file segnaposto: se l'agent si chiude male, quello
-/// nuovo li riaccende all'avvio (Windows non sa che sono spenti: muovere il mouse non basterebbe, servirebbe il tasto).
+/// Il DDC/CI dei monitor in standby è a singhiozzo: la prima transazione dopo una pausa spesso fallisce e le successive,
+/// se arrivano subito, riescono (un LG 32" in standby restava muto con un comando ogni 300-700 ms, mentre MonitorDeck,
+/// che ripete ogni comando fino a 3 volte a 40 ms di distanza, lo riaccendeva al primo clic). Quindi ogni lettura e
+/// scrittura si ripete così, rispettando i 50 ms minimi tra due comandi chiesti da MCCS.
+///
+/// Riaccensione: "acceso", poi 1,2 secondi di silenzio per lasciar partire il monitor, poi si rilegge. Si ripete
+/// finché il monitor non dice "acceso", che è affidabile. Finché ci sono monitor in standby esiste un file segnaposto:
+/// se l'agent si chiude male, quello nuovo li riaccende all'avvio (Windows non sa che sono spenti: muovere il mouse
+/// non basterebbe, servirebbe il tasto).
 ///
 /// Le chiamate DDC/CI sono lente (decine di ms per monitor): girano su un thread a parte, mai su quello degli hook.
 /// </summary>
@@ -27,9 +32,14 @@ internal sealed class MonitorStandby : IDisposable
     private const int CheckMs = 5000;
     private const byte VCP_POWER_MODE = 0xD6;
     private const uint PowerOn = 1, PowerOff = 4;
-    /// <summary>Tentativi di riaccensione, uno al secondo circa (gli stessi tempi della prova che ha funzionato).</summary>
+    /// <summary>Tentativi di riaccensione, uno ogni secondo e mezzo circa.</summary>
     private const int WakeAttempts = 30;
-    private const int WakeReadDelayMs = 300, WakeRetryDelayMs = 700;
+    /// <summary>Attesa dopo "acceso" prima di rileggere (come MonitorDeck), e pausa prima del tentativo successivo.</summary>
+    private const int WakeSettleMs = 1200, WakeRetryDelayMs = 300;
+    /// <summary>Ripetizioni ravvicinate di ogni comando DDC/CI, e distanza minima tra due comandi allo stesso monitor.</summary>
+    private const int DdcTries = 3, DdcRetryGapMs = 40, DdcMinGapMs = 60;
+    /// <summary>Ora dell'ultimo comando a ogni monitor (solo il thread di lavoro lo tocca).</summary>
+    private static readonly Dictionary<IntPtr, long> LastCommand = [];
 
     private readonly MonitorStandbyPolicy _policy = new();
     private readonly Func<bool> _enabled;
@@ -96,21 +106,28 @@ internal sealed class MonitorStandby : IDisposable
     private void Standby()
     {
         var names = new List<string>();
+        var skipped = new List<string>();
         foreach (var m in PhysicalMonitors())
         {
-            if (GetPowerMode(m.Handle) >= 1 && SetVCPFeature(m.Handle, VCP_POWER_MODE, PowerOff))
+            var mode = GetPowerMode(m.Handle);
+            if (mode >= 1 && TrySet(m.Handle, VCP_POWER_MODE, PowerOff, out _))
             {
                 _asleep.Add(m);
                 names.Add(m.Name);
             }
-            else DestroyPhysicalMonitor(m.Handle);
+            else
+            {
+                skipped.Add(mode < 0 ? $"{m.Name} (nessuna risposta DDC/CI)" : $"{m.Name} (comando rifiutato)");
+                DestroyPhysicalMonitor(m.Handle);
+            }
         }
+        var rest = skipped.Count > 0 ? $"; restano accesi: {string.Join(", ", skipped)}" : "";
         if (names.Count > 0)
         {
             WriteMarker(names);
-            Log.Info($"Si sta comandando un altro PC: monitor in standby ({string.Join(", ", names)})");
+            Log.Info($"Si sta comandando un altro PC: monitor in standby ({string.Join(", ", names)}){rest}");
         }
-        else Log.Info("Si sta comandando un altro PC, ma nessun monitor accetta lo standby via DDC/CI: restano accesi");
+        else Log.Info($"Si sta comandando un altro PC, ma nessun monitor accetta lo standby via DDC/CI{rest}");
         _policy.Applied(StandbyAction.Standby, names.Count > 0);
     }
 
@@ -134,23 +151,51 @@ internal sealed class MonitorStandby : IDisposable
         _policy.Applied(StandbyAction.Wake);
     }
 
-    /// <summary>Manda "acceso" finché ogni monitor non lo conferma. Restituisce quelli che non l'hanno confermato.</summary>
+    /// <summary>
+    /// Manda "acceso" finché ogni monitor non lo conferma. Restituisce quelli che non l'hanno confermato, dopo aver
+    /// scritto nel log l'ultimo esito di ciascuno (comando rifiutato, nessuna risposta, o la modalità che dichiara).
+    /// </summary>
     private static List<PhysicalMonitor> WakeWithRetries(List<PhysicalMonitor> monitors, int attempts)
     {
         var pending = new List<PhysicalMonitor>(monitors);
+        var outcome = new Dictionary<IntPtr, string>();
         for (var attempt = 1; attempt <= attempts && pending.Count > 0; attempt++)
         {
+            foreach (var m in pending)
+                outcome[m.Handle] = TrySet(m.Handle, VCP_POWER_MODE, PowerOn, out var error) ? "" : $"comando rifiutato (errore {error})";
+            Thread.Sleep(WakeSettleMs);
             foreach (var m in pending.ToArray())
             {
-                SetVCPFeature(m.Handle, VCP_POWER_MODE, PowerOn);
-                Thread.Sleep(WakeReadDelayMs);
-                if (GetPowerMode(m.Handle) != PowerOn) continue;
-                pending.Remove(m);
-                if (attempt > 1) Log.Info($"Monitor {m.Name} riacceso al tentativo {attempt}");
+                var mode = GetPowerMode(m.Handle);
+                if (mode == PowerOn)
+                {
+                    pending.Remove(m);
+                    if (attempt > 1) Log.Info($"Monitor {m.Name} riacceso al tentativo {attempt}");
+                }
+                else if (outcome[m.Handle].Length == 0)
+                    outcome[m.Handle] = mode < 0 ? "comando accettato, nessuna risposta alla lettura" : $"comando accettato, dice modalità {mode}";
             }
             if (pending.Count > 0) Thread.Sleep(WakeRetryDelayMs);
         }
+        if (pending.Count > 0)
+            Log.Info($"Ultimo esito della riaccensione: {string.Join("; ", pending.Select(m => $"{m.Name}: {outcome[m.Handle]}"))}");
         return pending;
+    }
+
+    /// <summary>Scrive un codice VCP, ripetendo subito se il monitor non risponde (vedi sopra). error = GetLastError.</summary>
+    private static bool TrySet(IntPtr monitor, byte code, uint value, out int error)
+    {
+        error = 0;
+        for (var i = 0; i < DdcTries; i++)
+        {
+            Pace(monitor);
+            var ok = SetVCPFeature(monitor, code, value);
+            if (!ok) error = Marshal.GetLastWin32Error();
+            Mark(monitor);
+            if (ok) return true;
+            Thread.Sleep(DdcRetryGapMs);
+        }
+        return false;
     }
 
     /// <summary>All'avvio: monitor rimasti in standby da un agent chiuso male (c'è ancora il file segnaposto).</summary>
@@ -193,9 +238,29 @@ internal sealed class MonitorStandby : IDisposable
         return list;
     }
 
-    /// <summary>Modalità di alimentazione (1 acceso, 2-4 standby/spento), o -1 se il monitor non risponde al DDC/CI.</summary>
-    private static long GetPowerMode(IntPtr monitor) =>
-        GetVCPFeatureAndVCPFeatureReply(monitor, VCP_POWER_MODE, out _, out var current, out _) ? current : -1;
+    /// <summary>Modalità di alimentazione (1 acceso, 2-5 standby/spento), o -1 se il monitor non risponde al DDC/CI.</summary>
+    private static long GetPowerMode(IntPtr monitor)
+    {
+        for (var i = 0; i < DdcTries; i++)
+        {
+            Pace(monitor);
+            var ok = GetVCPFeatureAndVCPFeatureReply(monitor, VCP_POWER_MODE, out _, out var current, out _);
+            Mark(monitor);
+            if (ok) return current;
+            Thread.Sleep(DdcRetryGapMs);
+        }
+        return -1;
+    }
+
+    /// <summary>MCCS chiede almeno 50 ms tra due comandi: incalzati, molti monitor dicono "ok" e ignorano il comando.</summary>
+    private static void Pace(IntPtr monitor)
+    {
+        if (!LastCommand.TryGetValue(monitor, out var last)) return;
+        var wait = DdcMinGapMs - (int)(Environment.TickCount64 - last);
+        if (wait > 0) Thread.Sleep(wait);
+    }
+
+    private static void Mark(IntPtr monitor) => LastCommand[monitor] = Environment.TickCount64;
 
     // ───────────── impostazioni di alimentazione di Windows ─────────────
 
